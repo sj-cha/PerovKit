@@ -13,7 +13,7 @@ from scipy.spatial import cKDTree
 from rdkit import Chem
 from rdkit.Chem import AllChem, rdDetermineBonds
 
-from utils.rotation import get_rotation_matrix, rotation_from_vecs
+from utils.rotation import rotation_about_axis, rotation_from_u_to_v
 
 Plane = Tuple[int, int, int]
 
@@ -29,11 +29,10 @@ class Ligand:
     charge: int
     binding_motif: BindingMotif
 
+    plane: Optional[Plane] = None
+
     volume: float = field(default_factory=float) 
     binding_atoms: List[int] = field(default_factory=list)
-    direction_vector: np.ndarray = field(default_factory=lambda: np.zeros(3))
-
-    bound_plane: Optional[Plane] = None
 
     def __post_init__(self):
         self._get_volume()
@@ -45,7 +44,7 @@ class Ligand:
         cls,
         xyz_path: str,
         charge: int,
-        binding_motif: BindingMotif = None,
+        binding_motif: BindingMotif
     ) -> Ligand:
         
         atoms = read(xyz_path)
@@ -63,12 +62,15 @@ class Ligand:
     def from_smiles(
         cls,
         smiles: str,
-        binding_motif: BindingMotif = None,
+        binding_motif: BindingMotif,
+        random_seed: int
     ) -> Ligand:
         
         mol = Chem.MolFromSmiles(smiles)
         mol = Chem.AddHs(mol)
-        AllChem.EmbedMolecule(mol, AllChem.ETKDGv3())
+        params = AllChem.ETKDGv3()
+        params.randomSeed = random_seed
+        AllChem.EmbedMolecule(mol, params)
         AllChem.UFFOptimizeMolecule(mol)
 
         positions = mol.GetConformers()[0].GetPositions()
@@ -172,16 +174,15 @@ class Ligand:
             axis /= np.linalg.norm(axis)
 
             z = np.array([0.0, 0.0, 1.0], dtype=float)
-            R_align = rotation_from_vecs(axis, z)  
+            R_align = rotation_from_u_to_v(axis, z)  
             coords0 = coords0 @ R_align.T
 
             self.atoms.set_positions(coords0)
-            self.direction_vector = z
 
             return None
         
         ex = np.array([1.0, 0.0, 0.0], dtype=float)
-        R_align = rotation_from_vecs(axis, ex)  
+        R_align = rotation_from_u_to_v(axis, ex)  
         coords0 = coords0 @ R_align.T
 
         # Rest of the atoms 
@@ -197,40 +198,18 @@ class Ligand:
         best_score = -np.inf
 
         for th in thetas:
-            R = get_rotation_matrix(ex, th)
+            R = rotation_about_axis(ex, th)
             rotated = others @ R.T  # (N_other, 3)
             score = rotated[:, 2].sum()
             if score > best_score:
                 best_score = score
                 best_theta = th
 
-        R_best = get_rotation_matrix(ex, best_theta)
+        R_best = rotation_about_axis(ex, best_theta)
         rotated_all = coords0 @ R_best.T
 
         # update ASE atoms
         self.atoms.set_positions(rotated_all)
-        self.direction_vector = np.array([0.0, 0.0, 1.0], dtype=float)
-
-    def rotate(
-        self,
-        surface_atom_index: int,
-        plane: Plane,
-        *args,
-        **kwargs,
-    ) -> None:
-        """
-        Placeholder for ligand placement/orientation on the nanocrystal
-        surface. Later, this will:
-
-        - Use `surface_atom_index` and `plane` (and optionally Core info)
-          to orient the ligand.
-        - Update `bound_plane`, `binding_motif_vector`, etc.
-
-        For now, it only records the plane.
-        """
-        self.bound_plane = plane
-        # TODO: implement rigid-body rotation / alignment logic later.
-        # Left intentionally empty in terms of transformation.
 
     def to(self, fmt: str = 'xyz', filename: str = None) -> None:
         """Export ligand to file."""
@@ -239,13 +218,7 @@ class Ligand:
 
         write(filename, self.atoms, format=fmt, comment=formula)
 
-
-if __name__ == "__main__":
-    # ligand = Ligand.from_xyz(xyz_path="../../../ChiralPNC/Code/ligands/5_dodecylsulfate.xyz",
-    #                          charge = -1,
-    #                          binding_motif=BindingMotif(["O", "O"]))
-
-    ligand = Ligand.from_smiles(smiles='C[NH3+]',
-                             binding_motif=BindingMotif(["N"]))
-    
-    # ligand.to(filename="1.xyz")
+@dataclass
+class LigandSpec:
+    ligand: Ligand
+    coverage: float

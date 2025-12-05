@@ -16,7 +16,7 @@ class BindingSite:
     index: int              
     symbol: str             
     plane: Plane           
-    used: bool = False     
+    passivated: bool = False     
 
 @dataclass
 class Core:
@@ -27,14 +27,13 @@ class Core:
     a: float
     n_cells: int
     
-    plane_atoms: dict[Plane, dict[str, List[int]]] = field(default_factory=dict)
+    surface_atoms: Dict[str, np.ndarray] = field(init=False)
+    plane_atoms: Dict[Plane, Dict[str, List[int]]] = field(default_factory=dict)
     binding_sites: List[BindingSite] = field(default_factory=list)
 
     def __post_init__(self):
-        if not self.plane_atoms:
-            self._get_plane_indices()
-        if not self.binding_sites:
-            self._build_binding_sites()
+        self.surface_atoms = self._get_surface_atoms()
+        self.binding_sites = self._build_binding_sites()
 
     def _get_surface_atoms(
             self, 
@@ -65,7 +64,7 @@ class Core:
 
         return surface_indices
 
-    def _get_plane_indices(self) -> dict[tuple[int, int, int], dict[str, list[int]]]:
+    def _build_binding_sites(self) -> None:
         surface = self._get_surface_atoms()
         positions = np.array([a.position for a in self.atoms])
         symbols   = np.array([a.symbol   for a in self.atoms])
@@ -95,13 +94,12 @@ class Core:
 
                 plane_indices[v][elem].append(int(gi))
 
-        self.plane_atoms = {hkl: {elem: idxs for elem, idxs in elems.items()} for hkl, elems in plane_indices.items()}
-    
-    def _build_binding_sites(self) -> None:
+        plane_atoms = {hkl: {elem: idxs for elem, idxs in elems.items()} for hkl, elems in plane_indices.items()}
+        self.plane_atoms = plane_atoms
 
         idx_to_site: Dict[int, BindingSite] = {}
 
-        for plane, elem_map in self.plane_atoms.items():
+        for plane, elem_map in plane_atoms.items():
             for elem, indices in elem_map.items():
                 for idx in indices:
                     idx = int(idx)
@@ -112,10 +110,10 @@ class Core:
                         index=idx,
                         symbol=elem,
                         plane=plane,
-                        used=False,
+                        passivated=False,
                     )
 
-        self.binding_sites = list(idx_to_site.values())
+        return list(idx_to_site.values())
         
     @classmethod
     # Currently only supports ABX3 perovskites with cubic structure
@@ -211,8 +209,7 @@ class Core:
 
             # build new neutral core
             core = cls(A=A, B=B, X=X, atoms=new_atoms, a=a, n_cells=n_cells)
-            core._get_surface_atoms()
-            core._get_plane_indices()
+            core._build_binding_sites()
 
             symbols = core.atoms.get_chemical_symbols()
             n_A = sum(s == A for s in symbols)
@@ -230,7 +227,6 @@ class Core:
         self.atoms = self.atoms[mask]
 
         # Recompute surface atoms and binding sites
-        self._get_plane_indices()
         self._build_binding_sites()
     
     def to(self, fmt: str = 'xyz', filename: str = None) -> None:

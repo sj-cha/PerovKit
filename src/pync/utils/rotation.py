@@ -1,6 +1,6 @@
 import numpy as np
 
-def get_rotation_matrix(axis: np.ndarray, theta: float) -> np.ndarray:
+def rotation_about_axis(axis: np.ndarray, theta: float) -> np.ndarray:
     """
     Rodrigues' rotation formula for rotation about arbitrary axis.
 
@@ -17,7 +17,11 @@ def get_rotation_matrix(axis: np.ndarray, theta: float) -> np.ndarray:
 
     return np.eye(3) + np.sin(theta) * K + (1.0 - np.cos(theta)) * (K @ K)
 
-def rotation_from_vecs(u: np.ndarray, v: np.ndarray) -> np.ndarray:
+def rotation_from_u_to_v(u: np.ndarray, v: np.ndarray) -> np.ndarray:
+    """
+    u: source vector
+    v: target vector
+    """
     u = np.asarray(u, dtype=float)
     v = np.asarray(v, dtype=float)
 
@@ -37,11 +41,11 @@ def rotation_from_vecs(u: np.ndarray, v: np.ndarray) -> np.ndarray:
         axis = np.cross(u, tmp)
         axis /= np.linalg.norm(axis)
         theta = np.pi
-        return get_rotation_matrix(axis, theta)
+        return rotation_about_axis(axis, theta)
 
     # general case
     axis = np.cross(u, v)
     axis /= np.linalg.norm(axis)
     theta = np.arccos(c)
 
-    return get_rotation_matrix(axis, theta)
+    return rotation_about_axis(axis, theta)
