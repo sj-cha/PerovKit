@@ -44,6 +44,7 @@ class NanoCrystal:
         self.ligands = []
         self.displaced_indices = []
         self.binding_sites = self.core.binding_sites
+        core_positions = self.core.atoms.get_positions()
 
         A_sites = [s for s in self.binding_sites if s.symbol == self.core.A]
         X_sites = [s for s in self.binding_sites if s.symbol == self.core.X]
@@ -74,7 +75,7 @@ class NanoCrystal:
                           f"but only {len(available)} available.")
                     n_target = len(available)
 
-            chosen_sites = self._select_sites_uniform(available, n_target)
+            chosen_sites = self._select_sites_uniform(core_positions, available, n_target)
 
             for site in chosen_sites:
                 lig_copy = self._clone_ligand(lig)
@@ -90,7 +91,6 @@ class NanoCrystal:
         assert n_lig > 0, "No ligands to place."
 
         # Core atoms coordinates except displaced ones
-        core_positions = self.core.atoms.get_positions()
         n_core = core_positions.shape[0]
 
         surface_indices = np.concatenate(list(self.core.surface_atoms.values()))
@@ -131,7 +131,7 @@ class NanoCrystal:
                 thetas[i],
             )
             ligand_coords_list.append(coords_i)
-
+        
         # Rotaation optimization loop
         for iter in range(max_iters):
             centers, radii = self._compute_bounding_spheres(ligand_coords_list)
@@ -191,6 +191,60 @@ class NanoCrystal:
         for lig, coords in zip(ligands, ligand_coords_list):
             lig.atoms.set_positions(coords)
             self.ligands.append(lig)
+    
+    def check_overlaps(self, cutoff: float = None):
+        if cutoff is None:
+            cutoff = self.overlap_cutoff
+
+        core_symbols = self.core.atoms.get_chemical_symbols()
+        core_positions = self.core.atoms.get_positions()
+        core_mask = np.ones(len(core_symbols), dtype=bool)
+        for idx in self.displaced_indices:
+            if 0 <= idx < len(core_mask):
+                core_mask[idx] = False
+        core_coords = core_positions[core_mask]
+
+        entities = []
+        entity_labels = []
+
+        if core_coords.size > 0:
+            entities.append(core_coords)
+            entity_labels.append("core")
+
+        for i, lig in enumerate(self.ligands):
+            entities.append(lig.atoms.get_positions())
+            entity_labels.append(f"ligand_{i}")
+
+        global_min = np.inf
+        global_pair = None
+
+        n = 0
+
+        for i in range(len(entities)):
+            for j in range(i + 1, len(entities)):
+                A = entities[i]
+                B = entities[j]
+                diff = A[:, None, :] - B[None, :, :]
+                d2 = np.sum(diff * diff, axis=-1)
+                min_idx = np.argmin(d2)
+                d_min = float(np.sqrt(d2.flat[min_idx]))
+
+                if d_min < global_min:
+                    global_min = d_min
+                    global_pair = (i, j)
+
+                if d_min < cutoff:
+                    print(
+                        f"[Log] {entity_labels[i]} vs {entity_labels[j]}: "
+                        f"min distance = {d_min:.3f} Å < {cutoff:.3f} Å"
+                    )
+                    n += 1
+
+        print(
+            f"[Log] global min inter-entity distance = {global_min:.3f} Å "
+            f"between {entity_labels[global_pair[0]]} and {entity_labels[global_pair[1]]}"
+            f" (total overlaps: {n})"
+        )
 
     def _compute_bounding_spheres(
         self,
@@ -323,7 +377,6 @@ class NanoCrystal:
                 queue.append(j)
 
         return sorted(list(active))
-
 
     def _place_one_ligand(
         self,
@@ -491,6 +544,7 @@ class NanoCrystal:
 
     def _select_sites_uniform(
         self,
+        core_positions: np.ndarray,
         sites: List[BindingSite],
         n_target: int,
     ) -> List[BindingSite]:
@@ -498,7 +552,6 @@ class NanoCrystal:
         if n_target >= len(sites):
             return list(sites)
 
-        core_positions = self.core.atoms.get_positions()
         coords = np.array([core_positions[s.index] for s in sites])
 
         center = coords.mean(axis=0)
@@ -519,62 +572,6 @@ class NanoCrystal:
             d_min[selected_indices] = 0.0  # already chosen
 
         return [sites[i] for i in selected_indices]
-    
-    def _debug_overlaps(self, cutoff: float = None):
-        if cutoff is None:
-            cutoff = self.overlap_cutoff
-
-        core_symbols = self.core.atoms.get_chemical_symbols()
-        core_positions = self.core.atoms.get_positions()
-        core_mask = np.ones(len(core_symbols), dtype=bool)
-        for idx in self.displaced_indices:
-            if 0 <= idx < len(core_mask):
-                core_mask[idx] = False
-        core_coords = core_positions[core_mask]
-
-        entities = []
-        entity_labels = []
-
-        if core_coords.size > 0:
-            entities.append(core_coords)
-            entity_labels.append("core")
-
-        for i, lig in enumerate(self.ligands):
-            entities.append(lig.atoms.get_positions())
-            entity_labels.append(f"ligand_{i}")
-
-        print(f"[DEBUG] #entities (core + ligands) = {len(entities)}")
-
-        global_min = np.inf
-        global_pair = None
-
-        n = 0
-
-        for i in range(len(entities)):
-            for j in range(i + 1, len(entities)):
-                A = entities[i]
-                B = entities[j]
-                diff = A[:, None, :] - B[None, :, :]
-                d2 = np.sum(diff * diff, axis=-1)
-                min_idx = np.argmin(d2)
-                d_min = float(np.sqrt(d2.flat[min_idx]))
-
-                if d_min < global_min:
-                    global_min = d_min
-                    global_pair = (i, j)
-
-                if d_min < cutoff:
-                    print(
-                        f"[OVERLAP] {entity_labels[i]} vs {entity_labels[j]}: "
-                        f"min distance = {d_min:.3f} Å < {cutoff:.3f} Å"
-                    )
-                    n += 1
-
-        print(
-            f"[DEBUG] global min inter-entity distance = {global_min:.3f} Å "
-            f"between {entity_labels[global_pair[0]]} and {entity_labels[global_pair[1]]}"
-            f" (total overlaps: {n})"
-        )
 
     def to(self, fmt: str = "xyz", filename: str = None):
         at = self.atoms
@@ -626,7 +623,7 @@ if __name__ == "__main__":
         B="Pb",
         X="Br",
         a=5.95,
-        n_cells=20,
+        n_cells=3,
         charge_neutral=True,
         random_seed=random_seed,
     )
@@ -640,11 +637,11 @@ if __name__ == "__main__":
     # )
 
     #    e.g. Anionic ligand (displaces X sites)
-    # an_lig = Ligand.from_smiles(
-    #     smiles="CCCCCCCC/C=C\CCCCCCCC(=O)[O-]",   
-    #     binding_motif=BindingMotif(["O", "O"]),
-    #     random_seed=random_seed,
-    # )
+    an_lig = Ligand.from_smiles(
+        smiles="CCCCCCCC/C=C\CCCCCCCC(=O)[O-]",   
+        binding_motif=BindingMotif(["O", "O"]),
+        random_seed=random_seed,
+    )
 
     cat_lig = Ligand.from_smiles(
         smiles="C[NH3+]",
@@ -652,15 +649,15 @@ if __name__ == "__main__":
         random_seed=random_seed,
     )
 
-    an_lig = Ligand.from_xyz(
-        "../../ligands/3_OP.xyz",
-        charge = -1,
-        binding_motif=BindingMotif(["O", "O"]),
-    )
+    # an_lig = Ligand.from_xyz(
+    #     "../../ligands/3_OP.xyz",
+    #     charge = -1,
+    #     binding_motif=BindingMotif(["O", "O"]),
+    # )
 
     specs = [
-        LigandSpec(ligand=cat_lig, coverage=0.5),  
-        LigandSpec(ligand=an_lig, coverage=0.5),  
+        LigandSpec(ligand=cat_lig, coverage=0.3),  
+        LigandSpec(ligand=an_lig, coverage=0.3),  
     ]
 
     nc = NanoCrystal(core=core, ligand_specs=specs, random_seed=random_seed)
