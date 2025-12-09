@@ -26,14 +26,16 @@ class Core:
     atoms: Atoms
     a: float
     n_cells: int
-    
+    indices: Optional[np.ndarray] = None
+
+    build_surface: bool = True
     surface_atoms: Dict[str, np.ndarray] = field(init=False)
     plane_atoms: Dict[Plane, Dict[str, List[int]]] = field(default_factory=dict)
     binding_sites: List[BindingSite] = field(default_factory=list)
 
     def __post_init__(self):
-        self.surface_atoms = self._get_surface_atoms()
-        self.binding_sites = self._build_binding_sites()
+        self.surface_atoms = self._get_surface_atoms() if self.build_surface else {}
+        self.binding_sites = self._build_binding_sites() if self.build_surface else []
 
     def _get_surface_atoms(
             self, 

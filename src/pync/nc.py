@@ -3,6 +3,7 @@ from dataclasses import dataclass, field
 from copy import deepcopy
 from typing import List, Dict, Optional, Tuple
 import json
+from pathlib import Path
 
 import random
 import math
@@ -36,7 +37,10 @@ class NanoCrystal:
 
     def __post_init__(self):
         self.core = deepcopy(self.core)
-        self.binding_sites = deepcopy(self.core.binding_sites)
+        if getattr(self.core, "binding_sites", None):
+            self.binding_sites = deepcopy(self.core.binding_sites)
+        else:
+            self.binding_sites = []
         self._rng = random.Random(self.random_seed)
         self.ligand_specs.sort(
             key=lambda spec: (
@@ -187,8 +191,7 @@ class NanoCrystal:
                     improved = True
 
             if not improved:
-                print(f"[Log] No improvement in active cluster. Stopping.")
-                break
+                raise RuntimeError("[Log] No improvement in active cluster. Stopping.")
 
             centers, radii = compute_bounding_spheres(ligand_coords_list)
             neighbor_map = build_neighbor_map(centers, radii, self.overlap_cutoff)
@@ -197,6 +200,9 @@ class NanoCrystal:
                 neighbor_map,
             )
             print(f"[Log] Iter {iter}  global_min = {global_min:.3f} Å")
+
+        if global_min < self.overlap_cutoff:
+            raise RuntimeError("[Error] Maximum iterations reached without satisfying overlap cutoff.")
 
         # Apply final coordinates to Ligand
         for lig, coords in zip(ligands, ligand_coords_list):
@@ -222,6 +228,8 @@ class NanoCrystal:
             pbc=core_atoms.pbc,
             cell=core_atoms.get_cell(),
         )
+
+        self._build_index_map()
 
     def _min_distance(
         self,
@@ -426,13 +434,34 @@ class NanoCrystal:
 
         return best_theta, best_coords_i
 
+    def _build_index_map(self) -> None:
+
+        n_core = len(self.core.atoms)
+        self.core.indices = np.arange(n_core, dtype=int)
+
+        cursor = n_core
+        for lig in self.ligands:
+            n = len(lig.atoms)
+            idx = np.arange(cursor, cursor + n, dtype=int)
+            lig.indices = idx
+            cursor += n
+
     def to(self, fmt: str = "xyz", filename: str = None):
         at = self.atoms
         formula = at.get_chemical_formula()
-        write(filename, at, format=fmt, comment=formula)
-        self.to_json(filename + ".json")
+
+        if filename is None:
+            filename = f"{formula}.{fmt}"
+
+        path = Path(filename)
+        path.parent.mkdir(parents=True, exist_ok=True)  
+
+        write(str(path), at, format=fmt, comment=formula)
+        self.to_json(str(path) + ".json")
 
     def to_json(self, json_path: str) -> None:
+
+        self._build_index_map()
 
         core_meta = {
             "A": self.core.A,
@@ -441,6 +470,7 @@ class NanoCrystal:
             "a": self.core.a,
             "n_cells": self.core.n_cells,
             "n_core_atoms": len(self.core.atoms),
+            "indices": None if self.core.indices is None else self.core.indices.tolist()
         }
 
         ligand_types_meta = []
@@ -493,7 +523,8 @@ class NanoCrystal:
                 {   
                     "ligand_id": i,
                     "spec_id": spec_id,
-                    "plane": list(lig.plane)
+                    "plane": list(lig.plane),
+                    "indices": None if lig.indices is None else lig.indices.tolist(),
                 }
             )
 
@@ -532,6 +563,11 @@ class NanoCrystal:
 
         core_meta = topo["core"]
         n_core_atoms = core_meta["n_core_atoms"]
+        core_indices_json = core_meta.get("indices", None)
+        if core_indices_json is None:
+            core_indices = np.arange(n_core_atoms, dtype=int)
+        else:
+            core_indices = np.array(core_indices_json, dtype=int)
 
         if n_core_atoms > len(atoms):
             raise ValueError(
@@ -547,6 +583,7 @@ class NanoCrystal:
             atoms=core_atoms,
             a=core_meta["a"],
             n_cells=core_meta["n_cells"],
+            build_surface=False,
         )
 
         ligand_types_meta = topo["ligand_types"]
@@ -563,6 +600,11 @@ class NanoCrystal:
             tmeta = type_id_to_meta[spec_id]
 
             n_atoms = tmeta["n_atoms"]
+            ligand_indices_json = inst_meta.get("indices", None)
+            if ligand_indices_json is None:
+                ligand_indices = np.arange(cursor, cursor + n_atoms, dtype=int)
+            else:
+                ligand_indices = np.array(ligand_indices_json, dtype=int)
 
             if cursor + n_atoms > len(atoms):
                 raise ValueError(
@@ -586,7 +628,8 @@ class NanoCrystal:
                 else None
             )
             lig.volume = tmeta["volume"]
-
+            lig.indices = ligand_indices
+            lig.binding_atoms = []
             ligands.append(lig)
 
         nc = cls(

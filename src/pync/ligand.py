@@ -33,6 +33,7 @@ class Ligand:
 
     volume: float = field(default_factory=float) 
     binding_atoms: List[int] = field(default_factory=list)
+    indices: Optional[np.ndarray] = None
 
     def __post_init__(self):
         self._get_volume()
