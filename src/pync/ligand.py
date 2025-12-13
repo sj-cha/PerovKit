@@ -27,15 +27,15 @@ class Ligand:
     smiles: str
     charge: int
     binding_motif: BindingMotif
-
     name: str
+    id: Optional[int] = None
+    volume: float = None
+    anchor_pos: Optional[np.ndarray] = None
     plane: Optional[Plane] = None
+    indices: Optional[np.ndarray] = None
     _neighbor_cutoff: float = 2.0
     _anchor_offset: float = 0.0
-
-    volume: float = field(default_factory=float) 
-    binding_atoms: List[int] = field(default_factory=list)
-    indices: Optional[np.ndarray] = None
+    _binding_atoms: List[int] = field(default_factory=list)
 
     def __post_init__(self):
         self._get_volume()
@@ -159,7 +159,7 @@ class Ligand:
                         best_dist = d
                         best_pair = (i, j)
 
-            self.binding_atoms = list(best_pair)
+            self._binding_atoms = list(best_pair)
 
         elif len(binding_elems) == 1:
             elem = binding_elems[0]
@@ -183,7 +183,7 @@ class Ligand:
             # choose the first one among candidates
             chosen_global = elem_indices[candidate_local[0]]
 
-            self.binding_atoms = [chosen_global]
+            self._binding_atoms = [chosen_global]
 
         else:
             raise NotImplementedError(
@@ -192,7 +192,7 @@ class Ligand:
 
     def _get_direction_vector(self, n_angles: int = 720):
         coords = self.atoms.get_positions()
-        binding_idx = self.binding_atoms
+        binding_idx = self._binding_atoms
         assert 2 >= len(binding_idx) > 0, "Need 1 or 2 binding atoms"
 
         # Compute the centroid of the binding atoms

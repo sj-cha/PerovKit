@@ -27,6 +27,7 @@ class NanoCrystal:
     random_seed: int
     ligands: List[Ligand] = field(default_factory=list)
     ligand_coverage: Dict[str, float] = field(default_factory=dict)
+    octahedra: Optional[Dict[int, dict]] = None
 
     # Rotation optimization parameters
     overlap_cutoff: float = 1.8   # Å
@@ -208,6 +209,7 @@ class NanoCrystal:
         # Apply final coordinates to Ligand
         for lig, coords in zip(ligands, ligand_coords_list):
             lig.atoms.set_positions(coords)
+            lig.id = len(self.ligands)
             self.ligands.append(lig)
 
         # Update core by removing displaced atoms           
@@ -230,7 +232,7 @@ class NanoCrystal:
             cell=core_atoms.get_cell(),
         )
 
-        self.core._build_octahedra()
+        self._build_octahedra()
         self._build_index_map()
 
     def _min_distance(
@@ -344,10 +346,14 @@ class NanoCrystal:
         R_rot = rotation_about_axis(plane, theta)
         coords_rot = coords_aligned @ R_rot.T
 
-        anchor_offset = float(getattr(ligand, "_anchor_offset", 0.0))
+        anchor_offset = plane / np.linalg.norm(plane) * float(getattr(ligand, "_anchor_offset", 0.0))
+        anchor_pos = site_pos + anchor_offset
+
+        if getattr(ligand, "anchor_pos", None) is None:
+            ligand.anchor_pos = anchor_pos
 
         # Translate to binding site position
-        coords_final = coords_rot + site_pos + plane / np.linalg.norm(plane) * anchor_offset
+        coords_final = coords_rot + anchor_pos
 
         return coords_final
 
@@ -438,6 +444,56 @@ class NanoCrystal:
 
         return best_theta, best_coords_i
 
+    def _build_octahedra(self) -> None:
+        
+        # Core
+        at = self.core.atoms
+        syms = np.array(at.get_chemical_symbols())
+        pos = at.get_positions()
+
+        pb_idx = np.where(syms == self.core.B)[0]
+        br_idx = np.where(syms == self.core.X)[0]
+
+        PB_pos = pos[pb_idx]
+        BR_pos = pos[br_idx]
+
+        # KD-tree for Br atoms
+        tree = cKDTree(BR_pos)
+        r_cut = self.core.a + 1e-2
+        neigh_lists = tree.query_ball_point(PB_pos, r_cut)
+
+        octahedra = {}
+
+        for loc, br_local_list in enumerate(neigh_lists):
+            pb_abs = int(pb_idx[loc])  
+            br_abs_list = [int(br_idx[j]) for j in br_local_list]
+
+            octahedra[pb_abs] = {
+                "Pb": [pb_abs],
+                "Br": br_abs_list,
+                "Ligand": []
+            }
+
+        # Ligand
+        anchors = []
+        lig_ids = []
+        for lig in self.ligands:
+            if lig.charge <= 0 and getattr(lig, "anchor_pos", None) is not None:
+                anchors.append(np.asarray(lig.anchor_pos, dtype=float))
+                lig_ids.append(int(lig.id))
+
+        if anchors:
+            anchors = np.vstack(anchors)
+
+            tree_pb = cKDTree(PB_pos)
+            d, pb_loc = tree_pb.query(anchors, k=1)
+
+            for j, (dist, loc_pb) in enumerate(zip(d, pb_loc)):
+                pb_abs = int(pb_idx[int(loc_pb)])
+                octahedra[pb_abs]["Ligand"].append(lig_ids[j])
+
+        self.octahedra = octahedra
+
     def _build_index_map(self) -> None:
 
         n_core = len(self.core.atoms)
@@ -512,7 +568,7 @@ class NanoCrystal:
         for meta in ligand_types_meta:
             meta["n_instances"] = type_counts[meta["id"]]
 
-        core_indices_meta = {"octahedra": getattr(self.core, "octahedra", None)}
+        core_indices_meta = {"octahedra": self.octahedra}
 
         ligands_meta = []
         for i, lig in enumerate(self.ligands):
@@ -529,6 +585,7 @@ class NanoCrystal:
                     "ligand_id": i,
                     "spec_id": spec_id,
                     "plane": list(lig.plane),
+                    "anchor_pos": list(lig.anchor_pos),
                 }
             )
 
@@ -580,7 +637,7 @@ class NanoCrystal:
         octa_raw = core_indices_meta.get("octahedra", None)
         if octa_raw is not None:
             octahedra = {
-                int(pb): {"Pb": v["Pb"], "Br": v["Br"]}
+                int(pb): {"Pb": v["Pb"], "Br": v["Br"], "Ligand": v["Ligand"]}
                 for pb, v in octa_raw.items()
             }
         else:
@@ -593,7 +650,6 @@ class NanoCrystal:
             atoms=core_atoms,
             a=core_meta["a"],
             n_cells=core_meta["n_cells"],
-            octahedra=octahedra,
             build_surface=False,
         )
 
@@ -628,13 +684,10 @@ class NanoCrystal:
             lig.charge = tmeta["charge"]
             lig.binding_motif = BindingMotif(tmeta["binding_motif_atoms"])
             lig.name = tmeta["name"]
-            lig.plane = (
-                tuple(inst_meta["plane"])
-                if inst_meta["plane"] is not None
-                else None
-            )
+            lig.plane = inst_meta["plane"]
             lig.volume = tmeta["volume"]
-            lig.binding_atoms = []
+            lig.anchor_pos = np.array(inst_meta["anchor_pos"], dtype=float)
+            lig._binding_atoms = []
             lig._neighbor_cutoff = 2.0
             ligands.append(lig)
 
@@ -645,6 +698,7 @@ class NanoCrystal:
         )
         nc.ligands = ligands
         nc.ligand_coverage = {t["name"]: t["coverage"] for t in ligand_types_meta}
+        nc.octahedra = octahedra
         nc._build_index_map()
 
         return nc

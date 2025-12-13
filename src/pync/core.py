@@ -28,8 +28,6 @@ class Core:
     a: float
     n_cells: int
     indices: Optional[np.ndarray] = None
-    octahedra: Dict[int, Dict[str, List[int]]] = field(default_factory=dict)
-
     build_surface: bool = True
     surface_atoms: Dict[str, np.ndarray] = field(init=False)
     plane_atoms: Dict[Plane, Dict[str, List[int]]] = field(default_factory=dict)
@@ -232,33 +230,3 @@ class Core:
                     )
 
         return list(idx_to_site.values())
-    
-    def _build_octahedra(self) -> None:
-
-        at = self.atoms
-        syms = np.array(at.get_chemical_symbols())
-        pos = at.get_positions()
-
-        pb_idx = np.where(syms == self.B)[0]
-        br_idx = np.where(syms == self.X)[0]
-
-        PB_pos = pos[pb_idx]
-        BR_pos = pos[br_idx]
-
-        # KD-tree for Br atoms
-        tree = cKDTree(BR_pos)
-        r_cut = self.a + 1e-2
-        neigh_lists = tree.query_ball_point(PB_pos, r_cut)
-
-        octahedra = {}
-
-        for loc, br_local_list in enumerate(neigh_lists):
-            pb_abs = int(pb_idx[loc])  
-            br_abs_list = [int(br_idx[j]) for j in br_local_list]
-
-            octahedra[pb_abs] = {
-                "Pb": [pb_abs],
-                "Br": br_abs_list,
-            }
-
-        self.octahedra = octahedra
