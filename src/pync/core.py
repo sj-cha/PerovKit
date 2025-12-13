@@ -109,9 +109,9 @@ class Core:
             planes = list(plane_indices.keys())
 
             corners = [i for i in planes if np.all(i) == True] 
-            corner_atoms = [x for c in corners for x in plane_indices[c]["Cs"]] 
+            corner_atoms = [x for c in corners for x in plane_indices[c].get(A, [])]
             rest = [j for j in planes if j not in corners]         
-            rest_atoms = [x for r in rest for x in plane_indices[r]["Cs"]]
+            rest_atoms   = [x for r in rest for x in plane_indices[r].get(A, [])]
 
             # limit to 7 corner atoms if 2x2x2 core
             if core.n_cells == 2:
@@ -234,31 +234,29 @@ class Core:
         return list(idx_to_site.values())
 
     def _build_octahedra(self) -> None:
-
         at = self.atoms
         syms = np.array(at.get_chemical_symbols())
         pos = at.get_positions()
 
-        pb_idx = np.where(syms == self.B)[0]
-        br_idx = np.where(syms == self.X)[0]
+        b_idx = np.where(syms == self.B)[0]
+        x_idx = np.where(syms == self.X)[0]
 
-        PB_pos = pos[pb_idx]
-        BR_pos = pos[br_idx]
+        B_pos = pos[b_idx]
+        X_pos = pos[x_idx]
 
-        # KD-tree for Br atoms
-        tree = cKDTree(BR_pos)
+        tree = cKDTree(X_pos)
         r_cut = self.a + 1e-2
-        neigh_lists = tree.query_ball_point(PB_pos, r_cut)
+        neigh_lists = tree.query_ball_point(B_pos, r_cut)
 
-        octahedra = {}
+        octahedra: Dict[int, Dict[str, List[int]]] = {}
 
-        for loc, br_local_list in enumerate(neigh_lists):
-            pb_abs = int(pb_idx[loc])  
-            br_abs_list = [int(br_idx[j]) for j in br_local_list]
+        for b_loc, x_local_list in enumerate(neigh_lists):
+            b_abs = int(b_idx[b_loc])
+            x_abs_list = [int(x_idx[j]) for j in x_local_list]  
 
-            octahedra[pb_abs] = {
-                "Pb": [pb_abs],
-                "Br": br_abs_list,
+            octahedra[b_abs] = {
+                "X": x_abs_list,     
+                "Ligand": []
             }
 
         self.octahedra = octahedra

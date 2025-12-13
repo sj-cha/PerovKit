@@ -452,48 +452,47 @@ class NanoCrystal:
         syms = np.array(at.get_chemical_symbols())
         pos = at.get_positions()
 
-        pb_idx = np.where(syms == self.core.B)[0]
-        br_idx = np.where(syms == self.core.X)[0]
+        b_idx = np.where(syms == self.core.B)[0]
+        x_idx = np.where(syms == self.core.X)[0]
 
-        PB_pos = pos[pb_idx]
-        BR_pos = pos[br_idx]
+        B_pos = pos[b_idx]
+        X_pos = pos[x_idx]
 
-        # KD-tree for Br atoms
-        tree = cKDTree(BR_pos)
+        x_tree = cKDTree(X_pos)
         r_cut = self.core.a + 1e-2
-        neigh_lists = tree.query_ball_point(PB_pos, r_cut)
+        neigh_lists = x_tree.query_ball_point(B_pos, r_cut)
 
-        octahedra = {}
+        octahedra: Dict[int, Dict[str, List[int]]] = {}
 
-        for loc, br_local_list in enumerate(neigh_lists):
-            pb_abs = int(pb_idx[loc])  
-            br_abs_list = [int(br_idx[j]) for j in br_local_list]
+        for b_loc, x_local_list in enumerate(neigh_lists):
+            b_abs = int(b_idx[b_loc])  
+            x_abs_list = [int(x_idx[j]) for j in x_local_list]  
 
-            octahedra[pb_abs] = {
-                "Pb": [pb_abs],
-                "Br": br_abs_list,
+            octahedra[b_abs] = {
+                "X": x_abs_list,  
                 "Ligand": []
             }
 
-        # Ligand
-        anchors = []
-        lig_ids = []
+        anchor_positions = []
+        ligand_ids = []
+
         for lig in self.ligands:
             if lig.charge <= 0 and getattr(lig, "anchor_pos", None) is not None:
-                anchors.append(np.asarray(lig.anchor_pos, dtype=float))
-                lig_ids.append(int(lig.id))
+                anchor_positions.append(np.asarray(lig.anchor_pos, dtype=float))
+                ligand_ids.append(int(lig.id))
 
-        if anchors:
-            anchors = np.vstack(anchors)
+        if anchor_positions:
+            anchor_positions = np.vstack(anchor_positions)
 
-            tree_pb = cKDTree(PB_pos)
-            d, pb_loc = tree_pb.query(anchors, k=1)
+            b_tree = cKDTree(B_pos)
+            _, b_loc = b_tree.query(anchor_positions, k=1)
 
-            for j, (dist, loc_pb) in enumerate(zip(d, pb_loc)):
-                pb_abs = int(pb_idx[int(loc_pb)])
-                octahedra[pb_abs]["Ligand"].append(lig_ids[j])
+            for j, b_loc_j in enumerate(b_loc):
+                b_abs = int(b_idx[int(b_loc_j)])
+                octahedra[b_abs]["Ligand"].append(ligand_ids[j])
 
         self.octahedra = octahedra
+
 
     def _build_index_map(self) -> None:
 
@@ -507,6 +506,7 @@ class NanoCrystal:
             lig.indices = idx
             cursor += n
 
+
     def to(self, fmt: str = "xyz", filename: str = None):
         at = self.atoms
         formula = at.get_chemical_formula()
@@ -519,6 +519,7 @@ class NanoCrystal:
 
         write(str(path), at, format=fmt, comment=formula)
         self.to_json(str(path) + ".json")
+
 
     def to_json(self, json_path: str) -> None:
 
@@ -636,10 +637,11 @@ class NanoCrystal:
 
         core_indices_meta = topo["core_indices"]
         octa_raw = core_indices_meta.get("octahedra", None)
+        X = str(core_meta["X"])
         if octa_raw is not None:
             octahedra = {
-                int(pb): {"Pb": v["Pb"], "Br": v["Br"], "Ligand": v["Ligand"]}
-                for pb, v in octa_raw.items()
+                int(b): {"X": v["X"], "Ligand": v["Ligand"]}
+                for b, v in octa_raw.items()
             }
         else:
             octahedra = None
