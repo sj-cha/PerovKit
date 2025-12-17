@@ -1,4 +1,4 @@
-# PyNC: an automatic construction of ligand-passivated nanocrystals
+# PyNC: A Framework for Generating and Analyzing Ligand-passivated Perovskite Nanocrystals
 
 Under active development by Seungjun Cha 
 
