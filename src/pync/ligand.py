@@ -40,7 +40,7 @@ class Ligand:
     def __post_init__(self):
         self._get_volume()
         self._get_binding_atoms_indices()
-        self._get_direction_vector()
+        self._orient_ligand()
 
     @classmethod
     def from_xyz(
@@ -190,7 +190,7 @@ class Ligand:
                 "Binding motifs with more than 2 atoms are not yet supported."
             )
 
-    def _get_direction_vector(self, n_angles: int = 720):
+    def _orient_ligand(self, n_angles: int = 720):
         coords = self.atoms.get_positions()
         binding_idx = self.binding_atoms
         assert 2 >= len(binding_idx) > 0, "Need 1 or 2 binding atoms"
