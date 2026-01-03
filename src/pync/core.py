@@ -1,6 +1,6 @@
 from __future__ import annotations
 from dataclasses import dataclass, field
-from typing import Dict, Tuple, List, Optional
+from typing import Dict, Tuple, List, Optional, Sequence
 from collections import defaultdict
 
 import numpy as np
@@ -193,8 +193,19 @@ class Core:
             angles=angles,
             order=order,
         )
-    
 
+
+    def apply_strain(
+        self,
+        strain: Sequence[float],          # (ex, ey, ez)
+    ):
+        from .strain import apply_strain
+        apply_strain(
+            structure=self,
+            strain=strain
+        )
+
+    
     def to(self, fmt: str = 'xyz', filename: str = None) -> None:
         """Export core structure to file."""
 

@@ -1,7 +1,7 @@
 from __future__ import annotations
 from dataclasses import dataclass, field
 from copy import deepcopy
-from typing import List, Dict, Optional, Tuple
+from typing import List, Dict, Optional, Tuple, Sequence
 import json
 from pathlib import Path
 
@@ -257,6 +257,19 @@ class NanoCrystal:
         )
 
     
+    def apply_strain(
+        self,
+        strain: Sequence[float],          # (ex, ey, ez)
+        move_ligands: bool = True,
+    ):
+        from .strain import apply_strain
+        apply_strain(
+            structure=self,
+            strain=strain,
+            move_ligands=move_ligands
+        )
+
+
     def check_overlaps(self, cutoff: float = None) -> float:
         if cutoff is None:
             cutoff = self.overlap_cutoff
