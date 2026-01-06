@@ -260,13 +260,13 @@ class NanoCrystal:
     def apply_strain(
         self,
         strain: Sequence[float],          # (ex, ey, ez)
-        move_ligands: bool = True,
+        strain_ligands: bool = True,
     ):
         from .strain import apply_strain
         apply_strain(
             structure=self,
             strain=strain,
-            move_ligands=move_ligands
+            strain_ligands=strain_ligands
         )
 
 

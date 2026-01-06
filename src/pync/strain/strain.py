@@ -10,7 +10,7 @@ from pync import Core, NanoCrystal
 def apply_strain(
     structure: Core | NanoCrystal,
     strain: Sequence[float],          # (ex, ey, ez)
-    move_ligands: bool = True,
+    strain_ligands: bool = True,
 ):
     strain = np.asarray(strain, dtype=float)
     if strain.shape != (3,):
@@ -32,12 +32,21 @@ def apply_strain(
         structure.atoms.positions[:] = pos_new[: len(structure.atoms)]
         return
 
-    n_core = len(structure.core.atoms)
-    pos_new[:n_core] = pos0[:n_core] @ F.T
-    structure.core.atoms.positions[:] = pos_new[:n_core]
+    if strain_ligands: # Strain all atoms including ligands
+        pos_new = pos0 @ F.T
 
-    # Optional move_ligand
-    if move_ligands:
+        n_core = len(structure.core.atoms)
+        structure.core.atoms.positions[:] = pos_new[:n_core]
+
+        for lig in structure.ligands:
+            lig.atoms.positions[:] = pos_new[lig.indices]
+        return
+    
+    else: # Strain core atoms only, ligands are rigidly translated
+        n_core = len(structure.core.atoms)
+        pos_new[:n_core] = pos0[:n_core] @ F.T
+        structure.core.atoms.positions[:] = pos_new[:n_core]
+
         for lig in structure.ligands:
             anchor0 = getattr(lig, "anchor_pos", None)
             if anchor0 is None:
