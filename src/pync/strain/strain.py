@@ -28,12 +28,16 @@ def apply_strain(
 
     # Apply strain 
     if isinstance(structure, Core):
-        pos_new = pos0 @ F.T
+        center = np.mean(pos0, axis=0)
+        pos_new = (pos0 - center) @ F.T + center
         structure.atoms.positions[:] = pos_new[: len(structure.atoms)]
         return
 
+    n_core = len(structure.core.atoms)
+    center = np.mean(pos0[:n_core], axis=0)
+
     if strain_ligands: # Strain all atoms including ligands
-        pos_new = pos0 @ F.T
+        pos_new = (pos0 - center) @ F.T + center
 
         n_core = len(structure.core.atoms)
         structure.core.atoms.positions[:] = pos_new[:n_core]
@@ -44,7 +48,7 @@ def apply_strain(
     
     else: # Strain core atoms only, ligands are rigidly translated
         n_core = len(structure.core.atoms)
-        pos_new[:n_core] = pos0[:n_core] @ F.T
+        pos_new[:n_core] = (pos0[:n_core] - center) @ F.T + center
         structure.core.atoms.positions[:] = pos_new[:n_core]
 
         for lig in structure.ligands:
@@ -53,7 +57,7 @@ def apply_strain(
                 continue
 
             anchor0 = np.asarray(anchor0, dtype=float).reshape(3,)
-            anchor_new = F @ anchor0
+            anchor_new = F @ (anchor0 - center) + center
             delta = anchor_new - anchor0
 
             lig.anchor_pos = anchor_new
