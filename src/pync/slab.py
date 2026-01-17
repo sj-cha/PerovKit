@@ -34,7 +34,7 @@ class Slab:
     def __post_init__(self):
         self.core = deepcopy(self.core)
 
-        if getattr(self.core, "is_core", False):
+        if getattr(self.core, "is_nanocrystal", False):
             raise ValueError(
                 "Slab got a nanocrystal-mode Core. Use NanoCrystal class instead."
             )
@@ -255,6 +255,7 @@ class Slab:
         )
 
         self._build_octahedra()
+        self._build_B_ijk()
         self._build_index_map()
 
 
@@ -678,6 +679,24 @@ class Slab:
         self.octahedra = octahedra
 
 
+    def _build_B_ijk(self) -> None:
+        if not self.octahedra:
+            self.B_ijk = {}
+            return
+
+        b_keys = np.array(sorted(self.octahedra.keys()), dtype=int)
+        pos = np.asarray(self.atoms.positions, dtype=float)
+        b_pos = pos[b_keys]
+
+        origin = b_pos.min(axis=0, keepdims=True)
+        ijk_arr = np.rint((b_pos - origin) / float(self.core.a)).astype(int)
+
+        self.B_ijk = {
+            int(b): (int(ijk_arr[i, 0]), int(ijk_arr[i, 1]), int(ijk_arr[i, 2]))
+            for i, b in enumerate(b_keys)
+        }
+
+
     def _build_index_map(self) -> None:
 
         n_core = len(self.core.atoms)
@@ -761,7 +780,7 @@ class Slab:
             meta["n_instances"] = type_counts[meta["id"]]
 
         core_indices_meta = {"octahedra": self.octahedra,
-                             "B_ijk": {str(k): list(v) for k, v in getattr(self.core, "B_ijk", {}).items()}
+                             "B_ijk": self.B_ijk
                              }
 
         ligands_meta = []
@@ -845,6 +864,9 @@ class Slab:
         else:
             octahedra = None
 
+        B_ijk_raw = core_indices_meta.get("B_ijk")
+        B_ijk = {int(k): (int(v[0]), int(v[1]), int(v[2])) for k, v in B_ijk_raw.items()}
+
         core = Core(
             A=core_meta["A"], 
             B=core_meta["B"], 
@@ -856,8 +878,6 @@ class Slab:
             build_surface=False,
         )
 
-        B_ijk_raw = core_indices_meta.get("B_ijk")
-        core.B_ijk = {int(k): (int(v[0]), int(v[1]), int(v[2])) for k, v in B_ijk_raw.items()}
 
         ligand_types_meta = topo["ligand_types"]
         type_id_to_meta: Dict[int, dict] = {
@@ -908,6 +928,7 @@ class Slab:
         slab.ligands = ligands
         slab.ligand_coverage = {t["name"]: t["coverage"] for t in ligand_types_meta}
         slab.octahedra = octahedra
+        slab.B_ijk = B_ijk
         slab._build_index_map()
 
         return slab

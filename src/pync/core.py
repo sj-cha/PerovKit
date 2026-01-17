@@ -52,18 +52,23 @@ class Core:
                 raise ValueError(f"supercell must be length-3 (nx, ny, nz); got {self.supercell}")
             self.supercell = tuple(int(x) for x in self.supercell)
 
-        self.surface_atoms = self._get_surface_atoms() if self.build_surface else {}
-        self.binding_sites = self._build_binding_sites() if self.build_surface else []
-        self._build_octahedra()
-        self._build_B_ijk()
-
+        if self.build_surface:
+            self.surface_atoms = self._get_surface_atoms()
+            self.binding_sites = self._build_binding_sites()
+            self._build_octahedra()
+            self._build_B_ijk()
+        else:
+            self.surface_atoms = {}
+            self.binding_sites = []
+            self.octahedra = {}
+            self.B_ijk = {}
 
     @property
     def is_slab(self) -> bool:
         return self.supercell is not None
 
     @property
-    def is_core(self) -> bool:
+    def is_nanocrystal(self) -> bool:
         return not self.is_slab
 
 
