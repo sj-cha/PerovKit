@@ -8,7 +8,7 @@ from scipy.sparse import coo_matrix
 from scipy.sparse.linalg import splu
 
 from .glazer_pattern import build_octahedra_rotmat
-from pync import Core, NanoCrystal
+from perovkit import Core, NanoCrystal
 
 """
 Some features have beem adapted from Terumasa Tadano's codes and modified.   

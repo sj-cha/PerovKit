@@ -4,7 +4,7 @@ from typing import Sequence
 
 import numpy as np
 
-from pync import Core, NanoCrystal
+from perovkit import Core, NanoCrystal
 
 
 def apply_strain(
