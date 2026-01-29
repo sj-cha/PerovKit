@@ -42,8 +42,8 @@ class Core:
     B_ijk: Dict[int, Tuple[int, int, int]] = field(default_factory=dict)
 
     build_surface: bool = True
-    surface_atoms: Dict[str, np.ndarray] = field(init=False)
-    plane_atoms: Dict[Plane, Dict[str, List[int]]] = field(default_factory=dict)
+    _surface_atoms: Dict[str, np.ndarray] = field(init=False)
+    _plane_atoms: Dict[Plane, Dict[str, List[int]]] = field(default_factory=dict)
     binding_sites: List[BindingSite] = field(default_factory=list)
 
     def __post_init__(self):
@@ -53,12 +53,12 @@ class Core:
             self.supercell = tuple(int(x) for x in self.supercell)
 
         if self.build_surface:
-            self.surface_atoms = self._get_surface_atoms()
+            self._surface_atoms = self._get_surface_atoms()
             self.binding_sites = self._build_binding_sites()
             self._build_octahedra()
             self._build_B_ijk()
         else:
-            self.surface_atoms = {}
+            self._surface_atoms = {}
             self.binding_sites = []
             self.octahedra = {}
             self.B_ijk = {}
@@ -136,7 +136,7 @@ class Core:
 
             net_charge = n_A * 1 + n_B * 2 - n_X * 1
 
-            plane_indices = core.plane_atoms
+            plane_indices = core._plane_atoms
             planes = list(plane_indices.keys())
 
             corners = [p for p in planes if np.all(p) == True]  
@@ -351,13 +351,13 @@ class Core:
 
                     plane_indices[v][elem].append(int(i))
 
-        self.plane_atoms = {
+        self._plane_atoms = {
             hkl: {elem: idxs for elem, idxs in elems.items()}
             for hkl, elems in plane_indices.items()
         }
 
         idx_to_site: Dict[int, BindingSite] = {}
-        for plane, elem_map in self.plane_atoms.items():
+        for plane, elem_map in self._plane_atoms.items():
             for elem, indices in elem_map.items():
                 for idx in indices:
                     idx = int(idx)
