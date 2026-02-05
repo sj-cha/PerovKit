@@ -26,7 +26,7 @@ from .utils.geometry import farthest_point_sampling, compute_bounding_spheres, b
 class Slab:
     core: Core
     ligand_specs: List[LigandSpec]
-    random_seed: int
+    random_seed: int = 42
     ligands: List[Ligand] = field(default_factory=list)
     ligand_coverage: Dict[str, float] = field(default_factory=dict)
     octahedra: Optional[Dict[int, dict]] = None
@@ -883,7 +883,8 @@ class Slab:
 
     def to(self, fmt='vasp', filename: Optional[str] = None) -> None:
         assert fmt == 'vasp', "Only 'vasp' format is supported currently."
-
+        assert len(self.ligands) > 0, "No ligands placed. Cannot export Slab."
+        
         at = self.atoms
         formula = at.get_chemical_formula()
 

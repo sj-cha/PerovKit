@@ -25,7 +25,7 @@ from .utils.geometry import farthest_point_sampling, compute_bounding_spheres, b
 class NanoCrystal:
     core: Core
     ligand_specs: List[LigandSpec]
-    random_seed: int
+    random_seed: int = 42
     ligands: List[Ligand] = field(default_factory=list)
     ligand_coverage: Dict[str, float] = field(default_factory=dict)
     octahedra: Optional[Dict[int, dict]] = None
@@ -637,6 +637,7 @@ class NanoCrystal:
 
 
     def to(self, fmt: str = "xyz", filename: str = None):
+        assert len(self.ligands) > 0, "No ligands placed. Cannot export NanoCrystal."
         at = self.atoms
         formula = at.get_chemical_formula()
 
