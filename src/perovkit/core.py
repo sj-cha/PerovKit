@@ -215,7 +215,6 @@ class Core:
         atoms = atoms[keep]
 
         atoms.set_cell([nx * float(a), ny * float(a), nz * float(a) + float(vacuum)])
-        atoms.set_pbc((True, True, False))
 
         slab = cls(
             A=A,
