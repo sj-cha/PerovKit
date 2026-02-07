@@ -33,6 +33,7 @@ class Slab:
 
     def __post_init__(self):
         self.core = deepcopy(self.core)
+        self.core.atoms.pbc = [True, True, False]
 
         if getattr(self.core, "is_nanocrystal", False):
             raise ValueError(
@@ -245,7 +246,7 @@ class Slab:
         stripped_atoms = Atoms(
             symbols=stripped_symbols,
             positions=stripped_positions,
-            pbc=old.atoms.pbc,
+            pbc=[True, True, True],
             cell=old.atoms.get_cell(),
         )
 
@@ -398,7 +399,7 @@ class Slab:
         stripped_atoms = Atoms(
             symbols=stripped_symbols,
             positions=stripped_positions,
-            pbc=old.atoms.pbc,
+            pbc=[True, True, True],
             cell=old.atoms.get_cell(),
         )
 
