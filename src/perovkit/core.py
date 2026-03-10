@@ -228,9 +228,9 @@ class Core:
         return slab
     
 
-    def perturb(self, bound: List[float], seed: Optional[int] = None) -> None:
-        if seed is not None:
-            rng = np.random.default_rng(seed)
+    def perturb(self, bound: List[float], random_seed: Optional[int] = None) -> None:
+        if random_seed is not None:
+            rng = np.random.default_rng(random_seed)
             rand_uniform = rng.uniform
         else:
             rand_uniform = np.random.uniform
