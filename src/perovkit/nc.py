@@ -263,6 +263,37 @@ class NanoCrystal:
         self._build_and_link_atoms()
 
 
+    def remove_ligand(self, id: int, re_index: bool = True) -> None:
+        idx = next(
+            (i for i, lig in enumerate(self.ligands) if lig.id == id),
+            None,
+        )
+        if idx is None:
+            raise ValueError(f"No ligand with id={id} found.")
+
+        self.ligands.pop(idx)
+
+        # Re-index remaining ligands
+        if re_index:
+            for i, lig in enumerate(self.ligands):
+                lig.id = i
+
+            # Remove ligand references from octahedra and remap ids
+            if self.octahedra is not None:
+                for b_abs, octa in self.octahedra.items():
+                    old_ids = octa["Ligand"]
+                    new_ids = []
+                    for lid in old_ids:
+                        if lid == id:
+                            continue
+                        # Shift ids that were above the removed one
+                        new_ids.append(lid - 1 if lid > id else lid)
+                    octa["Ligand"] = new_ids
+
+        self._build_index_map()
+        self._build_and_link_atoms()
+
+
     def apply_tilt(
         self,
         glazer: str,
@@ -642,7 +673,6 @@ class NanoCrystal:
 
 
     def to(self, fmt: str = "xyz", filename: str = None):
-        assert len(self.ligands) > 0, "No ligands placed. Cannot export NanoCrystal."
         at = self.atoms
         formula = at.get_chemical_formula()
 
