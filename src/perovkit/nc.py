@@ -45,10 +45,11 @@ class NanoCrystal:
         self._rng = random.Random(self.random_seed)
         self.ligand_specs.sort(
             key=lambda spec: (
-                0 if spec.ligand.charge > 0 else 1, 
-                -spec.ligand.volume,                
+                0 if spec.ligand.charge > 0 else 1,
+                -spec.ligand.volume,
             )
         )
+        self._atoms: Optional[Atoms] = None
 
 
     def place_ligands(
@@ -259,6 +260,7 @@ class NanoCrystal:
         self._build_octahedra()
         self._build_B_ijk()
         self._build_index_map()
+        self._build_and_link_atoms()
 
 
     def apply_tilt(
@@ -847,29 +849,58 @@ class NanoCrystal:
         nc.octahedra = octahedra
         nc.B_ijk = B_ijk
         nc._build_index_map()
+        nc._build_and_link_atoms()
 
         return nc
 
 
-    @property
-    def atoms(self) -> Atoms:
-        core_atoms = self.core.atoms
-        core_symbols = list(core_atoms.get_chemical_symbols())
-        core_positions = core_atoms.get_positions()
+    def _build_and_link_atoms(self) -> None:
+        """Build the combined Atoms and link position arrays via numpy views.
 
-        all_symbols = list(core_symbols)
-        all_positions = [core_positions]
+        After this call, `self._atoms`, `self.core.atoms`, and every
+        `ligand.atoms` share the same underlying position buffer.
+        Mutating positions on any one of them is instantly visible
+        in all the others (e.g. after MD or geometry optimisation).
+        """
+        core_atoms = self.core.atoms
+        all_symbols = list(core_atoms.get_chemical_symbols())
+        all_positions = [core_atoms.get_positions()]
 
         for lig in self.ligands:
-            lig_atoms = lig.atoms
-            all_symbols.extend(lig_atoms.get_chemical_symbols())
-            all_positions.append(lig_atoms.get_positions())
+            all_symbols.extend(lig.atoms.get_chemical_symbols())
+            all_positions.append(lig.atoms.get_positions())
 
         all_positions = np.vstack(all_positions)
 
-        return Atoms(
+        self._atoms = Atoms(
             symbols=all_symbols,
             positions=all_positions,
+            pbc=core_atoms.pbc,
+            cell=core_atoms.get_cell(),
+        )
+
+        # Link position arrays: make core and ligand position arrays
+        # be numpy views into self._atoms's position buffer.
+        shared = self._atoms.arrays['positions']
+        n_core = len(core_atoms)
+        self.core.atoms.arrays['positions'] = shared[:n_core]
+
+        cursor = n_core
+        for lig in self.ligands:
+            n = len(lig.atoms)
+            lig.atoms.arrays['positions'] = shared[cursor:cursor + n]
+            cursor += n
+
+    @property
+    def atoms(self) -> Atoms:
+        if self._atoms is not None:
+            return self._atoms
+
+        # Before ligands are placed, assemble on the fly (core only).
+        core_atoms = self.core.atoms
+        return Atoms(
+            symbols=core_atoms.get_chemical_symbols(),
+            positions=core_atoms.get_positions(),
             pbc=core_atoms.pbc,
             cell=core_atoms.get_cell(),
         )
