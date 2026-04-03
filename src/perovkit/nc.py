@@ -25,7 +25,6 @@ from .utils.geometry import farthest_point_sampling, compute_bounding_spheres, b
 class NanoCrystal:
     core: Core
     ligand_specs: List[LigandSpec]
-    random_seed: int = 42
     ligands: List[Ligand] = field(default_factory=list)
     ligand_coverage: Dict[str, float] = field(default_factory=dict)
     octahedra: Optional[Dict[int, dict]] = None
@@ -42,7 +41,6 @@ class NanoCrystal:
             self.binding_sites = deepcopy(self.core.binding_sites)
         else:
             self.binding_sites = []
-        self._rng = random.Random(self.random_seed)
         self.ligand_specs.sort(
             key=lambda spec: (
                 0 if spec.ligand.charge > 0 else 1,
@@ -59,11 +57,13 @@ class NanoCrystal:
         coarse_step_deg: int = 18,
         fine_step_deg: int = 2,
         window_deg: int = 12,
-        active_radius_factor: float = math.sqrt(2)/2
+        active_radius_factor: float = math.sqrt(2)/2,
+        random_seed: int = 42,
     ) -> None:
-        
+
         assert not self.ligands, "Ligands have already been placed."
 
+        self._rng = random.Random(random_seed)
         self.overlap_cutoff = overlap_cutoff
         self.coarse_step_deg = coarse_step_deg
         self.fine_step_deg = fine_step_deg
@@ -350,13 +350,10 @@ class NanoCrystal:
         n = 0
 
         for i in range(len(entities)):
+            tree_i = cKDTree(entities[i])
             for j in range(i + 1, len(entities)):
-                A = entities[i]
-                B = entities[j]
-                diff = A[:, None, :] - B[None, :, :]
-                d2 = np.sum(diff * diff, axis=-1)
-                min_idx = np.argmin(d2)
-                d_min = float(np.sqrt(d2.flat[min_idx]))
+                dists_j, _ = tree_i.query(entities[j], k=1)
+                d_min = float(np.min(dists_j))
 
                 if d_min < global_min:
                     global_min = d_min
@@ -672,7 +669,7 @@ class NanoCrystal:
             cursor += n
 
 
-    def to(self, fmt: str = "xyz", filename: str = None):
+    def to(self, fmt: str = "xyz", filename: str = None, write_json: bool = True) -> None:
         at = self.atoms
         formula = at.get_chemical_formula()
 
@@ -683,7 +680,8 @@ class NanoCrystal:
         path.parent.mkdir(parents=True, exist_ok=True)  
 
         write(str(path), at, format=fmt, comment=formula)
-        self.to_json(str(path) + ".json")
+        if write_json:
+            self.to_json(str(path) + ".json")
 
 
     def to_json(self, json_path: str) -> None:
@@ -776,7 +774,7 @@ class NanoCrystal:
 
 
     @classmethod
-    def from_xyz(cls, xyz_path: str, json_path: str) -> NanoCrystal:
+    def from_file(cls, xyz_path: str, json_path: str) -> NanoCrystal:
 
         atoms = read(xyz_path)
 
@@ -852,27 +850,29 @@ class NanoCrystal:
             lig_atoms = atoms[cursor : cursor + n_atoms]
             cursor += n_atoms
 
-            lig = object.__new__(Ligand)
-            lig.atoms = lig_atoms
-            lig.mol = None                      
-            lig.smiles = tmeta["smiles"]
-            lig.charge = tmeta["charge"]
-            lig.binding_motif = BindingMotif(tmeta["binding_motif_atoms"])
-            lig.name = tmeta["name"]
-            lig.plane = inst_meta["plane"]
-            lig.volume = tmeta["volume"]
-            lig._neighbor_cutoff = 2.0
-            lig.binding_atoms = list(map(int, tmeta.get("binding_atoms_indices", [])))
-            
+            binding_atoms = list(map(int, tmeta.get("binding_atoms_indices", [])))
             pos = np.asarray(lig_atoms.positions, dtype=float)
-            lig.anchor_pos = pos[np.asarray(lig.binding_atoms, dtype=int)].mean(axis=0)
+            anchor_pos = pos[np.asarray(binding_atoms, dtype=int)].mean(axis=0)
+
+            lig = Ligand._from_data(
+                atoms=lig_atoms,
+                mol=None,
+                smiles=tmeta["smiles"],
+                charge=tmeta["charge"],
+                binding_motif=BindingMotif(tmeta["binding_motif_atoms"]),
+                name=tmeta["name"],
+                plane=inst_meta["plane"],
+                volume=tmeta["volume"],
+                _neighbor_cutoff=1.2,
+                binding_atoms=binding_atoms,
+                anchor_pos=anchor_pos,
+            )
 
             ligands.append(lig)
 
         nc = cls(
             core=core,
-            ligand_specs=[],  
-            random_seed=0,    
+            ligand_specs=[],
         )
         nc.ligands = ligands
         nc.ligand_coverage = {t["name"]: t["coverage"] for t in ligand_types_meta}

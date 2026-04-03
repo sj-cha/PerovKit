@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 from dataclasses import dataclass, field
 from typing import Optional, Tuple, List
 
@@ -122,11 +123,27 @@ class Ligand:
             **kwargs)
     
     def clone(self) -> Ligand:
-        lig_cloned = object.__new__(Ligand)
-        lig_cloned.__dict__ = self.__dict__.copy()
-        lig_cloned.atoms = self.atoms.copy()
+        lig = copy.copy(self)
+        lig.atoms = self.atoms.copy()
+        if self.indices is not None:
+            lig.indices = self.indices.copy()
+        return lig
 
-        return lig_cloned
+    @classmethod
+    def _from_data(cls, **kwargs) -> Ligand:
+        lig = object.__new__(cls)
+        # Set dataclass defaults for optional fields
+        lig.id = None
+        lig.volume = None
+        lig.binding_atoms = []
+        lig.anchor_pos = None
+        lig.plane = None
+        lig.indices = None
+        lig._neighbor_cutoff = 1.2
+        lig._anchor_offset = 0.0
+        for k, v in kwargs.items():
+            setattr(lig, k, v)
+        return lig
 
     def _get_volume(self) -> float:        
         self.volume = float(AllChem.ComputeMolVolume(self.mol))
