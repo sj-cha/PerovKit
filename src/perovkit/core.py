@@ -269,7 +269,7 @@ class Core:
             self.atoms.set_cell(cell, scale_atoms=False)
 
 
-    def to(self, fmt: str = 'xyz', filename: Optional[str] = None) -> None:
+    def to(self, fmt: str, filename: Optional[str] = None) -> None:
         if filename is None:
             if self.is_slab:
                 nx, ny, nz = self.supercell or (0, 0, 0)

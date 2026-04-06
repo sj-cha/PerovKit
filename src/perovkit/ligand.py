@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Optional, Tuple, List
 
 import numpy as np
@@ -40,8 +41,9 @@ class Ligand:
 
     def __post_init__(self):
         self._get_volume()
-        self._get_binding_atoms_indices()
-        self._orient_ligand()
+        if self.binding_motif:
+            self._get_binding_atoms_indices()
+            self._orient_ligand()
 
     @classmethod
     def from_xyz(
@@ -95,9 +97,9 @@ class Ligand:
     def from_smiles(
         cls,
         smiles: str,
-        binding_motif: BindingMotif,
-        random_seed: int,
-        name: str,
+        binding_motif: BindingMotif = None,
+        random_seed: int = 42,
+        name: str = None,
         **kwargs
     ) -> Ligand:
         
@@ -275,6 +277,12 @@ class Ligand:
         """Export ligand to file."""
 
         formula = self.atoms.get_chemical_formula()
+
+        if filename is None:
+            filename = f"{self.smiles}.{fmt}"
+        
+        path = Path(filename)
+        path.parent.mkdir(parents=True, exist_ok=True)  
 
         write(filename, self.atoms, format=fmt, comment=formula)
 
