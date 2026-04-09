@@ -33,9 +33,8 @@ class Core:
     atoms: Atoms
     a: float
 
-    n_cells: Optional[int] = None                    # used for core mode
-    supercell: Optional[Tuple[int, int, int]] = None # used for slab mode (nx, ny, nz)
-    vacuum: Optional[float] = None                   # used for slab mode
+    supercell: Optional[Tuple[int, int, int]] = None  # (nx, ny, nz)
+    vacuum: Optional[float] = None
 
     indices: Optional[np.ndarray] = None
     octahedra: Dict[int, Dict[str, List[int]]] = field(default_factory=dict)
@@ -65,11 +64,11 @@ class Core:
 
     @property
     def is_slab(self) -> bool:
-        return self.supercell is not None
+        return any(self.atoms.pbc)
 
     @property
     def is_nanocrystal(self) -> bool:
-        return not self.is_slab
+        return not any(self.atoms.pbc)
 
 
     @classmethod
@@ -79,11 +78,15 @@ class Core:
         B: str,
         X: str,
         a: float,
-        n_cells: int,
+        supercell: Sequence[int],
         charge_neutral: bool = True,
         random_seed: Optional[int] = None,
         tol: float = 1e-5,
     ) -> Core:
+
+        if len(supercell) != 3:
+            raise ValueError(f"supercell must be length-3 (nx, ny, nz); got {supercell}")
+        nx, ny, nz = map(int, supercell)
 
         species = [A, B, X, X, X]
         motif_coords = np.array(
@@ -97,13 +100,12 @@ class Core:
             dtype=float,
         ) * float(a)
 
-        N = int(n_cells) + 1
         all_symbols: List[str] = []
         all_positions: List[np.ndarray] = []
 
-        for i in range(N):
-            for j in range(N):
-                for k in range(N):
+        for i in range(nx + 1):
+            for j in range(ny + 1):
+                for k in range(nz + 1):
                     shift = np.array([i, j, k], dtype=float) * float(a)
                     for s, c in zip(species, motif_coords):
                         all_symbols.append(s)
@@ -117,18 +119,19 @@ class Core:
             pbc=False,
         )
 
-        # Ensure AX termination 
-        max_coord = float(a) * (N - 1)
+        # Ensure AX termination
+        max_coords = np.array([nx, ny, nz], dtype=float) * float(a)
         pos = atoms.positions
         mask = np.ones(len(atoms), dtype=bool)
-        filt = np.any(pos > (max_coord + tol), axis=1)
+        filt = np.any(pos > (max_coords + tol), axis=1)
         mask[filt] = False
         atoms = atoms[mask]
 
-        core = cls(A=A, B=B, X=X, atoms=atoms, a=float(a), n_cells=int(n_cells))
+        sc = (nx, ny, nz)
+        core = cls(A=A, B=B, X=X, atoms=atoms, a=float(a), supercell=sc)
 
-        # Remove surface A atoms to ensure charge neutrality 
-        if core.n_cells is not None and core.n_cells > 1 and charge_neutral:
+        # Remove surface A atoms to ensure charge neutrality
+        if charge_neutral:
             symbols = core.atoms.get_chemical_symbols()
             n_A = sum(s == A for s in symbols)
             n_B = sum(s == B for s in symbols)
@@ -139,27 +142,28 @@ class Core:
             plane_indices = core._plane_atoms
             planes = list(plane_indices.keys())
 
-            corners = [p for p in planes if np.all(p) == True]  
+            corners = [p for p in planes if np.all(p) == True]
             corner_atoms = [x for c in corners for x in plane_indices[c].get(A, [])]
             rest = [p for p in planes if p not in corners]
             rest_atoms = [x for r in rest for x in plane_indices[r].get(A, [])]
 
-            if core.n_cells == 2:
-                corner_atoms = corner_atoms[:7]
+            if net_charge <= 8:
+                corner_atoms = corner_atoms[:net_charge]
+                to_remove = set(corner_atoms)
+            else:
+                to_remove = set(corner_atoms)
 
-            to_remove = set(corner_atoms)
-
-            n_remove = int(net_charge - len(corner_atoms))
-            if n_remove > 0:
-                rng = random.Random(random_seed)
-                extra_indices = rng.sample(sorted(rest_atoms), k=n_remove)
-                to_remove.update(extra_indices)
+                n_remove = int(net_charge - len(corner_atoms))
+                if n_remove > 0:
+                    rng = random.Random(random_seed)
+                    extra_indices = rng.sample(sorted(rest_atoms), k=n_remove)
+                    to_remove.update(extra_indices)
 
             mask = np.ones(len(core.atoms), dtype=bool)
             mask[list(to_remove)] = False
             new_atoms = core.atoms[mask]
 
-            core = cls(A=A, B=B, X=X, atoms=new_atoms, a=float(a), n_cells=int(n_cells))
+            core = cls(A=A, B=B, X=X, atoms=new_atoms, a=float(a), supercell=sc)
             core._build_binding_sites()
 
             symbols = core.atoms.get_chemical_symbols()
@@ -215,6 +219,7 @@ class Core:
         atoms = atoms[keep]
 
         atoms.set_cell([nx * float(a), ny * float(a), nz * float(a) + float(vacuum)])
+        atoms.pbc = [True, True, False]
 
         slab = cls(
             A=A,
@@ -251,11 +256,13 @@ class Core:
         pos = self.atoms.get_positions()
         self.atoms.set_positions(pos + dirs * mags[:, None])
 
+
     def apply_tilt(self, glazer: str, angles: Tuple[float, float, float], *, order: str = "xyz"):
         from .tilt import apply_tilt
         if self.is_slab:
             raise NotImplementedError("Tilt is not implemented for slab structures.")
         apply_tilt(structure=self, glazer=glazer, angles=angles, order=order)
+
 
     def apply_strain(self, strain: Sequence[float]):
         from .strain import apply_strain
@@ -271,12 +278,8 @@ class Core:
 
     def to(self, fmt: str, filename: Optional[str] = None) -> None:
         if filename is None:
-            if self.is_slab:
-                nx, ny, nz = self.supercell or (0, 0, 0)
-                filename = f"{self.A}{self.B}{self.X}3_{nx}x{ny}x{nz}.{fmt}"
-            else:
-                nc = self.n_cells if self.n_cells is not None else "NA"
-                filename = f"{self.A}{self.B}{self.X}3_{nc}.{fmt}"
+            nx, ny, nz = self.supercell or (0, 0, 0)
+            filename = f"{self.A}{self.B}{self.X}3_{nx}x{ny}x{nz}.{fmt}"
 
         path = Path(filename)
         path.parent.mkdir(parents=True, exist_ok=True)  
@@ -295,6 +298,9 @@ class Core:
 
         positions = np.asarray(self.atoms.get_positions(), dtype=float)
         symbols = np.array(self.atoms.get_chemical_symbols())
+        pbc = self.atoms.pbc
+        non_periodic = [i for i in range(3) if not pbc[i]]
+        has_periodic = any(pbc)
 
         for element in [self.A, self.X]:
             elem_global = np.where(symbols == element)[0]
@@ -304,51 +310,51 @@ class Core:
                 surface_indices[element] = np.array([], dtype=int)
                 continue
 
-            if self.is_slab:
-                z_max = elem_pos[:, 2].max()
-                surface_flags = np.isclose(elem_pos[:, 2], z_max, atol=tol)
-            else:
-                mins = elem_pos.min(axis=0)
-                maxs = elem_pos.max(axis=0)
-                on_min = np.isclose(elem_pos, mins, atol=tol)
-                on_max = np.isclose(elem_pos, maxs, atol=tol)
-                surface_flags = np.any(on_min | on_max, axis=1)
+            surface_flags = np.zeros(len(elem_pos), dtype=bool)
+            for ax in non_periodic:
+                ax_max = elem_pos[:, ax].max()
+                surface_flags |= np.isclose(elem_pos[:, ax], ax_max, atol=tol)
+                if not has_periodic:
+                    ax_min = elem_pos[:, ax].min()
+                    surface_flags |= np.isclose(elem_pos[:, ax], ax_min, atol=tol)
 
             surface_indices[element] = elem_global[surface_flags].astype(int)
 
         return surface_indices
 
+
     def _build_binding_sites(self) -> List[BindingSite]:
         surface = self._get_surface_atoms()
         positions = np.array([a.position for a in self.atoms], dtype=float)
         symbols = np.array([a.symbol for a in self.atoms])
+        pbc = self.atoms.pbc
+        non_periodic = [i for i in range(3) if not pbc[i]]
+        has_periodic = any(pbc)
 
         tol = 1e-3
         plane_indices = defaultdict(lambda: defaultdict(list))
 
-        if self.is_slab:
-            for elem, idxs in surface.items():
-                for i in idxs:
-                    plane_indices[(0, 0, 1)][elem].append(int(i))            
-        else:
-            for elem, idxs in surface.items():
-                elem_global = np.where(symbols == elem)[0]
-                elem_pos = positions[elem_global]
-                if elem_pos.size == 0:
+        for elem, idxs in surface.items():
+            elem_global = np.where(symbols == elem)[0]
+            elem_pos = positions[elem_global]
+            if elem_pos.size == 0:
+                continue
+
+            mins, maxs = elem_pos.min(0), elem_pos.max(0)
+
+            for i in idxs:
+                p = positions[int(i)]
+                plane = [0, 0, 0]
+                for ax in non_periodic:
+                    if np.isclose(p[ax], maxs[ax], atol=tol):
+                        plane[ax] = 1
+                    elif not has_periodic and np.isclose(p[ax], mins[ax], atol=tol):
+                        plane[ax] = -1
+                v = tuple(plane)
+                if np.count_nonzero(v) == 0:
                     continue
 
-                mins, maxs = elem_pos.min(0), elem_pos.max(0)
-
-                for i in idxs:
-                    p = positions[int(i)]
-                    is_max = np.isclose(p, maxs, atol=tol)
-                    is_min = np.isclose(p, mins, atol=tol)
-
-                    v = tuple(int(x) for x in (is_max.astype(int) - is_min.astype(int)))
-                    if np.count_nonzero(v) == 0:
-                        continue
-
-                    plane_indices[v][elem].append(int(i))
+                plane_indices[v][elem].append(int(i))
 
         self._plane_atoms = {
             hkl: {elem: idxs for elem, idxs in elems.items()}
@@ -366,6 +372,7 @@ class Core:
 
         return list(idx_to_site.values())
 
+
     def _build_octahedra(self) -> None:
         at = self.atoms
         syms = np.array(at.get_chemical_symbols())
@@ -377,8 +384,9 @@ class Core:
             self.octahedra = {}
             return
 
-        if self.is_slab:
-            # periodic neighbor search (cKDTree boxsize needs coords in [0, L))
+        r_cut = float(self.a) + 1e-2
+
+        if any(at.pbc):
             cell = at.get_cell()
             Lx, Ly, Lz = cell.lengths()
 
@@ -389,16 +397,14 @@ class Core:
             X_pos = pos[x_idx]
 
             tree = cKDTree(X_pos, boxsize=(Lx, Ly, Lz))
-            r_cut = float(self.a) + 1e-2
-            neigh_lists = tree.query_ball_point(B_pos, r_cut)
         else:
             pos = at.get_positions()
             B_pos = pos[b_idx]
             X_pos = pos[x_idx]
 
             tree = cKDTree(X_pos)
-            r_cut = float(self.a) + 1e-2
-            neigh_lists = tree.query_ball_point(B_pos, r_cut)
+
+        neigh_lists = tree.query_ball_point(B_pos, r_cut)
 
         octahedra: Dict[int, Dict[str, List[int]]] = {}
         for b_loc, x_local_list in enumerate(neigh_lists):
@@ -407,6 +413,7 @@ class Core:
             octahedra[b_abs] = {"X": x_abs_list, "Ligand": []}
 
         self.octahedra = octahedra
+
 
     def _build_B_ijk(self) -> None:
         if not self.octahedra:

@@ -32,7 +32,6 @@ class Slab:
 
     def __post_init__(self):
         self.core = deepcopy(self.core)
-        self.core.atoms.pbc = [True, True, False]
 
         if getattr(self.core, "is_nanocrystal", False):
             raise ValueError(

@@ -253,7 +253,7 @@ class NanoCrystal:
             X=self.core.X,
             atoms=stripped_atoms,
             a=self.core.a,
-            n_cells=self.core.n_cells,
+            supercell=self.core.supercell,
             build_surface=False,
         )
 
@@ -693,7 +693,7 @@ class NanoCrystal:
             "B": self.core.B,
             "X": self.core.X,
             "a": self.core.a,
-            "n_cells": self.core.n_cells,
+            "supercell": list(self.core.supercell),
             "n_core_atoms": len(self.core.atoms)
         }
 
@@ -822,7 +822,7 @@ class NanoCrystal:
             X=core_meta["X"],
             atoms=core_atoms,
             a=core_meta["a"],
-            n_cells=core_meta["n_cells"],
+            supercell=tuple(core_meta["supercell"]),
             build_surface=False,
         )
 
