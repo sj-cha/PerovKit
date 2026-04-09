@@ -12,7 +12,7 @@ from scipy.spatial import cKDTree
 
 # RDKit
 from rdkit import Chem
-from rdkit.Chem import AllChem, rdDetermineBonds
+from rdkit.Chem import AllChem, rdDetermineBonds, rdMolTransforms
 
 from .utils.rotation import rotation_about_axis, rotation_from_u_to_v
 
@@ -100,15 +100,38 @@ class Ligand:
         binding_motif: BindingMotif = None,
         random_seed: int = 42,
         name: str = None,
+        optimize: bool = False,
         **kwargs
     ) -> Ligand:
-        
+
         mol = Chem.MolFromSmiles(smiles)
         mol = Chem.AddHs(mol)
         params = AllChem.ETKDGv3()
         params.randomSeed = random_seed
         AllChem.EmbedMolecule(mol, params)
-        AllChem.UFFOptimizeMolecule(mol)
+
+        if optimize:
+            AllChem.UFFOptimizeMolecule(mol)
+        else:
+            # Set all rotatable bond dihedrals to 180° (all-trans/extended)
+            rotatable = Chem.MolFromSmarts('[!$(*#*)&!D1]-&!@[!$(*#*)&!D1]')
+            matches = mol.GetSubstructMatches(rotatable)
+            conf = mol.GetConformer()
+            torsion_indices = []
+            for match in matches:
+                i, j = match
+                neighbors_i = [n.GetIdx() for n in mol.GetAtomWithIdx(i).GetNeighbors() if n.GetIdx() != j]
+                neighbors_j = [n.GetIdx() for n in mol.GetAtomWithIdx(j).GetNeighbors() if n.GetIdx() != i]
+                if neighbors_i and neighbors_j:
+                    quad = (neighbors_i[0], i, j, neighbors_j[0])
+                    rdMolTransforms.SetDihedralDeg(conf, *quad, 180.0)
+                    torsion_indices.append(quad)
+
+            # Relax bonds/angles while keeping torsions fixed at 180°
+            ff = AllChem.UFFGetMoleculeForceField(mol)
+            for a, b, c, d in torsion_indices:
+                ff.UFFAddTorsionConstraint(a, b, c, d, False, 180.0, 180.0, 1.0e5)
+            ff.Minimize(maxIts=200)
 
         positions = mol.GetConformers()[0].GetPositions()
         symbols = [atom.GetSymbol() for atom in mol.GetAtoms()]
@@ -279,7 +302,10 @@ class Ligand:
         formula = self.atoms.get_chemical_formula()
 
         if filename is None:
-            filename = f"{self.smiles}.{fmt}"
+            if self.name is not None:
+                filename = f"{self.name}.{fmt}"
+            else:
+                filename = f"{self.smiles}.{fmt}"
         
         path = Path(filename)
         path.parent.mkdir(parents=True, exist_ok=True)  
