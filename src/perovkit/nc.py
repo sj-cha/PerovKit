@@ -18,7 +18,7 @@ from scipy.spatial import cKDTree
 from .core import Core, BindingSite
 from .ligand import Ligand, LigandSpec, BindingMotif
 from .utils.rotation import rotation_about_axis, rotation_from_u_to_v
-from .utils.geometry import farthest_point_sampling, compute_bounding_spheres, build_neighbor_map
+from .utils.geometry import farthest_point_sampling, per_face_farthest_point_sampling, compute_bounding_spheres, build_neighbor_map
 
 
 @dataclass
@@ -118,7 +118,12 @@ class NanoCrystal:
                         n_target = len(available)
 
                 coords = np.array([core_positions[s.index] for s in available])
-                chosen_indices = farthest_point_sampling(coords, n_target, self._rng)
+                sc = self.core.supercell
+                if sc is not None and len(set(sc)) > 1:
+                    planes = [s.plane for s in available]
+                    chosen_indices = per_face_farthest_point_sampling(coords, planes, n_target, self._rng)
+                else:
+                    chosen_indices = farthest_point_sampling(coords, n_target, self._rng)
                 chosen_sites = [available[i] for i in chosen_indices]
 
             for site in chosen_sites:

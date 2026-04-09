@@ -33,6 +33,51 @@ def farthest_point_sampling(
 
     return selected
 
+def per_face_farthest_point_sampling(
+    coords: np.ndarray,
+    planes: List[Tuple[int, int, int]],
+    n_target: int,
+    rng: random.Random,
+) -> List[int]:
+    """FPS run independently per face, with n_target allocated proportionally."""
+    from collections import defaultdict
+    import math
+
+    face_groups: Dict[Tuple[int, int, int], List[int]] = defaultdict(list)
+    for i, plane in enumerate(planes):
+        # Group by absolute plane (e.g., (1,0,0) and (-1,0,0) are opposite faces)
+        face_groups[plane].append(i)
+
+    total = len(coords)
+    if n_target >= total:
+        return list(range(total))
+
+    selected: List[int] = []
+    remainder = 0.0
+
+    faces = sorted(face_groups.keys())
+    for face in faces:
+        indices = face_groups[face]
+        # Proportional allocation with fractional accumulation
+        exact = n_target * len(indices) / total + remainder
+        n_face = int(math.floor(exact))
+        remainder = exact - n_face
+        if n_face == 0:
+            continue
+
+        face_coords = coords[indices]
+        face_selected = farthest_point_sampling(face_coords, n_face, rng)
+        selected.extend(indices[j] for j in face_selected)
+
+    # If rounding left us short, fill from unselected sites
+    if len(selected) < n_target:
+        unselected = [i for i in range(total) if i not in set(selected)]
+        rng.shuffle(unselected)
+        selected.extend(unselected[:n_target - len(selected)])
+
+    return selected
+
+
 def compute_bounding_spheres(
         coords_list: List[np.ndarray],
     ) -> Tuple[np.ndarray, np.ndarray]:
