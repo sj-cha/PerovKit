@@ -259,8 +259,6 @@ class Core:
 
     def apply_tilt(self, glazer: str, angles: Tuple[float, float, float], *, order: str = "xyz"):
         from .tilt import apply_tilt
-        if self.is_slab:
-            raise NotImplementedError("Tilt is not implemented for slab structures.")
         apply_tilt(structure=self, glazer=glazer, angles=angles, order=order)
 
 

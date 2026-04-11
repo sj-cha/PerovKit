@@ -28,7 +28,14 @@ class Slab:
     ligand_specs: List[LigandSpec]
     ligands: List[Ligand] = field(default_factory=list)
     ligand_coverage: Dict[str, float] = field(default_factory=dict)
-    octahedra: Optional[Dict[int, dict]] = None
+
+    @property
+    def octahedra(self):
+        return self.core.octahedra
+
+    @property
+    def B_ijk(self):
+        return self.core.B_ijk
 
     def __post_init__(self):
         self.core = deepcopy(self.core)
@@ -256,8 +263,8 @@ class Slab:
         stripped_atoms.cell[2, 2] = max_z + old.vacuum
         
         self.core = Core(
-            A=old.A, 
-            B=old.B, 
+            A=old.A,
+            B=old.B,
             X=old.X,
             atoms=stripped_atoms,
             a=old.a,
@@ -265,9 +272,10 @@ class Slab:
             vacuum=old.vacuum,
             build_surface=False,
         )
+        self.core._build_octahedra()
+        self.core._build_B_ijk()
 
-        self._build_octahedra()
-        self._build_B_ijk()
+        self._assign_ligands_to_octahedra()
         self._build_index_map()
         self._build_and_link_atoms()
 
@@ -410,8 +418,8 @@ class Slab:
         stripped_atoms.cell[2, 2] = max_z + old.vacuum
         
         self.core = Core(
-            A=old.A, 
-            B=old.B, 
+            A=old.A,
+            B=old.B,
             X=old.X,
             atoms=stripped_atoms,
             a=old.a,
@@ -419,9 +427,10 @@ class Slab:
             vacuum=old.vacuum,
             build_surface=False,
         )
+        self.core._build_octahedra()
+        self.core._build_B_ijk()
 
-        self._build_octahedra()
-        self._build_B_ijk()
+        self._assign_ligands_to_octahedra()
         self._build_index_map()
         self._build_and_link_atoms()
 
@@ -828,39 +837,25 @@ class Slab:
         return best_theta, best_coords_i
 
 
-    def _build_octahedra(self) -> None:
-        
-        # Core
+    def _assign_ligands_to_octahedra(self) -> None:
+        """Add ligand associations to the core-built octahedra."""
+        octahedra = self.octahedra
+        if not octahedra:
+            return
+
+        for octa in octahedra.values():
+            octa["Ligand"] = []
+
         at = self.core.atoms
         syms = np.array(at.get_chemical_symbols())
-        pos = at.get_positions()
-
         b_idx = np.where(syms == self.core.B)[0]
-        x_idx = np.where(syms == self.core.X)[0]
 
         cell = at.get_cell()
         Lx, Ly, Lz = cell.lengths()
 
         scaled = at.get_scaled_positions(wrap=True)
         pos = scaled @ cell.array
-
         B_pos = pos[b_idx]
-        X_pos = pos[x_idx]
-
-        x_tree = cKDTree(X_pos, boxsize=(Lx, Ly, Lz))
-        r_cut = float(self.core.a) + 1e-2
-        neigh_lists = x_tree.query_ball_point(B_pos, r_cut)
-
-        octahedra: Dict[int, Dict[str, List[int]]] = {}
-
-        for b_loc, x_local_list in enumerate(neigh_lists):
-            b_abs = int(b_idx[b_loc])  
-            x_abs_list = [int(x_idx[j]) for j in x_local_list]  
-
-            octahedra[b_abs] = {
-                "X": x_abs_list,  
-                "Ligand": []
-            }
 
         anchor_positions = []
         ligand_ids = []
@@ -879,26 +874,6 @@ class Slab:
             for j, b_loc_j in enumerate(b_loc):
                 b_abs = int(b_idx[int(b_loc_j)])
                 octahedra[b_abs]["Ligand"].append(ligand_ids[j])
-
-        self.octahedra = octahedra
-
-
-    def _build_B_ijk(self) -> None:
-        if not self.octahedra:
-            self.B_ijk = {}
-            return
-
-        b_keys = np.array(sorted(self.octahedra.keys()), dtype=int)
-        pos = np.asarray(self.atoms.positions, dtype=float)
-        b_pos = pos[b_keys]
-
-        origin = b_pos.min(axis=0, keepdims=True)
-        ijk_arr = np.rint((b_pos - origin) / float(self.core.a)).astype(int)
-
-        self.B_ijk = {
-            int(b): (int(ijk_arr[i, 0]), int(ijk_arr[i, 1]), int(ijk_arr[i, 2]))
-            for i, b in enumerate(b_keys)
-        }
 
 
     def _build_index_map(self) -> None:
@@ -1012,6 +987,7 @@ class Slab:
 
         topo = {
             "schema_version": 1,
+            "type": "slab",
             "n_total_atoms": n_total_atoms,
             "core": core_meta,
             "ligand_types": ligand_types_meta,
@@ -1032,12 +1008,20 @@ class Slab:
         with open(json_path) as f:
             topo = json.load(f)
 
-        vasp_sort_idx = topo.get("vasp_sort_idx", None)
-        atoms = atoms[np.argsort(vasp_sort_idx)]
-
         schema_version = topo.get("schema_version", 1)
         if schema_version != 1:
             raise ValueError(f"Unsupported schema_version: {schema_version!r}")
+
+        file_type = topo.get("type")
+        if file_type is not None and file_type != "slab":
+            raise ValueError(
+                f"JSON type is '{file_type}', expected 'slab'. "
+                f"Use NanoCrystal.from_file() for nanocrystal data."
+            )
+
+        vasp_sort_idx = topo.get("vasp_sort_idx")
+        if vasp_sort_idx is not None:
+            atoms = atoms[np.argsort(vasp_sort_idx)]
 
         n_total_atoms_json = topo["n_total_atoms"]
         if n_total_atoms_json != len(atoms):
@@ -1134,8 +1118,8 @@ class Slab:
         )
         slab.ligands = ligands
         slab.ligand_coverage = {t["name"]: t["coverage"] for t in ligand_types_meta}
-        slab.octahedra = octahedra
-        slab.B_ijk = B_ijk
+        slab.core.octahedra = octahedra
+        slab.core.B_ijk = B_ijk
         slab._build_index_map()
         slab._build_and_link_atoms()
 

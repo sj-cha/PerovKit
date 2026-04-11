@@ -8,12 +8,23 @@ from scipy.sparse import coo_matrix
 from scipy.sparse.linalg import splu
 
 from .glazer_pattern import build_octahedra_rotmat
-from perovkit import Core, NanoCrystal
+from perovkit import Core, NanoCrystal, Slab
 
 """
 Some features have beem adapted from Terumasa Tadano's codes and modified.   
 Please refer to DistortPerovskite: https://github.com/ttadano/DistortPerovskite/tree/main
 """
+
+
+def _mic(v, cell_inv, cell_arr, pbc):
+    """Minimum-image convention for displacement vector(s) *v*."""
+    if cell_inv is None:
+        return v
+    frac = v @ cell_inv
+    for ax in range(3):
+        if pbc[ax]:
+            frac[..., ax] -= np.round(frac[..., ax])
+    return frac @ cell_arr
 
 
 def _build_X_to_B(octahedra: Dict[int, dict]) -> Dict[int, list[int]]:
@@ -29,6 +40,9 @@ def _adjust_network(
     b_keys: np.ndarray,
     x_to_bs: Dict[int, list[int]],
     R_b: Dict[int, np.ndarray],
+    cell_inv: np.ndarray | None = None,
+    cell_arr: np.ndarray | None = None,
+    pbc: np.ndarray | None = None,
 ) -> Dict[int, np.ndarray]:
 
     b_keys_list = [int(b) for b in b_keys]
@@ -67,12 +81,12 @@ def _adjust_network(
 
                 rbi0 = pos0[bi]
                 rbj0 = pos0[bj]
-                vi = pos0[x] - rbi0
-                vj = pos0[x] - rbj0
+                vi = _mic(pos0[x] - rbi0, cell_inv, cell_arr, pbc)
+                vj = _mic(pos0[x] - rbj0, cell_inv, cell_arr, pbc)
 
                 pred_i = rbi0 + Ri @ vi
                 pred_j = rbj0 + Rj @ vj
-                delta_ij = pred_i - pred_j  # t_j - t_i = delta_ij
+                delta_ij = _mic(pred_i - pred_j, cell_inv, cell_arr, pbc)
 
                 add_directed(bi, bj, delta_ij)
                 add_directed(bj, bi, -delta_ij)
@@ -98,15 +112,8 @@ def _adjust_network(
     return {b_keys_list[i]: t[i].copy() for i in range(n)}
 
 
-def _get_b_ijk(structure: Core | NanoCrystal) -> Dict[int, Tuple[int, int, int]]:
-    if isinstance(structure, Core):
-        return structure.B_ijk
-    if isinstance(structure, NanoCrystal):
-        return structure.core.B_ijk
-
-
 def apply_tilt(
-    structure: Core | NanoCrystal,
+    structure: Core | NanoCrystal | Slab,
     glazer: str,
     angles: Tuple[float, float, float],
     *,
@@ -120,12 +127,12 @@ def apply_tilt(
     pos0 = np.array(structure.atoms.positions, dtype=float, copy=True)
     pos_new = np.array(pos0, copy=True)
 
-    # Ligand maps (NanoCrystal only)
+    # Ligand maps (NanoCrystal / Slab only)
     lig_to_b = {}
     lig_global_indices = {}
     lig_anchor0 = None
 
-    if isinstance(structure, NanoCrystal) and move_ligands:
+    if isinstance(structure, (NanoCrystal, Slab)) and move_ligands:
         lig_anchor0 = {}
         for b in b_keys:
             for lig_id in octahedra[int(b)].get("Ligand", []):
@@ -141,7 +148,7 @@ def apply_tilt(
         if not lig_anchor0:
             lig_anchor0 = None
 
-    b_ijk = _get_b_ijk(structure)  
+    b_ijk = structure.B_ijk
 
     # Per-B rotation matrices following Glazer phase rule
     R_b = build_octahedra_rotmat(
@@ -153,9 +160,18 @@ def apply_tilt(
     )
 
     x_to_bs = _build_X_to_B(octahedra)
-    
+
+    # Periodic boundary info
+    atoms = structure.atoms if isinstance(structure, Core) else structure.core.atoms
+    pbc = np.asarray(atoms.pbc)
+    if any(pbc):
+        cell_arr = np.asarray(atoms.get_cell(), dtype=float)
+        cell_inv = np.linalg.inv(cell_arr)
+    else:
+        cell_arr = cell_inv = None
+
     # Solve translations to restore corner sharing
-    t_b = _adjust_network(pos0, b_keys, x_to_bs, R_b)
+    t_b = _adjust_network(pos0, b_keys, x_to_bs, R_b, cell_inv, cell_arr, pbc)
 
     # 1) B: translate only
     for b in b_keys:
@@ -169,12 +185,16 @@ def apply_tilt(
             R = R_b.get(int(b), np.eye(3))
             tb = t_b.get(int(b), np.zeros(3))
             rb0 = pos0[int(b)]
-            v0 = pos0[int(x)] - rb0
+            v0 = _mic(pos0[int(x)] - rb0, cell_inv, cell_arr, pbc)
             preds.append((rb0 + tb) + (R @ v0))
+        if len(preds) > 1:
+            ref = preds[0]
+            for i in range(1, len(preds)):
+                preds[i] = ref + _mic(preds[i] - ref, cell_inv, cell_arr, pbc)
         pos_new[int(x)] = np.mean(preds, axis=0)
 
     # 3) Ligands: rigidly follow assigned B (row-vector update)
-    if isinstance(structure, NanoCrystal) and move_ligands:
+    if isinstance(structure, (NanoCrystal, Slab)) and move_ligands:
         for lig_id, b in lig_to_b.items():
             b = int(b)
             R = R_b.get(b, np.eye(3))

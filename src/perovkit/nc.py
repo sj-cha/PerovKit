@@ -27,7 +27,14 @@ class NanoCrystal:
     ligand_specs: List[LigandSpec]
     ligands: List[Ligand] = field(default_factory=list)
     ligand_coverage: Dict[str, float] = field(default_factory=dict)
-    octahedra: Optional[Dict[int, dict]] = None
+
+    @property
+    def octahedra(self):
+        return self.core.octahedra
+
+    @property
+    def B_ijk(self):
+        return self.core.B_ijk
 
     def __post_init__(self):
         self.core = deepcopy(self.core)
@@ -261,9 +268,10 @@ class NanoCrystal:
             supercell=self.core.supercell,
             build_surface=False,
         )
+        self.core._build_octahedra()
+        self.core._build_B_ijk()
 
-        self._build_octahedra()
-        self._build_B_ijk()
+        self._assign_ligands_to_octahedra()
         self._build_index_map()
         self._build_and_link_atoms()
 
@@ -594,33 +602,19 @@ class NanoCrystal:
         return best_theta, best_coords_i
 
 
-    def _build_octahedra(self) -> None:
-        
-        # Core
+    def _assign_ligands_to_octahedra(self) -> None:
+        """Add ligand associations to the core-built octahedra."""
+        octahedra = self.octahedra
+        if not octahedra:
+            return
+
+        for octa in octahedra.values():
+            octa["Ligand"] = []
+
         at = self.core.atoms
         syms = np.array(at.get_chemical_symbols())
-        pos = at.get_positions()
-
         b_idx = np.where(syms == self.core.B)[0]
-        x_idx = np.where(syms == self.core.X)[0]
-
-        B_pos = pos[b_idx]
-        X_pos = pos[x_idx]
-
-        x_tree = cKDTree(X_pos)
-        r_cut = self.core.a + 1e-2
-        neigh_lists = x_tree.query_ball_point(B_pos, r_cut)
-
-        octahedra: Dict[int, Dict[str, List[int]]] = {}
-
-        for b_loc, x_local_list in enumerate(neigh_lists):
-            b_abs = int(b_idx[b_loc])  
-            x_abs_list = [int(x_idx[j]) for j in x_local_list]  
-
-            octahedra[b_abs] = {
-                "X": x_abs_list,  
-                "Ligand": []
-            }
+        B_pos = at.get_positions()[b_idx]
 
         anchor_positions = []
         ligand_ids = []
@@ -640,29 +634,8 @@ class NanoCrystal:
                 b_abs = int(b_idx[int(b_loc_j)])
                 octahedra[b_abs]["Ligand"].append(ligand_ids[j])
 
-        self.octahedra = octahedra
-
-
-    def _build_B_ijk(self) -> None:
-        if not self.octahedra:
-            self.B_ijk = {}
-            return
-
-        b_keys = np.array(sorted(self.octahedra.keys()), dtype=int)
-        pos = np.asarray(self.atoms.positions, dtype=float)
-        b_pos = pos[b_keys]
-
-        origin = b_pos.min(axis=0, keepdims=True)
-        ijk_arr = np.rint((b_pos - origin) / float(self.core.a)).astype(int)
-
-        self.B_ijk = {
-            int(b): (int(ijk_arr[i, 0]), int(ijk_arr[i, 1]), int(ijk_arr[i, 2]))
-            for i, b in enumerate(b_keys)
-        }
-
 
     def _build_index_map(self) -> None:
-
         n_core = len(self.core.atoms)
         self.core.indices = np.arange(n_core, dtype=int)
 
@@ -767,6 +740,7 @@ class NanoCrystal:
 
         topo = {
             "schema_version": 1,
+            "type": "nanocrystal",
             "n_total_atoms": n_total_atoms,
             "core": core_meta,
             "ligand_types": ligand_types_meta,
@@ -789,6 +763,13 @@ class NanoCrystal:
         schema_version = topo.get("schema_version", 1)
         if schema_version != 1:
             raise ValueError(f"Unsupported schema_version: {schema_version!r}")
+
+        file_type = topo.get("type")
+        if file_type is not None and file_type != "nanocrystal":
+            raise ValueError(
+                f"JSON type is '{file_type}', expected 'nanocrystal'. "
+                f"Use Slab.from_file() for slab data."
+            )
 
         n_total_atoms_json = topo["n_total_atoms"]
         if n_total_atoms_json != len(atoms):
@@ -881,8 +862,8 @@ class NanoCrystal:
         )
         nc.ligands = ligands
         nc.ligand_coverage = {t["name"]: t["coverage"] for t in ligand_types_meta}
-        nc.octahedra = octahedra
-        nc.B_ijk = B_ijk
+        nc.core.octahedra = octahedra
+        nc.core.B_ijk = B_ijk
         nc._build_index_map()
         nc._build_and_link_atoms()
 
