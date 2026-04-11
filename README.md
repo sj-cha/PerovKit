@@ -1,14 +1,12 @@
 # PerovKit
 
-A Python library for generating and analyzing ligand-passivated perovskite systems
-
-PerovKit generates ABX<sub>3</sub> perovskites (nanocrystals or periodic slabs), places organic ligands on surface binding sites by rotation optimization, and provides several useful analysis tools. 
+PerovKit provides modular, Pythonic data structures for constructing ligand-passivated ABX<sub>3</sub> perovskite models (nanocrystals, nanorods, and periodic slabs) for downstream atomistic simulations. 
 
 Under active development by Seungjun Cha (scha@gatech.edu)
 
 ## Installation
 
-Requires Python >= 3.10.
+Requires Python >= 3.12.
 
 ```bash
 git clone https://github.com/sj-cha/PerovKit.git
@@ -38,7 +36,7 @@ from perovkit import Core, Ligand, LigandSpec, BindingMotif, NanoCrystal, Slab
 core = Core.build_nanocrystal(
     A="Cs", B="Pb", X="Br",
     a=5.95,
-    n_cells=3,
+    supercell=(3,3,3),
     charge_neutral=True,
     random_seed=42,
 )
@@ -74,7 +72,7 @@ nc.place_ligands()
 core = Core.build_slab(
     A="Cs", B="Pb", X="Br",
     a=5.95,
-    supercell=(2, 2, 3),
+    supercell=(2,2,3),
 )
 
 specs = [
@@ -82,7 +80,7 @@ specs = [
     LigandSpec(ligand=anionic_lig, coverage=0.5),
 ]
 
-slab = Slab(core=core, ligand_specs=specs, random_seed=42)
+slab = Slab(core=core, ligand_specs=specs)
 slab.place_ligands()
 ```
 

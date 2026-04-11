@@ -53,7 +53,7 @@ class NanoCrystal:
     def place_ligands(
         self,
         max_iters: int = 10,
-        overlap_cutoff: float = 2.0,   # Å
+        overlap_cutoff: float = 1.8,   # Å
         coarse_step_deg: int = 18,
         fine_step_deg: int = 2,
         window_deg: int = 12,
