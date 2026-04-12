@@ -12,6 +12,7 @@ from tqdm.auto import tqdm
 
 from ase import Atoms
 from ase.io import read, write
+from ase.io.vasp import write_vasp
 
 from scipy.spatial import cKDTree 
 
@@ -647,7 +648,8 @@ class NanoCrystal:
             cursor += n
 
 
-    def to(self, fmt: str = "xyz", filename: str = None, write_json: bool = True) -> None:
+    def to(self, fmt: str = "xyz", filename: str = None, write_json: bool = True,
+           vacuum: float = 15.0) -> None:
         at = self.atoms
         formula = at.get_chemical_formula()
 
@@ -655,14 +657,29 @@ class NanoCrystal:
             filename = f"{formula}.{fmt}"
 
         path = Path(filename)
-        path.parent.mkdir(parents=True, exist_ok=True)  
+        path.parent.mkdir(parents=True, exist_ok=True)
 
-        write(str(path), at, format=fmt, comment=formula)
-        if write_json:
-            self.to_json(str(path) + ".json")
+        if fmt == "vasp":
+            pos = at.get_positions()
+            center = pos.mean(axis=0)
+            extent = pos.max(axis=0) - pos.min(axis=0)
+            cell_diag = extent + 2 * vacuum
+
+            vasp_atoms = at.copy()
+            vasp_atoms.set_cell(np.diag(cell_diag))
+            vasp_atoms.positions += (cell_diag / 2 - center)
+            vasp_atoms.pbc = True
+
+            write_vasp(str(path), vasp_atoms, sort=True, direct=True)
+            if write_json:
+                self.to_json(str(path) + ".json", sorted=True)
+        else:
+            write(str(path), at, format=fmt, comment=formula)
+            if write_json:
+                self.to_json(str(path) + ".json")
 
 
-    def to_json(self, json_path: str) -> None:
+    def to_json(self, json_path: str, sorted: bool = False) -> None:
 
         self._build_index_map()
 
@@ -748,6 +765,9 @@ class NanoCrystal:
             "ligands": ligands_meta,
         }
 
+        if sorted:
+            topo["sort_idx"] = np.argsort(self.atoms.symbols).tolist()
+
         with open(json_path, "w") as f:
             json.dump(topo, f, indent=2)
 
@@ -771,6 +791,10 @@ class NanoCrystal:
                 f"Use Slab.from_file() for slab data."
             )
 
+        sort_idx = topo.get("sort_idx")
+        if sort_idx is not None:
+            atoms = atoms[np.argsort(sort_idx)]
+
         n_total_atoms_json = topo["n_total_atoms"]
         if n_total_atoms_json != len(atoms):
             raise ValueError(
@@ -786,6 +810,7 @@ class NanoCrystal:
             )
 
         core_atoms = atoms[:n_core_atoms]
+        core_atoms.pbc = False
 
         core_indices_meta = topo["core_indices"]
 

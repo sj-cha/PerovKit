@@ -267,18 +267,29 @@ class Core:
         apply_strain(structure=self, strain=strain, strain_ligands=False)
 
 
-    def to(self, fmt: str, filename: Optional[str] = None) -> None:
+    def to(self, fmt: str, filename: Optional[str] = None, vacuum: float = 15.0) -> None:
         if filename is None:
             nx, ny, nz = self.supercell or (0, 0, 0)
             filename = f"{self.A}{self.B}{self.X}3_{nx}x{ny}x{nz}.{fmt}"
 
         path = Path(filename)
-        path.parent.mkdir(parents=True, exist_ok=True)  
-        
-        if fmt == "vasp":
-            write_vasp(str(path), self.atoms, sort=True)
-            return
+        path.parent.mkdir(parents=True, exist_ok=True)
 
+        if fmt == "vasp":
+            if self.is_slab:
+                write_vasp(str(path), self.atoms, sort=True, direct=True)
+            else:
+                pos = self.atoms.get_positions()
+                center = pos.mean(axis=0)
+                extent = pos.max(axis=0) - pos.min(axis=0)
+                cell_diag = extent + 2 * vacuum
+
+                vasp_atoms = self.atoms.copy()
+                vasp_atoms.set_cell(np.diag(cell_diag))
+                vasp_atoms.positions += (cell_diag / 2 - center)
+                vasp_atoms.pbc = True
+
+                write_vasp(str(path), vasp_atoms, sort=True, direct=True)
         else:
             formula = self.atoms.get_chemical_formula()
             write(str(path), self.atoms, format=fmt, comment=formula)

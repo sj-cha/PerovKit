@@ -993,7 +993,7 @@ class Slab:
             "ligand_types": ligand_types_meta,
             "core_indices": core_indices_meta,
             "ligands": ligands_meta,
-            "vasp_sort_idx": np.argsort(self.atoms.symbols).tolist()
+            "sort_idx": np.argsort(self.atoms.symbols).tolist()
         }
 
         with open(json_path, "w") as f:
@@ -1019,9 +1019,9 @@ class Slab:
                 f"Use NanoCrystal.from_file() for nanocrystal data."
             )
 
-        vasp_sort_idx = topo.get("vasp_sort_idx")
-        if vasp_sort_idx is not None:
-            atoms = atoms[np.argsort(vasp_sort_idx)]
+        sort_idx = topo.get("sort_idx")
+        if sort_idx is not None:
+            atoms = atoms[np.argsort(sort_idx)]
 
         n_total_atoms_json = topo["n_total_atoms"]
         if n_total_atoms_json != len(atoms):
