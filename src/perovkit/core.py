@@ -264,14 +264,7 @@ class Core:
 
     def apply_strain(self, strain: Sequence[float]):
         from .strain import apply_strain
-        apply_strain(structure=self, strain=strain)
-
-        if self.is_slab:
-            cell = self.atoms.get_cell().copy()
-            cell[0] *= (1 + float(strain[0]))
-            cell[1] *= (1 + float(strain[1]))
-            cell[2] *= (1 + float(strain[2]))
-            self.atoms.set_cell(cell, scale_atoms=False)
+        apply_strain(structure=self, strain=strain, strain_ligands=False)
 
 
     def to(self, fmt: str, filename: Optional[str] = None) -> None:
