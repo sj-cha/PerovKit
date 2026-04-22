@@ -33,7 +33,6 @@ class Ligand:
     id: Optional[int] = None
     volume: float = None
     binding_atoms: List[int] = field(default_factory=list)
-    anchor_pos: Optional[np.ndarray] = None
     plane: Optional[Plane] = None
     indices: Optional[np.ndarray] = None
     _neighbor_cutoff: float = 1.2
@@ -44,6 +43,13 @@ class Ligand:
         if self.binding_motif:
             self._get_binding_atoms_indices()
             self._orient_ligand()
+
+    @property
+    def anchor_pos(self) -> Optional[np.ndarray]:
+        if not self.binding_atoms:
+            return None
+        pos = self.atoms.get_positions()
+        return pos[np.asarray(self.binding_atoms, dtype=int)].mean(axis=0)
 
     @classmethod
     def from_xyz(
@@ -161,7 +167,6 @@ class Ligand:
         lig.id = None
         lig.volume = None
         lig.binding_atoms = []
-        lig.anchor_pos = None
         lig.plane = None
         lig.indices = None
         lig._neighbor_cutoff = 1.2

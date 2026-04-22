@@ -506,9 +506,6 @@ class NanoCrystal:
         anchor_offset = plane / np.linalg.norm(plane) * float(getattr(ligand, "_anchor_offset", 0.0))
         anchor_pos = site_pos + anchor_offset
 
-        if getattr(ligand, "anchor_pos", None) is None:
-            ligand.anchor_pos = anchor_pos
-
         # Translate to binding site position
         coords_final = coords_rot + anchor_pos
 
@@ -862,8 +859,6 @@ class NanoCrystal:
             cursor += n_atoms
 
             binding_atoms = list(map(int, tmeta.get("binding_atoms_indices", [])))
-            pos = np.asarray(lig_atoms.positions, dtype=float)
-            anchor_pos = pos[np.asarray(binding_atoms, dtype=int)].mean(axis=0)
 
             lig = Ligand._from_data(
                 atoms=lig_atoms,
@@ -876,7 +871,6 @@ class NanoCrystal:
                 volume=tmeta["volume"],
                 _neighbor_cutoff=1.2,
                 binding_atoms=binding_atoms,
-                anchor_pos=anchor_pos,
             )
 
             ligands.append(lig)

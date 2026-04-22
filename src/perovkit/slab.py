@@ -62,7 +62,7 @@ class Slab:
     def place_ligands(
         self,
         max_iters: int = 10,
-        overlap_cutoff: float = 2.0,   # Å
+        overlap_cutoff: float = 1.8,   # Å
         coarse_step_deg: int = 18,
         fine_step_deg: int = 2,
         window_deg: int = 12,
@@ -733,9 +733,6 @@ class Slab:
         anchor_offset = plane / np.linalg.norm(plane) * float(getattr(ligand, "_anchor_offset", 0.0))
         anchor_pos = site_pos + anchor_offset
 
-        if getattr(ligand, "anchor_pos", None) is None:
-            ligand.anchor_pos = anchor_pos
-
         # Translate to binding site position
         coords_final = coords_rot + anchor_pos
         
@@ -1093,8 +1090,6 @@ class Slab:
             cursor += n_atoms
 
             binding_atoms = list(map(int, tmeta.get("binding_atoms_indices", [])))
-            pos = np.asarray(lig_atoms.positions, dtype=float)
-            anchor_pos = pos[np.asarray(binding_atoms, dtype=int)].mean(axis=0)
 
             lig = Ligand._from_data(
                 atoms=lig_atoms,
@@ -1107,7 +1102,6 @@ class Slab:
                 volume=tmeta["volume"],
                 _neighbor_cutoff=1.2,
                 binding_atoms=binding_atoms,
-                anchor_pos=anchor_pos,
             )
 
             ligands.append(lig)

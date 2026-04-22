@@ -130,10 +130,8 @@ def apply_tilt(
     # Ligand maps (NanoCrystal / Slab only)
     lig_to_b = {}
     lig_global_indices = {}
-    lig_anchor0 = None
 
     if isinstance(structure, (NanoCrystal, Slab)) and move_ligands:
-        lig_anchor0 = {}
         for b in b_keys:
             for lig_id in octahedra[int(b)].get("Ligand", []):
                 lig_id = int(lig_id)
@@ -141,12 +139,6 @@ def apply_tilt(
 
                 lig = structure.ligands[lig_id]
                 lig_global_indices[lig_id] = np.asarray(lig.indices, dtype=int)
-
-                if getattr(lig, "anchor_pos", None) is not None:
-                    lig_anchor0[lig_id] = np.array(lig.anchor_pos, dtype=float, copy=True)
-
-        if not lig_anchor0:
-            lig_anchor0 = None
 
     b_ijk = structure.B_ijk
 
@@ -204,10 +196,6 @@ def apply_tilt(
 
             # row-vector convention
             pos_new[gidx] = (rb0 + tb) + (pos0[gidx] - rb0) @ R.T
-
-            a0 = lig_anchor0[int(lig_id)]
-            a1 = (rb0 + tb) + (R @ (a0 - rb0))
-            structure.ligands[int(lig_id)].anchor_pos = a1
 
     if isinstance(structure, Core):
         structure.atoms.positions[:] = pos_new[: len(structure.atoms)]

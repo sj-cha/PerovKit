@@ -54,7 +54,6 @@ def apply_strain(
                         continue
                     anchor0 = np.asarray(anchor0, dtype=float).reshape(3,)
                     anchor_new = F @ anchor0
-                    lig.anchor_pos = anchor_new
                     pos_new[lig.indices] += anchor_new - anchor0
         else:
             center = np.mean(pos0[:n_core], axis=0)
@@ -71,7 +70,6 @@ def apply_strain(
                         continue
                     anchor0 = np.asarray(anchor0, dtype=float).reshape(3,)
                     anchor_new = F @ (anchor0 - center) + center
-                    lig.anchor_pos = anchor_new
                     pos_new[lig.indices] += anchor_new - anchor0
 
         # Single write to the shared buffer updates core and all ligands
