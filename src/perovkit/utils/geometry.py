@@ -2,7 +2,8 @@
 import numpy as np
 import pandas as pd
 from typing import List, Tuple, Dict
-from scipy.spatial import cKDTree
+from scipy.spatial import cKDTree, ConvexHull
+from ase.geometry import find_mic
 import random
 
 def farthest_point_sampling(
@@ -32,6 +33,7 @@ def farthest_point_sampling(
         d[selected] = 0.0
 
     return selected
+
 
 def per_face_farthest_point_sampling(
     coords: np.ndarray,
@@ -82,16 +84,17 @@ def compute_bounding_spheres(
         coords_list: List[np.ndarray],
     ) -> Tuple[np.ndarray, np.ndarray]:
 
-        n_lig = len(coords_list)
-        centers = np.zeros((n_lig, 3), dtype=float)
-        radii = np.zeros(n_lig, dtype=float)
+    n_lig = len(coords_list)
+    centers = np.zeros((n_lig, 3), dtype=float)
+    radii = np.zeros(n_lig, dtype=float)
 
-        for i, coords in enumerate(coords_list):
-            c = coords.mean(axis=0)
-            centers[i] = c
-            radii[i] = np.linalg.norm(coords - c, axis=1).max()
+    for i, coords in enumerate(coords_list):
+        c = coords.mean(axis=0)
+        centers[i] = c
+        radii[i] = np.linalg.norm(coords - c, axis=1).max()
 
-        return centers, radii
+    return centers, radii
+
 
 def build_neighbor_map(
     centers: np.ndarray,
@@ -118,6 +121,7 @@ def build_neighbor_map(
             neighbor_map[j].add(i)
 
     return {i: sorted(neighbor_map[i]) for i in range(n)}
+
 
 def compute_B_X_B_angles(structure,
                          B_sites:List=None
@@ -158,7 +162,6 @@ def compute_B_X_B_angles(structure,
                 vec1 = positions[b1] - pos_x
                 vec2 = positions[b2] - pos_x
 
-                from ase.geometry import find_mic
                 vecs, _ = find_mic(np.array([vec1, vec2]), cell, pbc=pbc)
                 vec1, vec2 = vecs[0], vecs[1]
 
@@ -176,6 +179,7 @@ def compute_B_X_B_angles(structure,
     if not df.empty:
         df = df.sort_values(['B1', 'B2', 'X']).reset_index(drop=True)
     return df
+
 
 def compute_X_B_X_angles(structure,
                          B_sites:List=None):
@@ -208,7 +212,6 @@ def compute_X_B_X_angles(structure,
                 vec1 = positions[x1] - pos_b
                 vec2 = positions[x2] - pos_b
 
-                from ase.geometry import find_mic
                 vecs, _ = find_mic(np.array([vec1, vec2]), cell, pbc=pbc)
                 vec1, vec2 = vecs[0], vecs[1]
 
@@ -225,4 +228,112 @@ def compute_X_B_X_angles(structure,
     df = pd.DataFrame(results)
     if not df.empty:
         df = df.sort_values(['B', 'X1', 'X2']).reset_index(drop=True)
+    return df
+
+
+def compute_bond_angle_variance(structure,
+                                B_sites:List=None,
+                                linear_threshold:float=130.0):
+
+    df = compute_X_B_X_angles(structure, B_sites)
+    df = df[df['angles'] < linear_threshold].copy()
+    df['angles'] = (df['angles'].astype(float) - 90) ** 2
+    variance_df = (
+        df.groupby('B')['angles']
+          .agg(lambda x: x.sum() / (len(x) - 1))
+          .reset_index()
+          .rename(columns={'angles': 'bond_angle_variance'})
+    )
+    variance_df['B_ijk'] = variance_df['B'].map(structure.B_ijk)
+    variance_df = variance_df[['B', 'B_ijk', 'bond_angle_variance']]
+    return variance_df
+
+
+def compute_distortion_index(structure,
+                             B_sites:List=None):
+
+    octahedra = structure.octahedra
+    B_ijk = structure.B_ijk
+    atoms = structure.atoms
+
+    positions = atoms.get_positions()
+    cell = atoms.get_cell()
+    pbc = atoms.get_pbc()
+
+    # Determine which B atoms to consider
+    if B_sites is not None:
+        b_set = set(B_sites)
+    else:
+        b_set = set(octahedra.keys())
+ 
+    results = []
+    for b_idx, entry in octahedra.items():
+        if b_idx not in b_set:
+            continue
+        x_list = entry['X']
+
+        pos_b = positions[b_idx]
+        vecs = np.array([positions[x_idx] - pos_b for x_idx in x_list])
+        vecs, _ = find_mic(vecs, cell, pbc=pbc)
+        dists = np.linalg.norm(vecs, axis=1)
+
+        D = np.mean(np.abs(dists - dists.mean()) / dists.mean())
+
+        results.append({
+            'B': b_idx,
+            'B_ijk': B_ijk.get(b_idx),
+            'distortion_index': D
+        })
+
+    df = pd.DataFrame(results)
+    if not df.empty:
+        df = df.sort_values('B').reset_index(drop=True)
+    return df
+
+
+def compute_quadratic_elongation(structure,
+                                 B_sites:List=None):
+
+    octahedra = structure.octahedra
+    B_ijk = structure.B_ijk
+    atoms = structure.atoms
+
+    positions = atoms.get_positions()
+    cell = atoms.get_cell()
+    pbc = atoms.get_pbc()
+
+    # Determine which B atoms to consider
+    if B_sites is not None:
+        b_set = set(B_sites)
+    else:
+        b_set = set(octahedra.keys())
+
+    results = []
+    for b_idx, entry in octahedra.items():
+        if b_idx not in b_set:
+            continue
+        x_list = entry['X']
+        if len(x_list) != 6:
+            continue
+
+        pos_b = positions[b_idx]
+        vecs = np.array([positions[x_idx] - pos_b for x_idx in x_list])
+        vecs, _ = find_mic(vecs, cell, pbc=pbc)
+        dists = np.linalg.norm(vecs, axis=1)
+
+        # Robinson l_0: center-to-vertex of a regular octahedron with the same volume as the observed one (V = 4/3 * l_0^3)
+        vol = ConvexHull(vecs).volume
+        l_0 = (3.0 * vol / 4.0) ** (1.0 / 3.0)
+
+        quadratic_elongation = float(np.mean((dists / l_0) ** 2))
+
+        results.append({
+            'B': b_idx,
+            'B_ijk': B_ijk.get(b_idx),
+            'quadratic_elongation': quadratic_elongation
+        })
+
+    df = pd.DataFrame(results)
+    if not df.empty:
+        df = df.sort_values('B').reset_index(drop=True)
     return df
