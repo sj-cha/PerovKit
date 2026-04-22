@@ -119,28 +119,21 @@ def build_neighbor_map(
 
     return {i: sorted(neighbor_map[i]) for i in range(n)}
 
-def compute_b_x_b_angles(structure,
-                         atoms=None, 
-                         B_indices=None, 
-                         layer=None):
+def compute_B_X_B_angles(structure,
+                         B_sites:List=None
+                         ):
     
     octahedra = structure.octahedra
     B_ijk = structure.B_ijk
-    if atoms is None:
-        atoms = structure.atoms
+    atoms = structure.atoms
 
     positions = atoms.get_positions()
     cell = atoms.get_cell()
     pbc = atoms.get_pbc()
     
     # Determine which B atoms to consider
-    if B_indices is not None:
-        b_set = set(B_indices)
-    elif layer is not None:
-        assert int(layer) <= max(structure.core.supercell)
-        if isinstance(layer, int):
-            layer = [layer]
-        b_set = {b for b, ijk in B_ijk.items() if ijk[2] in layer}
+    if B_sites is not None:
+        b_set = set(B_sites)
     else:
         b_set = set(octahedra.keys())
 
@@ -154,17 +147,12 @@ def compute_b_x_b_angles(structure,
 
     # Compute angles for each shared X atom
     results = []
-    seen = set()
     for x_idx, b_list in x_to_b.items():
         if len(b_list) < 2:
             continue
         for i in range(len(b_list)):
             for j in range(i + 1, len(b_list)):
                 b1, b2 = b_list[i], b_list[j]
-                key = (min(b1, b2), max(b1, b2), x_idx)
-                if key in seen:
-                    continue
-                seen.add(key)
 
                 pos_x = positions[x_idx]
                 vec1 = positions[b1] - pos_x
@@ -181,10 +169,60 @@ def compute_b_x_b_angles(structure,
                 results.append({
                     'B1': b1, 'B2': b2, 'X': x_idx,
                     'B1_ijk': B_ijk.get(b1), 'B2_ijk': B_ijk.get(b2),
-                    'angle': angle
+                    'angles': angle
                 })
 
     df = pd.DataFrame(results)
     if not df.empty:
         df = df.sort_values(['B1', 'B2', 'X']).reset_index(drop=True)
+    return df
+
+def compute_X_B_X_angles(structure,
+                         B_sites:List=None):
+    
+    octahedra = structure.octahedra
+    B_ijk = structure.B_ijk
+    atoms = structure.atoms
+
+    positions = atoms.get_positions()
+    cell = atoms.get_cell()
+    pbc = atoms.get_pbc()
+    
+    # Determine which B atoms to consider
+    if B_sites is not None:
+        b_set = set(B_sites)
+    else:
+        b_set = set(octahedra.keys())
+
+    # Compute angles for each shared B atom
+    results = []
+    for b_idx, entry in octahedra.items():
+        if b_idx not in b_set:
+            continue
+        x_list = entry['X']
+        for i in range(len(x_list)):
+            for j in range(i + 1, len(x_list)):
+                x1, x2 = x_list[i], x_list[j]
+
+                pos_b = positions[b_idx]
+                vec1 = positions[x1] - pos_b
+                vec2 = positions[x2] - pos_b
+
+                from ase.geometry import find_mic
+                vecs, _ = find_mic(np.array([vec1, vec2]), cell, pbc=pbc)
+                vec1, vec2 = vecs[0], vecs[1]
+
+                cos_angle = np.dot(vec1, vec2) / (np.linalg.norm(vec1) * np.linalg.norm(vec2))
+                cos_angle = np.clip(cos_angle, -1, 1)
+                angle = np.degrees(np.arccos(cos_angle))
+
+                results.append({
+                    'B': b_idx, 'X1': x1, 'X2': x2,
+                    'B_ijk': B_ijk.get(b_idx),
+                    'angles': angle
+                })
+
+    df = pd.DataFrame(results)
+    if not df.empty:
+        df = df.sort_values(['B', 'X1', 'X2']).reset_index(drop=True)
     return df
