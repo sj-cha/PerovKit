@@ -1,10 +1,10 @@
 from __future__ import annotations
-
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, Tuple, List, Optional, Sequence
 from collections import defaultdict
 
+import random
 import numpy as np
 from ase import Atoms
 from ase.io import write
@@ -12,38 +12,40 @@ from ase.io.vasp import write_vasp
 from scipy.spatial import cKDTree
 from ase.data import covalent_radii, atomic_numbers
 
-import random
-
-Plane = Tuple[int, int, int]
-
-
-@dataclass
-class BindingSite:
-    index: int
-    symbol: str
-    plane: Plane
-    passivated: bool = False
-
 
 @dataclass
 class Core:
+    """
+    ABX3 perovskite core. 
+    Currently only supports cubic phase for inorganic perovskites.
+
+    Attributes:
+        A, B, X (str): Chemical symbols for A-, B-, and X-site species.
+        atoms (ASE Atoms): ASE Atoms object of Core
+        a (float): Cubic lattice constant (Å).
+        supercell (Tuple[int, int, int]): Number of repeating unit cells along x, y, z (nx, ny, nz).
+        vacuum (float): Vacuum thickness (Å) along a z-direction (used for Slab).
+        octahedra (Dict[int, Dict[str, List[int]]]): Map B-atom index -> {"X": [...], "Ligand": [...]}.
+        B_ijk (Dict[int, Tuple[int, int, int]]): Map B-atom index -> integer lattice coordinates.
+        build_surface (bool): Whether to compute Core metadata (surface atoms, binding sites, octahedra) on initialization. 
+        binding_sites (List[BindingSite]): List of surface binding sites.
+    """
     A: str
     B: str
     X: str
     atoms: Atoms
     a: float
 
-    supercell: Optional[Tuple[int, int, int]] = None  # (nx, ny, nz)
+    supercell: Optional[Tuple[int, int, int]] = None
     vacuum: Optional[float] = None
 
-    indices: Optional[np.ndarray] = None
     octahedra: Dict[int, Dict[str, List[int]]] = field(default_factory=dict)
     B_ijk: Dict[int, Tuple[int, int, int]] = field(default_factory=dict)
 
     build_surface: bool = True
-    _surface_atoms: Dict[str, np.ndarray] = field(init=False)
-    _plane_atoms: Dict[Plane, Dict[str, List[int]]] = field(default_factory=dict)
     binding_sites: List[BindingSite] = field(default_factory=list)
+    _surface_atoms: Dict[str, np.ndarray] = field(init=False)
+    _plane_atoms: Dict[Tuple[int, int, int], Dict[str, List[int]]] = field(default_factory=dict)
 
     def __post_init__(self):
         if self.supercell is not None:
@@ -80,10 +82,22 @@ class Core:
         a: float,
         supercell: Sequence[int],
         charge_neutral: bool = True,
-        random_seed: Optional[int] = None,
-        tol: float = 1e-5,
+        random_seed: Optional[int] = None
     ) -> Core:
+        """
+        Build an AX-terminated ABX3 nanocrystal.
 
+        Args:
+            A, B, X (str): Chemical symbols for A-, B-, and X-site species.
+            a (float): Cubic lattice constant (Å).
+            supercell (Sequence[int]): Number of repeating unit cells along x, y, z.
+            charge_neutral (bool): If True, remove surface A atoms to ensure charge neutrality
+                                   Corners are removed first, then additional surface A atoms are randomly removed if needed.
+            random_seed (Optional[int]): Seed for choosing which surface A atoms to remove.
+
+        Returns:
+            A Core instance representing the nanocrystal.
+        """
         if len(supercell) != 3:
             raise ValueError(f"supercell must be length-3 (nx, ny, nz); got {supercell}")
         nx, ny, nz = map(int, supercell)
@@ -123,7 +137,7 @@ class Core:
         max_coords = np.array([nx, ny, nz], dtype=float) * float(a)
         pos = atoms.positions
         mask = np.ones(len(atoms), dtype=bool)
-        filt = np.any(pos > (max_coords + tol), axis=1)
+        filt = np.any(pos > (max_coords + 1e-5), axis=1)
         mask[filt] = False
         atoms = atoms[mask]
 
@@ -181,11 +195,21 @@ class Core:
         B: str,
         X: str,
         a: float,
-        supercell: Sequence[int],  # (nx, ny, nz)
+        supercell: Sequence[int],
         vacuum: float = 15.0,
-        tol: float = 1e-5,
     ) -> Core:
+        """
+        Build an ABX3 slab periodic in x,y with vacuum along z.
 
+        Args:
+            A, B, X (str): Chemical symbols for A-, B-, and X-site species.
+            a (float): Cubic lattice constant (Å).
+            supercell (Sequence[int]): Number of repeating unit cells along x, y, z.
+            vacuum (float): Vacuum thickness (Å) along a z-direction.
+
+        Returns:
+            A Core instance representing the slab.
+        """
         if len(supercell) != 3:
             raise ValueError(f"supercell must be length-3 (nx, ny, nz); got {supercell}")
         nx, ny, nz = map(int, supercell)
@@ -215,7 +239,7 @@ class Core:
 
         z_cut = float(a) * float(nz)
         pos = atoms.get_positions()
-        keep = pos[:, 2] <= (z_cut + tol)
+        keep = pos[:, 2] <= (z_cut + 1e-5)
         atoms = atoms[keep]
 
         atoms.set_cell([nx * float(a), ny * float(a), nz * float(a) + float(vacuum)])
@@ -233,7 +257,18 @@ class Core:
         return slab
     
 
-    def perturb(self, bound: List[float], random_seed: Optional[int] = None) -> None:
+    def perturb(
+        self, 
+        bound: List[float, float], 
+        random_seed: int= None
+    ):
+        """
+        Randomly displace every atom by a fraction of its covalent radius.
+
+        Args:
+            bound (List[float, float]): bounds on the random displacement as a fraction of the covalent radius (e.g. [0.0, 0.1] for up to 10% displacement).
+            random_seed (int): Optional random seed
+        """
         if random_seed is not None:
             rng = np.random.default_rng(random_seed)
             rand_uniform = rng.uniform
@@ -257,17 +292,52 @@ class Core:
         self.atoms.set_positions(pos + dirs * mags[:, None])
 
 
-    def apply_tilt(self, glazer: str, angles: Tuple[float, float, float], *, order: str = "xyz"):
+    def apply_tilt(
+        self, 
+        glazer: str, 
+        angles: Tuple[float, float, float], 
+        order: str = "xyz"
+    ):
+        """
+        Apply a Glazer octahedral tilt.
+
+        Args:
+            glazer: Glazer notation string (e.g. "a+b-c-").
+            angles: Tilt angles (deg) about x, y, z axes.
+            order: Rotation order (e.g. "xyz").
+        """
         from .tilt import apply_tilt
         apply_tilt(structure=self, glazer=glazer, angles=angles, order=order)
 
 
-    def apply_strain(self, strain: Sequence[float]):
+    def apply_strain(
+        self, 
+        strain: Sequence[float]
+    ):
+        """
+        Apply an axial strain.
+
+        Args:
+            strain (Sequence[float]): (ex, ey, ez) fractional strains along each axis.
+        """
         from .strain import apply_strain
         apply_strain(structure=self, strain=strain, strain_ligands=False)
 
 
-    def to(self, fmt: str, filename: Optional[str] = None, vacuum: float = 15.0) -> None:
+    def to(
+        self, 
+        fmt: str, 
+        filename: Optional[str] = None, 
+        vacuum: float = 15.0
+    ):
+        """
+        Write the structure to file.
+
+        Args:
+            fmt: File format
+            filename: Output path
+            vacuum: Vacuum padding (Å) for nanocrystal VASP output.
+        """
         if filename is None:
             nx, ny, nz = self.supercell or (0, 0, 0)
             filename = f"{self.A}{self.B}{self.X}3_{nx}x{ny}x{nz}.{fmt}"
@@ -295,7 +365,18 @@ class Core:
             write(str(path), self.atoms, format=fmt, comment=formula)
 
 
-    def _get_surface_atoms(self, tol: float = 1e-2) -> Dict[str, np.ndarray]:
+    def _get_surface_atoms(
+        self, 
+    ) -> Dict[str, np.ndarray]:
+        """
+        Identify A- and X-site atoms on non-periodic surfaces.
+
+        Args:
+            tol: Coordinate tolerance (Å)
+
+        Returns:
+            surface_indices (Dict): Map element symbol -> array of surface atom indices
+        """
         surface_indices: Dict[str, np.ndarray] = {}
 
         positions = np.asarray(self.atoms.get_positions(), dtype=float)
@@ -313,6 +394,7 @@ class Core:
                 continue
 
             surface_flags = np.zeros(len(elem_pos), dtype=bool)
+            tol = 1e-3
             for ax in non_periodic:
                 ax_max = elem_pos[:, ax].max()
                 surface_flags |= np.isclose(elem_pos[:, ax], ax_max, atol=tol)
@@ -326,6 +408,9 @@ class Core:
 
 
     def _build_binding_sites(self) -> List[BindingSite]:
+        """
+        Assign each surface atom a Miller index and return BindingSite list.
+        """
         surface = self._get_surface_atoms()
         positions = np.array([a.position for a in self.atoms], dtype=float)
         symbols = np.array([a.symbol for a in self.atoms])
@@ -375,7 +460,10 @@ class Core:
         return list(idx_to_site.values())
 
 
-    def _build_octahedra(self) -> None:
+    def _build_octahedra(self):
+        """
+        Build the octahedral network by finding nearest X neighbors of each B.
+        """
         at = self.atoms
         syms = np.array(at.get_chemical_symbols())
 
@@ -417,7 +505,10 @@ class Core:
         self.octahedra = octahedra
 
 
-    def _build_B_ijk(self) -> None:
+    def _build_B_ijk(self):
+        """
+        Assign integer (i, j, k) lattice coordinates to each B atom.
+        """
         if not self.octahedra:
             self.B_ijk = {}
             return
@@ -433,3 +524,20 @@ class Core:
             int(b): (int(ijk_arr[i, 0]), int(ijk_arr[i, 1]), int(ijk_arr[i, 2]))
             for i, b in enumerate(b_keys)
         }
+
+
+@dataclass
+class BindingSite:
+    """
+    Surface atom available for ligand binding.
+
+    Attributes:
+        index (int): Atom index in the Core Atoms object.
+        symbol (str): Chemical symbol of the site atom.
+        plane (Tuple[int, int, int]): Miller index (h, k, l) indicating the surface plane.
+        passivated (bool): Whether a ligand is attached to this site.
+    """
+    index: int
+    symbol: str
+    plane: Tuple[int, int, int]
+    passivated: bool = False
