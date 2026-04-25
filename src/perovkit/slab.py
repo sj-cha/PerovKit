@@ -835,7 +835,6 @@ class Slab:
 
 
     def _assign_ligands_to_octahedra(self) -> None:
-        """Add ligand associations to the core-built octahedra."""
         octahedra = self.octahedra
         if not octahedra:
             return
@@ -876,7 +875,6 @@ class Slab:
     def _build_index_map(self) -> None:
 
         n_core = len(self.core.atoms)
-        self.core.indices = np.arange(n_core, dtype=int)
 
         cursor = n_core
         for lig in self.ligands:
@@ -903,7 +901,7 @@ class Slab:
             self.to_json(str(path) + ".json")
 
 
-    def to_json(self, json_path: str) -> None:
+    def to_json(self, filename: str) -> None:
 
         self._build_index_map()
 
@@ -993,16 +991,16 @@ class Slab:
             "sort_idx": np.argsort(self.atoms.symbols).tolist()
         }
 
-        with open(json_path, "w") as f:
+        with open(filename, "w") as f:
             json.dump(topo, f, indent=2)
 
 
     @classmethod
-    def from_file(cls, file_path: str, json_path: str) -> Slab:
+    def from_file(cls, filename: str, json_filename: str) -> Slab:
 
-        atoms = read(file_path)
+        atoms = read(filename)
 
-        with open(json_path) as f:
+        with open(json_filename) as f:
             topo = json.load(f)
 
         schema_version = topo.get("schema_version", 1)
@@ -1121,13 +1119,6 @@ class Slab:
 
 
     def _build_and_link_atoms(self) -> None:
-        """Build the combined Atoms and link position arrays via numpy views.
-
-        After this call, `self._atoms`, `self.core.atoms`, and every
-        `ligand.atoms` share the same underlying position buffer.
-        Mutating positions on any one of them is instantly visible
-        in all the others (e.g. after MD or geometry optimisation).
-        """
         core_atoms = self.core.atoms
         all_symbols = list(core_atoms.get_chemical_symbols())
         all_positions = [core_atoms.get_positions()]

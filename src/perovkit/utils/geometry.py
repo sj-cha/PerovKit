@@ -1,10 +1,11 @@
-# pync/utils/geometry.py
 import numpy as np
 import pandas as pd
 from typing import List, Tuple, Dict
 from scipy.spatial import cKDTree, ConvexHull
 from ase.geometry import find_mic
 import random
+from collections import defaultdict
+import math
 
 def farthest_point_sampling(
     coords: np.ndarray,
@@ -42,8 +43,6 @@ def per_face_farthest_point_sampling(
     rng: random.Random,
 ) -> List[int]:
     """FPS run independently per face, with n_target allocated proportionally."""
-    from collections import defaultdict
-    import math
 
     face_groups: Dict[Tuple[int, int, int], List[int]] = defaultdict(list)
     for i, plane in enumerate(planes):
