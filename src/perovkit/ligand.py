@@ -1,5 +1,4 @@
 from __future__ import annotations
-
 import copy
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -9,21 +8,43 @@ import numpy as np
 from ase import Atoms
 from ase.io import read, write
 from scipy.spatial import cKDTree
-
-# RDKit
 from rdkit import Chem
 from rdkit.Chem import AllChem, rdDetermineBonds, rdMolTransforms
 
 from .utils.rotation import rotation_about_axis, rotation_from_u_to_v
 
-Plane = Tuple[int, int, int]
 
 @dataclass
 class BindingMotif:
+    """
+    Specification of how a ligand anchors to a surface.
+
+    Attributes:
+        atoms (list[str]): Chemical symbols of the binding atoms (length 1 or 2).
+    """
     atoms: list[str]
+
 
 @dataclass
 class Ligand:
+    """
+    Surface-passivating ligand molecule.
+
+    Attributes:
+        atoms (ASE Atoms): ASE Atoms object.
+        mol (Chem.Mol): RDKit Mol object.
+        smiles (str): SMILES string of the ligand without explicit hydrogens.
+        charge (int): Formal charge of the ligand.
+        binding_motif (BindingMotif): Specification of how a ligand anchors to a surface.
+        name (str): User-defined identifier.
+        id (int): Ligand ID assigned after placement.
+        volume (float): Molecular volume (Å^3).
+        binding_atoms (List[int]): Local indices of atoms used as anchors.
+        plane (Tuple[int, int, int]): Miller index of the surface the ligand is bound to.
+        indices (np.ndarray): Global atom indices when placed in a parent NanoCrystal/Slab.
+        _neighbor_cutoff (float): Neighbor cutoff (Å) used during binding atoms detection.
+        _anchor_offset (float): Offset (Å) applied along the axis perpendicular to the plane.
+    """
     atoms: Atoms
     mol: Chem.Mol
     smiles: str
@@ -33,7 +54,7 @@ class Ligand:
     id: Optional[int] = None
     volume: float = None
     binding_atoms: List[int] = field(default_factory=list)
-    plane: Optional[Plane] = None
+    plane: Optional[Tuple[int, int, int]] = None
     indices: Optional[np.ndarray] = None
     _neighbor_cutoff: float = 1.2
     _anchor_offset: float = 0.0
@@ -44,6 +65,7 @@ class Ligand:
             self._get_binding_atoms_indices()
             self._orient_ligand()
 
+
     @property
     def anchor_pos(self) -> Optional[np.ndarray]:
         if not self.binding_atoms:
@@ -51,18 +73,32 @@ class Ligand:
         pos = self.atoms.get_positions()
         return pos[np.asarray(self.binding_atoms, dtype=int)].mean(axis=0)
 
+
     @classmethod
-    def from_xyz(
+    def from_file(
         cls,
-        file_path: str,
+        filename: str,
         binding_motif: BindingMotif,
         name: str,
-        charge: Optional[int] = None,     
+        charge: Optional[int] = None,
         **kwargs
     ) -> Ligand:
-        
-        atoms = read(file_path)
-        mol = Chem.MolFromXYZFile(rf"{file_path}")
+        """
+        Build a Ligand from a file. 
+        Currently only XYZ files are supported.
+
+        Args:
+            filename (str): Path to the XYZ file.
+            binding_motif (BindingMotif): Specification of how a ligand anchors to a surface.
+            name (str): User-defined identifier.
+            charge (Optional[int]): Formal charge; if None, tries -1, 0, +1 in order.
+            **kwargs: Forwarded to the Ligand constructor.
+
+        Returns:
+            A Ligand instance.
+        """
+        atoms = read(filename)
+        mol = Chem.MolFromXYZFile(rf"{filename}")
 
         if charge is None:
             candidate_charges = (-1, 0, 1)
@@ -99,6 +135,7 @@ class Ligand:
                    name=name,
                    **kwargs)
     
+
     @classmethod
     def from_smiles(
         cls,
@@ -109,7 +146,21 @@ class Ligand:
         optimize: bool = False,
         **kwargs
     ) -> Ligand:
+        """
+        Build a Ligand from a SMILES string.
 
+        Args:
+            smiles (str): SMILES string of the ligand.
+            binding_motif (BindingMotif): Specification of how a ligand anchors to a surface.
+            random_seed (int): Random seed for ETKDG embedding.
+            name (str): User-defined identifier.
+            optimize (bool): If True, fully relax with UFF; otherwise set rotatable bonds 
+                             to 180° (extended) and relax with torsions fixed.
+            **kwargs: Forwarded to the Ligand constructor.
+
+        Returns:
+            A Ligand instance.
+        """
         mol = Chem.MolFromSmiles(smiles)
         mol = Chem.AddHs(mol)
         params = AllChem.ETKDGv3()
@@ -119,7 +170,7 @@ class Ligand:
         if optimize:
             AllChem.UFFOptimizeMolecule(mol)
         else:
-            # Set all rotatable bond dihedrals to 180° (all-trans/extended)
+            # Set all rotatable bond dihedrals to 180°
             rotatable = Chem.MolFromSmarts('[!$(*#*)&!D1]-&!@[!$(*#*)&!D1]')
             matches = mol.GetSubstructMatches(rotatable)
             conf = mol.GetConformer()
@@ -153,15 +204,24 @@ class Ligand:
             name=name,
             **kwargs)
     
+
     def clone(self) -> Ligand:
+        """
+        Return a shallow copy with independent atoms and indices.
+        """
         lig = copy.copy(self)
         lig.atoms = self.atoms.copy()
         if self.indices is not None:
             lig.indices = self.indices.copy()
         return lig
 
+
     @classmethod
     def _from_data(cls, **kwargs) -> Ligand:
+        """
+        Construct a Ligand bypassing __post_init__. 
+        Used when deserializing from the metadata.
+        """
         lig = object.__new__(cls)
         # Set dataclass defaults for optional fields
         lig.id = None
@@ -175,11 +235,18 @@ class Ligand:
             setattr(lig, k, v)
         return lig
 
-    def _get_volume(self) -> float:        
-        self.volume = float(AllChem.ComputeMolVolume(self.mol))
-    
-    def _get_binding_atoms_indices(self) -> List[int]:
 
+    def _get_volume(self):
+        """
+        Compute molecular volume (Å^3).
+        """
+        self.volume = float(AllChem.ComputeMolVolume(self.mol))
+
+
+    def _get_binding_atoms_indices(self) -> List[int]:
+        """
+        Detect the atom indices that match the binding motif.
+        """
         symbols = self.atoms.get_chemical_symbols()
         coords  = self.atoms.get_positions()
 
@@ -237,7 +304,11 @@ class Ligand:
                 "Binding motifs with more than 2 atoms are not yet supported."
             )
 
+
     def _orient_ligand(self, n_angles: int = 720):
+        """
+        Orient the ligand so the binding axis is canonical and the body points up.
+        """
         coords = self.atoms.get_positions()
         binding_idx = self.binding_atoms
         assert 2 >= len(binding_idx) > 0, "Need 1 or 2 binding atoms"
@@ -301,9 +372,15 @@ class Ligand:
         # update ASE atoms
         self.atoms.set_positions(rotated_all)
 
-    def to(self, fmt: str = 'xyz', filename: str = None) -> None:
-        """Export ligand to file."""
 
+    def to(self, fmt: str = 'xyz', filename: str = None) -> None:
+        """
+        Write the ligand to file.
+
+        Args:
+            fmt (str): File format.
+            filename (str): Output path.
+        """
         formula = self.atoms.get_chemical_formula()
 
         if filename is None:
@@ -317,8 +394,19 @@ class Ligand:
 
         write(filename, self.atoms, format=fmt, comment=formula)
 
+
 @dataclass
 class LigandSpec:
+    """
+    Pairs a Ligand with placement parameters.
+
+    Attributes:
+        ligand (Ligand): The ligand to attach.
+        coverage (Optional[float]): Fractional coverage of available binding sites.
+        binding_sites (Optional[list[int]]): Explicit surface site indices to use.
+        anchor_offset (float): Offset (Å) along the binding axis.
+        name (Optional[str]): User-defined identifier.
+    """
     ligand: Ligand
     coverage: Optional[float] = None
     binding_sites: Optional[list[int]] = None

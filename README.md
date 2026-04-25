@@ -19,7 +19,7 @@ Dependencies: `numpy`, `scipy`, `ase`, `rdkit`, `tqdm`
 ## Key Concepts
 
 - **Core**: The inorganic ABX<sub>3</sub> perovskite structure. Built as either a finite nanocrystal (`build_nanocrystal`) or a periodic slab (`build_slab`).
-- **Ligand**: An organic molecule that passivates surface sites. Created from SMILES (`from_smiles`) or an XYZ file (`from_xyz`). The `BindingMotif` specifies which atoms coordinate the surface. Cationic ligands take A-sites and anionic ligands take X-sites.
+- **Ligand**: An organic molecule that passivates surface sites. Created from SMILES (`from_smiles`) or an existing file (`from_file`). The `BindingMotif` specifies which atoms coordinate the surface. Cationic ligands take A-sites and anionic ligands take X-sites.
 - **LigandSpec**: Pairs a `Ligand` with placement parameters: `coverage` (fraction or absolute count of surface sites), optional `binding_sites` (explicit site indices), and `anchor_offset` (controls a vertical offset from the surface).
 - **NanoCrystal / Slab**: Combines a `Core` with `Ligand`. Handles site selection and ligand placement by rotation optimization.
 
@@ -49,8 +49,8 @@ cationic_lig = Ligand.from_smiles(
     name="MA",
 )
 
-anionic_lig = Ligand.from_xyz(
-    "ligands/OP.xyz",
+anionic_lig = Ligand.from_file(
+    filename="ligands/OP.xyz",
     binding_motif=BindingMotif(["O", "O"]),
     name="OP",
 )
