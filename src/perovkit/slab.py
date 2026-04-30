@@ -68,9 +68,12 @@ class Slab:
         window_deg: int = 12,
         active_radius_factor: float = math.sqrt(2)/2,
         random_seed: int = 42,
+        verbose: bool = True,
     ) -> None:
 
         assert not self.ligands, "Ligands have already been placed."
+
+        log = print if verbose else (lambda *a, **k: None)
 
         self._rng = random.Random(random_seed)
         self.overlap_cutoff = overlap_cutoff
@@ -107,7 +110,7 @@ class Slab:
             
             if spec.binding_sites is not None:
                 if len(spec.binding_sites) == 0:
-                    print(f"[Warning] Empty list provided for ligand {lig.name}. Skipping placement.")
+                    log(f"[Warning] Empty list provided for ligand {lig.name}. Skipping placement.")
                     continue
                 chosen_sites = []
                 for idx in spec.binding_sites:
@@ -115,14 +118,14 @@ class Slab:
                     if site is not None:
                         chosen_sites.append(site)
                     else:
-                        print(f"[Warning] Requested binding site index {idx} not available for ligand {lig.name}.")
+                        log(f"[Warning] Requested binding site index {idx} not available for ligand {lig.name}.")
             else:
                 if 0.0 < spec.coverage <= 1.0:
                     n_target = int(math.ceil(spec.coverage * len(available)))
                 else:
                     n_target = int(spec.coverage)
                     if n_target > len(available):
-                        print(f"[Warning] Requested {n_target} sites for ligand, "
+                        log(f"[Warning] Requested {n_target} sites for ligand, "
                             f"but only {len(available)} available.")
                         n_target = len(available)
 
@@ -140,7 +143,7 @@ class Slab:
                 sites.append(site)
                 displaced_indices.append(site.index)
 
-            print(f"[Log] Placed total {len(chosen_sites)} {ligand_type} ligands.")
+            log(f"[Log] Placed total {len(chosen_sites)} {ligand_type} ligands.")
             self.ligand_coverage[spec.ligand.name] = spec.coverage
 
         n_lig = len(ligands)
@@ -186,11 +189,11 @@ class Slab:
             ligand_coords_list,
             neighbor_map,
         )
-        print(f"[Log] Initial global_min = {global_min:.3f} Å")
+        log(f"[Log] Initial global_min = {global_min:.3f} Å")
 
         for iter in range(1, max_iters + 1):
             if global_min >= self.overlap_cutoff:
-                print(
+                log(
                     f"[Log] Hard cutoff {self.overlap_cutoff:.3f} Å satisfied. Stopping optimization."
                 )
                 break
@@ -203,6 +206,7 @@ class Slab:
             for i in tqdm(
                 active_cluster,
                 desc=f"Optimizing ligand (iter {iter})",
+                disable=not verbose,
             ):
                 neighbor_idx = neighbor_map.get(i, [])
                 neighbors_coords = [ligand_coords_list[j] for j in neighbor_idx]
@@ -232,7 +236,7 @@ class Slab:
                 ligand_coords_list,
                 neighbor_map,
             )
-            print(f"[Log] Iter {iter}  global_min = {global_min:.3f} Å")
+            log(f"[Log] Iter {iter}  global_min = {global_min:.3f} Å")
 
         if global_min < self.overlap_cutoff:
             raise RuntimeError("[Error] Maximum iterations reached without satisfying overlap cutoff.")
@@ -290,9 +294,12 @@ class Slab:
         an_y_move: float = 0.0,
         an_z_move: float = 0.0,
         an_z_rotate: float = 0.0,
+        verbose: bool = True,
     ):
         assert not self.ligands, "Ligands have already been placed."
-        
+
+        log = print if verbose else (lambda *a, **k: None)
+
         self.ligands = []
         displaced_indices = []
         for s in self.binding_sites:
@@ -326,14 +333,14 @@ class Slab:
                     if site is not None:
                         chosen_sites.append(site)
                     else:
-                        print(f"[Warning] Requested binding site index {idx} not available for ligand {lig.name}.")
+                        log(f"[Warning] Requested binding site index {idx} not available for ligand {lig.name}.")
             else:
                 if 0.0 < spec.coverage <= 1.0:
                     n_target = int(math.ceil(spec.coverage * len(available)))
                 else:
                     n_target = int(spec.coverage)
                     if n_target > len(available):
-                        print(f"[Warning] Requested {n_target} sites for ligand, "
+                        log(f"[Warning] Requested {n_target} sites for ligand, "
                             f"but only {len(available)} available.")
                         n_target = len(available)
 
@@ -351,7 +358,7 @@ class Slab:
                 sites.append(site)
                 displaced_indices.append(site.index)
 
-            print(f"[Log] Placed total {len(chosen_sites)} {ligand_type} ligands.")
+            log(f"[Log] Placed total {len(chosen_sites)} {ligand_type} ligands.")
             self.ligand_coverage[spec.ligand.name] = spec.coverage
 
         n_lig = len(ligands)
@@ -497,7 +504,9 @@ class Slab:
         )
 
 
-    def check_overlaps(self, cutoff: float = None) -> float:
+    def check_overlaps(self, cutoff: float = None, verbose: bool = True) -> float:
+        log = print if verbose else (lambda *a, **k: None)
+
         if cutoff is None:
             cutoff = self.overlap_cutoff
 
@@ -514,7 +523,7 @@ class Slab:
             entities.append(lig.atoms.get_positions())
             entity_labels.append(f"ligand_{i}")
 
-        print(f"[DEBUG] #entities (core + ligands) = {len(entities)}")
+        log(f"[DEBUG] #entities (core + ligands) = {len(entities)}")
 
         global_min = np.inf
         global_pair = None
@@ -532,13 +541,13 @@ class Slab:
                     global_pair = (i, j)
 
                 if d_min < cutoff:
-                    print(
+                    log(
                         f"[OVERLAP] {entity_labels[i]} vs {entity_labels[j]}: "
                         f"min distance = {d_min:.3f} Å < {cutoff:.3f} Å"
                     )
                     n += 1
 
-        print(
+        log(
             f"[Log] global min inter-entity distance = {global_min:.3f} Å "
             f"between {entity_labels[global_pair[0]]} and {entity_labels[global_pair[1]]}"
             f" (total overlaps: {n})"
