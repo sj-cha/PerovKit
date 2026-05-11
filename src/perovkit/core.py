@@ -474,7 +474,7 @@ class Core:
             self.octahedra = {}
             return
 
-        r_cut = float(self.a) + 1e-2
+        r_cut = float(self.a)/2 + 1e-2
 
         if any(at.pbc):
             cell = at.get_cell()
