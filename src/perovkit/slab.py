@@ -893,9 +893,7 @@ class Slab:
             cursor += n
 
 
-    def to(self, fmt='vasp', filename: Optional[str] = None, write_json: bool = True) -> None:
-        assert fmt == 'vasp', "Only 'vasp' format is supported currently."
-        
+    def to(self, fmt='vasp', filename: Optional[str] = None, write_json: bool = True) -> None:      
         at = self.atoms
         formula = at.get_chemical_formula()
 
@@ -904,13 +902,17 @@ class Slab:
         
         path = Path(filename)
         path.parent.mkdir(parents=True, exist_ok=True)  
-        
-        write_vasp(str(path), self.atoms, sort=True, direct= True)
-        if write_json:
-            self.to_json(str(path) + ".json")
+        if fmt == 'vasp':
+            write_vasp(str(path), self.atoms, sort=True, direct= True)
+            if write_json:
+                self.to_json(str(path) + ".json", sort = True)
+        else:
+            write(str(path), self.atoms, format=fmt)
+            if write_json:
+                self.to_json(str(path) + ".json", sort = False)
 
 
-    def to_json(self, filename: str) -> None:
+    def to_json(self, filename: str, sort: bool = False) -> None:
 
         self._build_index_map()
 
@@ -996,9 +998,11 @@ class Slab:
             "core": core_meta,
             "ligand_types": ligand_types_meta,
             "core_indices": core_indices_meta,
-            "ligands": ligands_meta,
-            "sort_idx": np.argsort(self.atoms.symbols).tolist()
+            "ligands": ligands_meta
         }
+
+        if sort:
+            topo["sort_idx"] = np.argsort(self.atoms.symbols).tolist()
 
         with open(filename, "w") as f:
             json.dump(topo, f, indent=2)
@@ -1023,7 +1027,7 @@ class Slab:
                 f"Use NanoCrystal.from_file() for nanocrystal data."
             )
 
-        sort_idx = topo.get("sort_idx")
+        sort_idx = topo.get("sort_idx", None)
         if sort_idx is not None:
             atoms = atoms[np.argsort(sort_idx)]
 
@@ -1125,6 +1129,137 @@ class Slab:
         slab._build_and_link_atoms()
 
         return slab
+
+    @classmethod
+    def from_ase(cls,
+                 atoms: Atoms | List[Atoms],
+                 json_filename: str
+                 ) -> Slab | List[Slab]:
+
+        with open(json_filename) as f:
+            topo = json.load(f)
+
+        schema_version = topo.get("schema_version", 1)
+        if schema_version != 1:
+            raise ValueError(f"Unsupported schema_version: {schema_version!r}")
+
+        file_type = topo.get("type")
+        if file_type is not None and file_type != "slab":
+            raise ValueError(
+                f"JSON type is '{file_type}', expected 'slab'. "
+                f"Use NanoCrystal.from_file() for nanocrystal data."
+            )
+
+        single_input = isinstance(atoms, Atoms)
+        atoms_list: List[Atoms] = [atoms] if single_input else list(atoms)
+
+        sort_idx = topo.get("sort_idx", None)
+        n_total_atoms_json = topo["n_total_atoms"]
+
+        core_meta = topo["core"]
+        n_core_atoms = core_meta["n_core_atoms"]
+        core_cell = np.array(core_meta["cell"], dtype=float)
+        core_pbc = np.array(core_meta["pbc"], dtype=bool)
+
+        core_indices_meta = topo["core_indices"]
+
+        octa_raw = core_indices_meta.get("octahedra", None)
+        if octa_raw is not None:
+            octahedra = {
+                int(b): {"X": v["X"], "Ligand": v["Ligand"]}
+                for b, v in octa_raw.items()
+            }
+        else:
+            octahedra = None
+
+        B_ijk_raw = core_indices_meta.get("B_ijk")
+        B_ijk = {int(k): (int(v[0]), int(v[1]), int(v[2])) for k, v in B_ijk_raw.items()}
+
+        ligand_types_meta = topo["ligand_types"]
+        type_id_to_meta: Dict[int, dict] = {
+            t["id"]: t for t in ligand_types_meta
+        }
+        ligands_meta = topo["ligands"]
+
+        slabs: List[Slab] = []
+        for atoms_i in atoms_list:
+            if sort_idx is not None:
+                atoms_i = atoms_i[np.argsort(sort_idx)]
+
+            if n_total_atoms_json != len(atoms_i):
+                raise ValueError(
+                    f"Atom count mismatch: JSON={n_total_atoms_json}, XYZ={len(atoms_i)}."
+                )
+
+            if n_core_atoms > len(atoms_i):
+                raise ValueError(
+                    f"n_core_atoms={n_core_atoms}, but XYZ has only {len(atoms_i)} atoms."
+                )
+
+            core_atoms = atoms_i[:n_core_atoms]
+            core_atoms.set_cell(core_cell)
+            core_atoms.set_pbc(core_pbc)
+
+            core = Core(
+                A=core_meta["A"],
+                B=core_meta["B"],
+                X=core_meta["X"],
+                atoms=core_atoms,
+                a=core_meta["a"],
+                supercell=tuple(core_meta["supercell"]),
+                vacuum=core_meta["vacuum"],
+                build_surface=False,
+            )
+
+            ligands: List[Ligand] = []
+            cursor = n_core_atoms
+
+            for inst_meta in ligands_meta:
+                spec_id = inst_meta["spec_id"]
+                tmeta = type_id_to_meta[spec_id]
+
+                n_atoms = tmeta["n_atoms"]
+
+                if cursor + n_atoms > len(atoms_i):
+                    raise ValueError(
+                        f"Ligand slice out of range: need up to {cursor + n_atoms}, "
+                        f"but XYZ has only {len(atoms_i)} atoms."
+                    )
+
+                lig_atoms = atoms_i[cursor : cursor + n_atoms]
+                cursor += n_atoms
+
+                binding_atoms = list(map(int, tmeta.get("binding_atoms_indices", [])))
+
+                lig = Ligand._from_data(
+                    atoms=lig_atoms,
+                    mol=None,
+                    smiles=tmeta["smiles"],
+                    charge=tmeta["charge"],
+                    binding_motif=BindingMotif(tmeta["binding_motif_atoms"]),
+                    name=tmeta["name"],
+                    plane=inst_meta["plane"],
+                    volume=tmeta["volume"],
+                    _neighbor_cutoff=1.2,
+                    binding_atoms=binding_atoms,
+                )
+
+                ligands.append(lig)
+
+            slab = cls(
+                core=core,
+                ligand_specs=[],
+            )
+            slab.ligands = ligands
+            slab.ligand_coverage = {t["name"]: t["coverage"] for t in ligand_types_meta}
+            slab.core.octahedra = octahedra
+            slab.core.B_ijk = B_ijk
+            slab._build_index_map()
+            slab._build_and_link_atoms()
+
+            slabs.append(slab)
+
+        return slabs[0] if single_input else slabs
 
 
     def _build_and_link_atoms(self) -> None:

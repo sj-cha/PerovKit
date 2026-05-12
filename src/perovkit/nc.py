@@ -673,14 +673,14 @@ class NanoCrystal:
 
             write_vasp(str(path), vasp_atoms, sort=True, direct=True)
             if write_json:
-                self.to_json(str(path) + ".json", sorted=True)
+                self.to_json(str(path) + ".json", sort=True)
         else:
             write(str(path), at, format=fmt, comment=formula)
             if write_json:
-                self.to_json(str(path) + ".json")
+                self.to_json(str(path) + ".json", sort=False)
 
 
-    def to_json(self, filename: str, sorted: bool = False) -> None:
+    def to_json(self, filename: str, sort: bool = False) -> None:
 
         self._build_index_map()
 
@@ -766,7 +766,7 @@ class NanoCrystal:
             "ligands": ligands_meta,
         }
 
-        if sorted:
+        if sort:
             topo["sort_idx"] = np.argsort(self.atoms.symbols).tolist()
 
         with open(filename, "w") as f:
@@ -792,7 +792,7 @@ class NanoCrystal:
                 f"Use Slab.from_file() for slab data."
             )
 
-        sort_idx = topo.get("sort_idx")
+        sort_idx = topo.get("sort_idx", None)
         if sort_idx is not None:
             atoms = atoms[np.argsort(sort_idx)]
 
@@ -891,6 +891,130 @@ class NanoCrystal:
         nc._build_and_link_atoms()
 
         return nc
+
+
+    @classmethod
+    def from_ase(cls,
+                 atoms: Atoms | List[Atoms],
+                 json_filename: str
+                 ) -> NanoCrystal | List[NanoCrystal]:
+
+        with open(json_filename) as f:
+            topo = json.load(f)
+
+        schema_version = topo.get("schema_version", 1)
+        if schema_version != 1:
+            raise ValueError(f"Unsupported schema_version: {schema_version!r}")
+
+        file_type = topo.get("type")
+        if file_type is not None and file_type != "nanocrystal":
+            raise ValueError(
+                f"JSON type is '{file_type}', expected 'nanocrystal'. "
+                f"Use Slab.from_file() for slab data."
+            )
+
+        single_input = isinstance(atoms, Atoms)
+        atoms_list: List[Atoms] = [atoms] if single_input else list(atoms)
+
+        n_total_atoms_json = topo["n_total_atoms"]
+
+        core_meta = topo["core"]
+        n_core_atoms = core_meta["n_core_atoms"]
+
+        core_indices_meta = topo["core_indices"]
+
+        octa_raw = core_indices_meta.get("octahedra", None)
+        if octa_raw is not None:
+            octahedra = {
+                int(b): {"X": v["X"], "Ligand": v["Ligand"]}
+                for b, v in octa_raw.items()
+            }
+        else:
+            octahedra = None
+
+        B_ijk_raw = core_indices_meta.get("B_ijk")
+        B_ijk = {int(k): (int(v[0]), int(v[1]), int(v[2])) for k, v in B_ijk_raw.items()}
+
+        ligand_types_meta = topo["ligand_types"]
+        type_id_to_meta: Dict[int, dict] = {
+            t["id"]: t for t in ligand_types_meta
+        }
+        ligands_meta = topo["ligands"]
+
+        ncs: List[NanoCrystal] = []
+        for atoms_i in atoms_list:
+            if n_total_atoms_json != len(atoms_i):
+                raise ValueError(
+                    f"Atom count mismatch: JSON={n_total_atoms_json}, XYZ={len(atoms_i)}."
+                )
+
+            if n_core_atoms > len(atoms_i):
+                raise ValueError(
+                    f"n_core_atoms={n_core_atoms}, but XYZ has only {len(atoms_i)} atoms."
+                )
+
+            core_atoms = atoms_i[:n_core_atoms]
+            core_atoms.pbc = False
+
+            core = Core(
+                A=core_meta["A"],
+                B=core_meta["B"],
+                X=core_meta["X"],
+                atoms=core_atoms,
+                a=core_meta["a"],
+                supercell=tuple(core_meta["supercell"]),
+                build_surface=False,
+            )
+
+            ligands: List[Ligand] = []
+            cursor = n_core_atoms
+
+            for inst_meta in ligands_meta:
+                spec_id = inst_meta["spec_id"]
+                tmeta = type_id_to_meta[spec_id]
+
+                n_atoms = tmeta["n_atoms"]
+
+                if cursor + n_atoms > len(atoms_i):
+                    raise ValueError(
+                        f"Ligand slice out of range: need up to {cursor + n_atoms}, "
+                        f"but XYZ has only {len(atoms_i)} atoms."
+                    )
+
+                lig_atoms = atoms_i[cursor : cursor + n_atoms]
+                cursor += n_atoms
+
+                binding_atoms = list(map(int, tmeta.get("binding_atoms_indices", [])))
+
+                lig = Ligand._from_data(
+                    atoms=lig_atoms,
+                    mol=None,
+                    smiles=tmeta["smiles"],
+                    charge=tmeta["charge"],
+                    binding_motif=BindingMotif(tmeta["binding_motif_atoms"]),
+                    name=tmeta["name"],
+                    plane=inst_meta["plane"],
+                    volume=tmeta["volume"],
+                    _neighbor_cutoff=1.2,
+                    binding_atoms=binding_atoms,
+                )
+
+                ligands.append(lig)
+
+            nc = cls(
+                core=core,
+                ligand_specs=[],
+            )
+            nc.ligands = ligands
+            nc.ligand_coverage = {t["name"]: t["coverage"] for t in ligand_types_meta}
+            nc.core.octahedra = octahedra
+            nc.core.B_ijk = B_ijk
+            nc._build_index_map()
+            nc._build_and_link_atoms()
+
+            ncs.append(nc)
+
+        return ncs[0] if single_input else ncs
 
 
     def _build_and_link_atoms(self) -> None:
