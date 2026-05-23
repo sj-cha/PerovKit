@@ -7,6 +7,7 @@ from typing import Optional, Tuple, List
 import numpy as np
 from ase import Atoms
 from ase.io import read, write
+from ase.io.vasp import write_vasp
 from scipy.spatial import cKDTree
 from rdkit import Chem
 from rdkit.Chem import AllChem, rdDetermineBonds, rdMolTransforms
@@ -373,7 +374,11 @@ class Ligand:
         self.atoms.set_positions(rotated_all)
 
 
-    def to(self, fmt: str = 'xyz', filename: str = None) -> None:
+    def to(self, 
+           fmt: str = 'xyz', 
+           filename: str = None,
+           vacuum: float = 15.0
+           ) -> None:
         """
         Write the ligand to file.
 
@@ -392,7 +397,22 @@ class Ligand:
         path = Path(filename)
         path.parent.mkdir(parents=True, exist_ok=True)  
 
-        write(filename, self.atoms, format=fmt, comment=formula)
+        if fmt == "vasp":
+            pos = self.atoms.get_positions()
+            center = pos.mean(axis=0)
+            extent = pos.max(axis=0) - pos.min(axis=0)
+            cell_diag = extent + vacuum
+
+            vasp_atoms = self.atoms.copy()
+            vasp_atoms.set_cell(np.diag(cell_diag))
+            vasp_atoms.positions += (cell_diag / 2 - center)
+            vasp_atoms.pbc = True
+
+            write_vasp(str(path), vasp_atoms, sort=True, direct=True)
+        else:
+            formula = self.atoms.get_chemical_formula()
+            write(str(path), self.atoms, format=fmt, comment=formula)
+
 
 
 @dataclass
