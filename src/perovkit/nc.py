@@ -664,7 +664,7 @@ class NanoCrystal:
             pos = at.get_positions()
             center = pos.mean(axis=0)
             extent = pos.max(axis=0) - pos.min(axis=0)
-            cell_diag = extent + 2 * vacuum
+            cell_diag = extent + vacuum
 
             vasp_atoms = at.copy()
             vasp_atoms.set_cell(np.diag(cell_diag))
