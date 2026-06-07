@@ -7,6 +7,23 @@ import numpy as np
 from perovkit import Core, NanoCrystal, Slab
 
 
+def _a_cation_groups(core) -> list:
+    """Atom-index groups for organic A-site cation molecules (empty for inorganic A)."""
+    if isinstance(core.A, list):
+        return [np.asarray(lig.indices, dtype=int) for lig in core.A]
+    return []
+
+
+def _rigidify_groups(pos0, pos_new, groups, affine):
+    """
+    Override each atom group with a rigid translation: move the group's center by
+    the affine map and keep its internal geometry fixed (no internal deformation).
+    """
+    for g in groups:
+        c0 = pos0[g].mean(axis=0)
+        pos_new[g] = pos0[g] + (affine(c0) - c0)
+
+
 def apply_strain(
     structure: Core | NanoCrystal | Slab,
     strain: Sequence[float],          # (ex, ey, ez)
@@ -28,12 +45,19 @@ def apply_strain(
 
     pos0 = np.asarray(structure.atoms.get_positions(), dtype=float)
 
+    core = structure if isinstance(structure, Core) else structure.core
+    a_cation_groups = _a_cation_groups(core)
+
     if isinstance(structure, Core):
         if is_periodic:
-            pos_new = pos0 @ F.T
+            affine = lambda p: p @ F.T
         else:
             center = np.mean(pos0, axis=0)
-            pos_new = (pos0 - center) @ F.T + center
+            affine = lambda p: (p - center) @ F.T + center
+
+        pos_new = affine(pos0)
+        # Organic A-site cations are rigid molecules: translate, don't deform.
+        _rigidify_groups(pos0, pos_new, a_cation_groups, affine)
 
         structure.atoms.positions[:] = pos_new
 
@@ -42,35 +66,26 @@ def apply_strain(
         n_core = len(structure.core.atoms)
 
         if is_periodic:
-            if strain_ligands:
-                pos_new = pos0 @ F.T
-            else:
-                pos_new = pos0.copy()
-                pos_new[:n_core] = pos0[:n_core] @ F.T
-
-                for lig in structure.ligands:
-                    anchor0 = getattr(lig, "anchor_pos", None)
-                    if anchor0 is None:
-                        continue
-                    anchor0 = np.asarray(anchor0, dtype=float).reshape(3,)
-                    anchor_new = F @ anchor0
-                    pos_new[lig.indices] += anchor_new - anchor0
+            affine = lambda p: p @ F.T
         else:
             center = np.mean(pos0[:n_core], axis=0)
+            affine = lambda p: (p - center) @ F.T + center
 
-            if strain_ligands:
-                pos_new = (pos0 - center) @ F.T + center
-            else:
-                pos_new = pos0.copy()
-                pos_new[:n_core] = (pos0[:n_core] - center) @ F.T + center
+        if strain_ligands:
+            pos_new = affine(pos0)
+        else:
+            pos_new = pos0.copy()
+            pos_new[:n_core] = affine(pos0[:n_core])
 
-                for lig in structure.ligands:
-                    anchor0 = getattr(lig, "anchor_pos", None)
-                    if anchor0 is None:
-                        continue
-                    anchor0 = np.asarray(anchor0, dtype=float).reshape(3,)
-                    anchor_new = F @ (anchor0 - center) + center
-                    pos_new[lig.indices] += anchor_new - anchor0
+            for lig in structure.ligands:
+                anchor0 = getattr(lig, "anchor_pos", None)
+                if anchor0 is None:
+                    continue
+                anchor0 = np.asarray(anchor0, dtype=float).reshape(3,)
+                pos_new[lig.indices] += affine(anchor0) - anchor0
+
+        # Organic A-site cations live in the core block: keep them rigid too.
+        _rigidify_groups(pos0, pos_new, a_cation_groups, affine)
 
         # Single write to the shared buffer updates core and all ligands
         structure.atoms.positions[:] = pos_new
