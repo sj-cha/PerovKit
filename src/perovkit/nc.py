@@ -58,6 +58,31 @@ class NanoCrystal:
         self._atoms: Optional[Atoms] = None
 
 
+    def _select_site_pool(self, spec: LigandSpec) -> Tuple[List[BindingSite], str]:
+        """
+        Resolve which binding sites a LigandSpec targets.
+
+        If `spec.site` ("A"/"B"/"X") is given it is used directly. Otherwise the
+        target is inferred from the ligand charge (positive -> A-site, otherwise
+        X-site) for backward compatibility. Returns (pool, label).
+        """
+        symbol_map = {
+            "A": self.core.A_label,
+            "B": self.core.B,
+            "X": self.core.X,
+        }
+        if spec.site is not None:
+            target = symbol_map[spec.site]
+            label = f"{spec.site}-site"
+        elif spec.ligand.charge > 0:
+            target, label = self.core.A_label, "A-site"
+        else:
+            target, label = self.core.X, "X-site"
+
+        pool = [s for s in self.binding_sites if s.symbol == target]
+        return pool, label
+
+
     def place_ligands(
         self,
         max_iters: int = 10,
@@ -88,23 +113,13 @@ class NanoCrystal:
 
         core_positions = self.core.atoms.get_positions()
 
-        A_sites = [s for s in self.binding_sites if s.symbol == self.core.A]
-        X_sites = [s for s in self.binding_sites if s.symbol == self.core.X]
-
         ligands: List[Ligand] = []
         sites: List[BindingSite] = []
 
         for spec in self.ligand_specs:
             lig = spec.ligand
-            charge = lig.charge
 
-            if charge > 0:
-                pool = A_sites
-                ligand_type = "A-site"
-            else: 
-                pool = X_sites
-                ligand_type = "X-site"
-
+            pool, ligand_type = self._select_site_pool(spec)
             available = [s for s in pool if not s.passivated]
 
             if spec.binding_sites is not None:
@@ -113,7 +128,7 @@ class NanoCrystal:
                     continue
                 chosen_sites = []
                 for idx in spec.binding_sites:
-                    site = next((s for s in available if s.index == idx), None)
+                    site = next((s for s in available if idx in s.atom_indices), None)
                     if site is not None:
                         chosen_sites.append(site)
                     else:
@@ -128,7 +143,7 @@ class NanoCrystal:
                             f"but only {len(available)} available.")
                         n_target = len(available)
 
-                coords = np.array([core_positions[s.index] for s in available])
+                coords = np.array([s.position(core_positions) for s in available])
                 sc = self.core.supercell
                 if sc is not None and len(set(sc)) > 1:
                     planes = [s.plane for s in available]
@@ -145,16 +160,19 @@ class NanoCrystal:
 
                 ligands.append(lig_cloned)
                 sites.append(site)
-                displaced_indices.append(site.index)
+                # Replace mode removes the surface atom(s); adsorb mode keeps them.
+                if not spec.adsorb:
+                    displaced_indices.extend(site.atom_indices)
 
-            log(f"[Log] Placed total {len(chosen_sites)} {ligand_type} ligands.")
+            mode = "adsorbed" if spec.adsorb else "placed"
+            log(f"[Log] {mode.capitalize()} total {len(chosen_sites)} {ligand_type} ligands.")
             self.ligand_coverage[spec.ligand.name] = spec.coverage
 
         n_lig = len(ligands)
         assert n_lig > 0, "No ligands to place."
 
         # Binding site positions and planes
-        site_positions = np.array([core_positions[s.index] for s in sites])
+        site_positions = np.array([s.position(core_positions) for s in sites])
         site_planes = np.array([s.plane for s in sites], dtype=float)
 
         # Core atoms coordinates except displaced ones
@@ -264,8 +282,19 @@ class NanoCrystal:
             pbc=False
         )
 
+        # Rebuild the A-site. For an organic A-site, replacing a surface cation
+        # removes its molecule, so re-derive the surviving cations from the
+        # preserved a_site_id grouping; otherwise keep the symbol.
+        A_value = self.core.A
+        if "a_site_id" in self.core.atoms.arrays:
+            stripped_atoms.set_array(
+                "a_site_id", self.core.atoms.get_array("a_site_id")[core_mask]
+            )
+            if isinstance(self.core.A, list) and self.core.A:
+                A_value = Core._build_A_ligands(stripped_atoms, self.core.A[0])
+
         self.core = Core(
-            A=self.core.A,
+            A=A_value,
             B=self.core.B,
             X=self.core.X,
             atoms=stripped_atoms,
@@ -685,7 +714,7 @@ class NanoCrystal:
         self._build_index_map()
 
         core_meta = {
-            "A": self.core.A,
+            "A": self.core.a_site_metadata(),
             "B": self.core.B,
             "X": self.core.X,
             "a": self.core.a,
@@ -829,7 +858,7 @@ class NanoCrystal:
         B_ijk = {int(k): (int(v[0]), int(v[1]), int(v[2])) for k, v in B_ijk_raw.items()}
 
         core = Core(
-            A=core_meta["A"],
+            A=Core.a_site_from_metadata(core_meta["A"], core_atoms),
             B=core_meta["B"],
             X=core_meta["X"],
             atoms=core_atoms,
@@ -957,7 +986,7 @@ class NanoCrystal:
             core_atoms.pbc = False
 
             core = Core(
-                A=core_meta["A"],
+                A=Core.a_site_from_metadata(core_meta["A"], core_atoms),
                 B=core_meta["B"],
                 X=core_meta["X"],
                 atoms=core_atoms,

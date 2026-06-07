@@ -422,17 +422,31 @@ class LigandSpec:
 
     Attributes:
         ligand (Ligand): The ligand to attach.
+        site (Optional[str]): Which sublattice to target, one of "A", "B", or "X".
+            This selects the binding sites explicitly instead of inferring them from
+            the ligand charge. If None, the target is inferred from the ligand charge
+            (positive -> A-site, otherwise X-site) for backward compatibility.
         coverage (Optional[float]): Fractional coverage of available binding sites.
         binding_sites (Optional[list[int]]): Explicit surface site indices to use.
-        anchor_offset (float): Offset (Å) along the binding axis.
+        anchor_offset (float): Offset (Å) along the binding axis. When `adsorb` is
+            True this sets the spacing between the surface species and the adsorbate.
+        adsorb (bool): If True, adsorb the ligand on top of the surface site instead
+            of replacing it (the surface atom is kept). Use `anchor_offset` to control
+            the spacing.
         name (Optional[str]): User-defined identifier.
     """
     ligand: Ligand
+    site: Optional[str] = None
     coverage: Optional[float] = None
     binding_sites: Optional[list[int]] = None
     anchor_offset: float = 0.0
+    adsorb: bool = False
     name: Optional[str] = None
 
     def __post_init__(self):
+        if self.site is not None and self.site not in ("A", "B", "X"):
+            raise ValueError(
+                f"site must be one of 'A', 'B', 'X' (or None); got {self.site!r}"
+            )
         if self.name is None:
             self.name = self.ligand.name
