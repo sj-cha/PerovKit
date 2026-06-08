@@ -129,10 +129,10 @@ class NanoCrystal:
                 chosen_sites = []
                 for idx in spec.binding_sites:
                     site = next((s for s in available if idx in s.atom_indices), None)
-                    if site is not None:
-                        chosen_sites.append(site)
-                    else:
+                    if site is None:
                         log(f"[Warning] Requested binding site index {idx} not available for ligand {lig.name}.")
+                    elif site not in chosen_sites:
+                        chosen_sites.append(site)
             else:
                 if 0.0 < spec.coverage <= 1.0:
                     n_target = int(math.ceil(spec.coverage * len(available)))
@@ -143,7 +143,7 @@ class NanoCrystal:
                             f"but only {len(available)} available.")
                         n_target = len(available)
 
-                coords = np.array([s.position(core_positions) for s in available])
+                coords = np.array([s.position for s in available])
                 sc = self.core.supercell
                 if sc is not None and len(set(sc)) > 1:
                     planes = [s.plane for s in available]
@@ -172,7 +172,7 @@ class NanoCrystal:
         assert n_lig > 0, "No ligands to place."
 
         # Binding site positions and planes
-        site_positions = np.array([s.position(core_positions) for s in sites])
+        site_positions = np.array([s.position for s in sites])
         site_planes = np.array([s.plane for s in sites], dtype=float)
 
         # Core atoms coordinates except displaced ones
@@ -858,7 +858,7 @@ class NanoCrystal:
         B_ijk = {int(k): (int(v[0]), int(v[1]), int(v[2])) for k, v in B_ijk_raw.items()}
 
         core = Core(
-            A=Core.a_site_from_metadata(core_meta["A"], core_atoms),
+            A=Core.a_site_from_json(core_meta["A"], core_atoms),
             B=core_meta["B"],
             X=core_meta["X"],
             atoms=core_atoms,
@@ -986,7 +986,7 @@ class NanoCrystal:
             core_atoms.pbc = False
 
             core = Core(
-                A=Core.a_site_from_metadata(core_meta["A"], core_atoms),
+                A=Core.a_site_from_json(core_meta["A"], core_atoms),
                 B=core_meta["B"],
                 X=core_meta["X"],
                 atoms=core_atoms,

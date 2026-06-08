@@ -444,7 +444,7 @@ class Core:
 
 
     @staticmethod
-    def a_site_from_metadata(meta: str | dict, atoms: Atoms):
+    def a_site_from_json(meta: str | dict, atoms: Atoms):
         """
         Reconstruct the A-site value from `a_site_metadata`.
 
@@ -689,7 +689,8 @@ class Core:
                     idx = int(idx)
                     if idx in idx_to_site:
                         continue
-                    idx_to_site[idx] = BindingSite(index=idx, symbol=elem, plane=plane, passivated=False)
+                    idx_to_site[idx] = BindingSite(index=idx, symbol=elem, plane=plane,
+                                                   position=positions[idx], passivated=False)
 
         sites = list(idx_to_site.values())
 
@@ -727,7 +728,7 @@ class Core:
 
             sites.append(
                 BindingSite(index=[int(i) for i in idx], symbol=self.A_label,
-                            plane=v, passivated=False)
+                            plane=v, position=center, passivated=False)
             )
 
         return sites
@@ -810,11 +811,14 @@ class BindingSite:
         symbol (str): Chemical symbol of the site atom, or the A-site label
             (e.g. "MA") for a molecular A-site.
         plane (Tuple[int, int, int]): Miller index (h, k, l) indicating the surface plane.
+        position (np.ndarray): Site position (Å): the atom position for a single-atom
+            site, or the molecule center for a molecular site.
         passivated (bool): Whether a ligand is attached to this site.
     """
     index: int | List[int]
     symbol: str
     plane: Tuple[int, int, int]
+    position: np.ndarray
     passivated: bool = False
 
     @property
@@ -825,7 +829,3 @@ class BindingSite:
     def atom_indices(self) -> List[int]:
         """All atom indices of this site (one for atomic, many for molecular)."""
         return [int(i) for i in self.index] if self.is_molecular else [int(self.index)]
-
-    def position(self, positions: np.ndarray) -> np.ndarray:
-        """Site position: the atom position, or the molecule center for a molecular site."""
-        return positions[self.atom_indices].mean(axis=0)
