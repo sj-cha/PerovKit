@@ -125,13 +125,13 @@ class Slab:
             
             if spec.binding_sites is not None:
                 if len(spec.binding_sites) == 0:
-                    log(f"[Warning] Empty list provided for ligand {lig.name}. Skipping placement.")
+                    print(f"[Warning] Empty list provided for ligand {lig.name}. Skipping placement.")
                     continue
                 chosen_sites = []
                 for idx in spec.binding_sites:
                     site = next((s for s in available if idx in s.atom_indices), None)
                     if site is None:
-                        log(f"[Warning] Requested binding site index {idx} not available for ligand {lig.name}.")
+                        print(f"[Warning] Requested binding site index {idx} not available for ligand {lig.name}.")
                     elif site not in chosen_sites:
                         chosen_sites.append(site)
             else:
@@ -140,7 +140,7 @@ class Slab:
                 else:
                     n_target = int(spec.coverage)
                     if n_target > len(available):
-                        log(f"[Warning] Requested {n_target} sites for ligand, "
+                        print(f"[Warning] Requested {n_target} sites for ligand, "
                             f"but only {len(available)} available.")
                         n_target = len(available)
 
@@ -257,7 +257,7 @@ class Slab:
             log(f"[Log] Iter {iter}  global_min = {global_min:.3f} Å")
 
         if global_min < self.overlap_cutoff:
-            raise RuntimeError("[Error] Maximum iterations reached without satisfying overlap cutoff.")
+            raise RuntimeError("[Log] Maximum iterations reached without satisfying overlap cutoff.")
 
         # Apply final coordinates to Ligand
         max_z = 0
@@ -350,7 +350,7 @@ class Slab:
                 for idx in spec.binding_sites:
                     site = next((s for s in available if idx in s.atom_indices), None)
                     if site is None:
-                        log(f"[Warning] Requested binding site index {idx} not available for ligand {lig.name}.")
+                        print(f"[Warning] Requested binding site index {idx} not available for ligand {lig.name}.")
                     elif site not in chosen_sites:
                         chosen_sites.append(site)
             else:
@@ -359,7 +359,7 @@ class Slab:
                 else:
                     n_target = int(spec.coverage)
                     if n_target > len(available):
-                        log(f"[Warning] Requested {n_target} sites for ligand, "
+                        print(f"[Warning] Requested {n_target} sites for ligand, "
                             f"but only {len(available)} available.")
                         n_target = len(available)
 
@@ -556,7 +556,7 @@ class Slab:
             entities.append(lig.atoms.get_positions())
             entity_labels.append(f"ligand_{i}")
 
-        log(f"[DEBUG] #entities (core + ligands) = {len(entities)}")
+        print(f"[DEBUG] #entities (core + ligands) = {len(entities)}")
 
         global_min = np.inf
         global_pair = None
