@@ -427,6 +427,8 @@ class Core:
 
         lig = self.A[0]
         motif = list(lig.binding_motif.atoms) if lig.binding_motif else None
+        motif_idx = (list(lig.binding_motif.indices)
+                     if lig.binding_motif and lig.binding_motif.indices else None)
         return {
             "label": self.A_label,
             "kind": "molecular",
@@ -436,6 +438,7 @@ class Core:
                 "smiles": lig.smiles,
                 "charge": int(lig.charge),
                 "binding_motif_atoms": motif,
+                "binding_motif_indices": motif_idx,
                 "binding_atoms_indices": list(getattr(lig, "binding_atoms", [])),
                 "n_atoms": len(lig.atoms),
                 "volume": float(lig.volume) if lig.volume is not None else None,
@@ -470,7 +473,8 @@ class Core:
             mol=None,
             smiles=lmeta["smiles"],
             charge=lmeta["charge"],
-            binding_motif=BindingMotif(motif_atoms) if motif_atoms else None,
+            binding_motif=(BindingMotif(motif_atoms, lmeta.get("binding_motif_indices"))
+                           if motif_atoms else None),
             name=lmeta["name"],
             volume=lmeta.get("volume"),
             binding_atoms=list(map(int, lmeta.get("binding_atoms_indices", []))),

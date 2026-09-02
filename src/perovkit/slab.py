@@ -971,6 +971,15 @@ class Slab:
                 lig.smiles,
                 lig.charge,
                 tuple(lig.binding_motif.atoms),
+                # The anchor is part of the ligand TYPE, not an incidental attribute: the
+                # per-type metadata below stores one binding_motif_indices and one
+                # binding_atoms_indices for every instance sharing this key. Without these two
+                # entries, two placements of the same molecule anchored through DIFFERENT atoms
+                # collide into one type and both reload with the first one's anchor, silently.
+                # `from_smiles` derives charge from the SMILES and defaults name to None, so
+                # that collision needs no user opt-in.
+                tuple(lig.binding_motif.indices) if lig.binding_motif.indices else None,
+                tuple(getattr(lig, "binding_atoms", []) or ()),
             )
 
             if key not in type_key_to_id:
@@ -985,6 +994,8 @@ class Slab:
                         "smiles": lig.smiles,
                         "charge": lig.charge,
                         "binding_motif_atoms": list(lig.binding_motif.atoms),
+                        "binding_motif_indices": (list(lig.binding_motif.indices)
+                                                  if lig.binding_motif.indices else None),
                         "binding_atoms_indices": list(getattr(lig, "binding_atoms", [])),
                         "coverage": self.ligand_coverage.get(lig.name),
                         "n_atoms": len(lig.atoms),
@@ -1009,6 +1020,15 @@ class Slab:
                 lig.smiles,
                 lig.charge,
                 tuple(lig.binding_motif.atoms),
+                # The anchor is part of the ligand TYPE, not an incidental attribute: the
+                # per-type metadata below stores one binding_motif_indices and one
+                # binding_atoms_indices for every instance sharing this key. Without these two
+                # entries, two placements of the same molecule anchored through DIFFERENT atoms
+                # collide into one type and both reload with the first one's anchor, silently.
+                # `from_smiles` derives charge from the SMILES and defaults name to None, so
+                # that collision needs no user opt-in.
+                tuple(lig.binding_motif.indices) if lig.binding_motif.indices else None,
+                tuple(getattr(lig, "binding_atoms", []) or ()),
             )
             spec_id = type_key_to_id[key]
 
@@ -1140,7 +1160,8 @@ class Slab:
                 mol=None,
                 smiles=tmeta["smiles"],
                 charge=tmeta["charge"],
-                binding_motif=BindingMotif(tmeta["binding_motif_atoms"]),
+                binding_motif=BindingMotif(tmeta["binding_motif_atoms"],
+                                           tmeta.get("binding_motif_indices")),
                 name=tmeta["name"],
                 plane=inst_meta["plane"],
                 volume=tmeta["volume"],
@@ -1269,7 +1290,8 @@ class Slab:
                     mol=None,
                     smiles=tmeta["smiles"],
                     charge=tmeta["charge"],
-                    binding_motif=BindingMotif(tmeta["binding_motif_atoms"]),
+                    binding_motif=BindingMotif(tmeta["binding_motif_atoms"],
+                                               tmeta.get("binding_motif_indices")),
                     name=tmeta["name"],
                     plane=inst_meta["plane"],
                     volume=tmeta["volume"],
