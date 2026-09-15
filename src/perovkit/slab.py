@@ -323,10 +323,13 @@ class Slab:
         an_y_move: float = 0.0,
         an_z_move: float = 0.0,
         an_z_rotate: float = 0.0,
+        random_seed: int = 42,
         verbose: bool = True,
     ):
         assert not self.ligands, "Ligands have already been placed."
 
+        self._rng = random.Random(random_seed)
+        
         log = print if verbose else (lambda *a, **k: None)
 
         self.ligands = []
