@@ -212,10 +212,24 @@ class Ligand:
         mol = Chem.AddHs(mol)
         params = AllChem.ETKDGv3()
         params.randomSeed = random_seed
-        AllChem.EmbedMolecule(mol, params)
+        conf_id = AllChem.EmbedMolecule(mol, params)
+
+        if conf_id < 0:
+            mol.RemoveAllConformers()
+            params.useRandomCoords = True
+            conf_id = AllChem.EmbedMolecule(mol, params)
+
+        if conf_id < 0:
+            raise ValueError(
+                f"RDKit failed to generate a conformer for ligand."
+            )
 
         if optimize:
-            AllChem.UFFOptimizeMolecule(mol)
+            AllChem.UFFOptimizeMolecule(
+                mol,
+                confId=conf_id,
+                maxIters=1000,
+            )
         else:
             # Set all rotatable bond dihedrals to 180°
             rotatable = Chem.MolFromSmarts('[!$(*#*)&!D1]-&!@[!$(*#*)&!D1]')
