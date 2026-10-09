@@ -527,11 +527,13 @@ class Ligand:
         self.atoms.set_positions(rotated_all)
 
 
-    def to(self, 
-           fmt: str = 'xyz', 
-           filename: str = None,
-           vacuum: float = 15.0
-           ) -> None:
+    def to(
+        self, 
+        fmt: str = 'xyz', 
+        filename: str = None,
+        vacuum: float = 15.0,
+        **kwargs
+    ) -> None:
         """
         Write the ligand to file.
 
@@ -551,6 +553,7 @@ class Ligand:
         path.parent.mkdir(parents=True, exist_ok=True)  
 
         if fmt == "vasp":
+            ase_kwargs = {**kwargs, "sort": True}
             pos = self.atoms.get_positions()
             center = pos.mean(axis=0)
             extent = pos.max(axis=0) - pos.min(axis=0)
@@ -561,10 +564,11 @@ class Ligand:
             vasp_atoms.positions += (cell_diag / 2 - center)
             vasp_atoms.pbc = True
 
-            write_vasp(str(path), vasp_atoms, sort=True, direct=True)
+            write_vasp(str(path), vasp_atoms, **ase_kwargs)
         else:
             formula = self.atoms.get_chemical_formula()
-            write(str(path), self.atoms, format=fmt, comment=formula)
+            ase_kwargs = {**kwargs, "format": fmt, "comment": formula}
+            write(str(path), self.atoms, **ase_kwargs)
 
 
 

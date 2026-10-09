@@ -553,7 +553,8 @@ class Core:
         self, 
         fmt: str, 
         filename: Optional[str] = None, 
-        vacuum: float = 15.0
+        vacuum: float = 15.0,
+        **kwargs,
     ):
         """
         Write the structure to file.
@@ -571,8 +572,10 @@ class Core:
         path.parent.mkdir(parents=True, exist_ok=True)
 
         if fmt == "vasp":
+            ase_kwargs = {**kwargs, "sort": True}
+
             if self.is_slab:
-                write_vasp(str(path), self.atoms, sort=True, direct=True)
+                write_vasp(str(path), self.atoms, **ase_kwargs)
             else:
                 pos = self.atoms.get_positions()
                 center = pos.mean(axis=0)
@@ -584,10 +587,11 @@ class Core:
                 vasp_atoms.positions += (cell_diag / 2 - center)
                 vasp_atoms.pbc = True
 
-                write_vasp(str(path), vasp_atoms, sort=True, direct=True)
+                write_vasp(str(path), vasp_atoms, **ase_kwargs)
         else:
             formula = self.atoms.get_chemical_formula()
-            write(str(path), self.atoms, format=fmt, comment=formula)
+            ase_kwargs = {**kwargs, "format": fmt, "comment": formula}
+            write(str(path), self.atoms, **ase_kwargs)
 
 
     def _get_surface_atoms(

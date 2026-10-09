@@ -929,7 +929,13 @@ class Slab:
             cursor += n
 
 
-    def to(self, fmt='vasp', filename: Optional[str] = None, write_json: bool = True) -> None:      
+    def to(
+        self, 
+        fmt='vasp', 
+        filename: Optional[str] = None, 
+        write_json: bool = True,
+        **kwargs
+    ) -> None:      
         at = self.atoms
         formula = at.get_chemical_formula()
 
@@ -939,11 +945,13 @@ class Slab:
         path = Path(filename)
         path.parent.mkdir(parents=True, exist_ok=True)  
         if fmt == 'vasp':
-            write_vasp(str(path), self.atoms, sort=True, direct= True)
+            ase_kwargs = {**kwargs, "sort": True}
+            write_vasp(str(path), self.atoms, **ase_kwargs)
             if write_json:
                 self.to_json(str(path) + ".json", sort = True)
         else:
-            write(str(path), self.atoms, format=fmt)
+            ase_kwargs = {**kwargs, "format": fmt, "comment": formula}
+            write(str(path), self.atoms, **ase_kwargs)
             if write_json:
                 self.to_json(str(path) + ".json", sort = False)
 

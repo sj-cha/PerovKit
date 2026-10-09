@@ -678,8 +678,14 @@ class NanoCrystal:
             cursor += n
 
 
-    def to(self, fmt: str = "xyz", filename: str = None, write_json: bool = True,
-           vacuum: float = 15.0) -> None:
+    def to(
+        self, 
+        fmt: str = "xyz", 
+        filename: str = None, 
+        write_json: bool = True,
+        vacuum: float = 15.0,
+        **kwargs
+    ) -> None:
         at = self.atoms
         formula = at.get_chemical_formula()
 
@@ -690,6 +696,8 @@ class NanoCrystal:
         path.parent.mkdir(parents=True, exist_ok=True)
 
         if fmt == "vasp":
+            ase_kwargs = {**kwargs, "sort": True}
+
             pos = at.get_positions()
             center = pos.mean(axis=0)
             extent = pos.max(axis=0) - pos.min(axis=0)
@@ -700,11 +708,12 @@ class NanoCrystal:
             vasp_atoms.positions += (cell_diag / 2 - center)
             vasp_atoms.pbc = True
 
-            write_vasp(str(path), vasp_atoms, sort=True, direct=True)
+            write_vasp(str(path), vasp_atoms, **ase_kwargs)
             if write_json:
                 self.to_json(str(path) + ".json", sort=True)
         else:
-            write(str(path), at, format=fmt, comment=formula)
+            ase_kwargs = {**kwargs, "format": fmt, "comment": formula}
+            write(str(path), self.atoms, **ase_kwargs)
             if write_json:
                 self.to_json(str(path) + ".json", sort=False)
 
