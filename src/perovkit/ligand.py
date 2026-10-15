@@ -400,17 +400,23 @@ class Ligand:
             axis = coords0[binding_idx[1]] - coords0[binding_idx[0]]
             axis /= np.linalg.norm(axis)
         else:
-            b = binding_idx[0]  
-            bind_pos = coords0[b]
+            b = binding_idx[0]
+            others = np.delete(coords0, b, axis=0)  # coords0[b] is the origin
 
-            deltas = coords0 - bind_pos # (N, 3)
-            d2 = np.einsum("ij,ij->i", deltas, deltas)  # squared distances
-            d2[b] = -np.inf # exclude self
+            if len(others) == 0:
+                # monatomic ligand: nothing to orient
+                self.atoms.set_positions(coords0)
+                return None
 
-            # if there is at least one other atom, use the farthest one
-            j = int(np.argmax(d2))
-            axis = deltas[j]                 
-            axis /= np.linalg.norm(axis)
+            # point binding atom -> unweighted centroid of the rest along +z
+            axis = others.mean(axis=0)
+            norm = np.linalg.norm(axis)
+            if norm < 1e-3:
+                # centroid sits on the binding atom (e.g. NH4+): fall back to the farthest atom
+                d2 = np.einsum("ij,ij->i", others, others)  # squared distances
+                axis = others[int(np.argmax(d2))]
+                norm = np.linalg.norm(axis)
+            axis /= norm
 
             z = np.array([0.0, 0.0, 1.0], dtype=float)
             R_align = rotation_from_u_to_v(axis, z)  
