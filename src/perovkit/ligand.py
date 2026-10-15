@@ -13,15 +13,21 @@ from rdkit.Chem import AllChem, rdDetermineBonds, rdMolTransforms
 
 from .utils.rotation import rotation_about_axis, rotation_from_u_to_v
 
-MAX_BITE_DISTANCE = 3.5
-
 
 @dataclass
 class BindingMotif:
     """
     Specification of how a ligand anchors to a surface.
+
+    Attributes:
+        atoms (list[str]): Element symbols of the binding atoms (1 or 2), e.g. ["O", "O"].
+        anchor (str): SMARTS of the binding group, e.g. "P" for a phosphonate. The binding
+            atoms are searched among the atoms of its first match and their bonded neighbors.
+        indices (list[int]): Explicit binding atom indices, one per entry of ``atoms``.
+            When given they are used as-is and ``anchor`` is not required.
     """
     atoms: list[str]
+    anchor: Optional[str] = None
     indices: Optional[list[int]] = None
 
     def __post_init__(self):
@@ -30,6 +36,10 @@ class BindingMotif:
                 f"Binding motifs with more than 2 atoms are not yet supported; "
                 f"got {len(self.atoms)}: {self.atoms}"
             )
+        if self.anchor is None and self.indices is None:
+            raise ValueError("BindingMotif: give an anchor SMARTS (or explicit indices)")
+        if self.anchor is not None and Chem.MolFromSmarts(self.anchor) is None:
+            raise ValueError(f"BindingMotif: invalid anchor SMARTS {self.anchor!r}")
         if self.indices is None:
             return
         self.indices = [int(i) for i in self.indices]
@@ -42,6 +52,21 @@ class BindingMotif:
             raise ValueError(f"BindingMotif: indices must be non-negative, got {self.indices}")
         if len(set(self.indices)) != len(self.indices):
             raise ValueError(f"BindingMotif: indices must be distinct, got {self.indices}")
+
+    @classmethod
+    def _from_metadata(cls, meta: dict) -> Optional[BindingMotif]:
+        """
+        Rebuild from serialized ligand metadata; None when the ligand has no motif.
+        """
+        atoms = meta.get("binding_motif_atoms")
+        if not atoms:
+            return None
+        anchor = meta.get("binding_motif_anchor")
+        indices = meta.get("binding_motif_indices")
+        if anchor is None and indices is None:
+            # written before anchors existed: pin the binding atoms resolved back then
+            indices = meta.get("binding_atoms_indices")
+        return cls(atoms, anchor=anchor, indices=indices)
 
 
 @dataclass
@@ -283,6 +308,28 @@ class Ligand:
         return np.array([a.GetDegree() for a in self.mol.GetAtoms()], dtype=int)
 
 
+    def _anchor_region(self) -> List[int]:
+        """
+        Atoms of the first anchor match and their bonded neighbors, sorted by index.
+        """
+        anchor = self.binding_motif.anchor
+        mol = self.mol
+        matches = mol.GetSubstructMatches(Chem.MolFromSmarts(anchor))
+        if not matches:
+            raise ValueError(f"anchor {anchor!r} matches nothing in ligand {self.smiles!r}")
+
+        first = set(matches[0])
+        # matches sharing atoms with the first one are the same group seen from another atom
+        if any(first.isdisjoint(m) for m in matches[1:]):
+            print(f"[Warning] anchor {anchor!r} matches more than one group in ligand "
+                  f"{self.name or self.smiles}; using the first match {sorted(first)}.")
+
+        region = set(first)
+        for i in first:
+            region.update(n.GetIdx() for n in mol.GetAtomWithIdx(i).GetNeighbors())
+        return sorted(region)
+
+
     def _get_binding_atoms_indices(self) -> List[int]:
         """
         Detect the atom indices that match the binding motif.
@@ -312,16 +359,18 @@ class Ligand:
             self.binding_atoms = idx
             return self.binding_atoms
 
+        region = self._anchor_region()
         cn = self._coordination_numbers()
 
         if len(binding_elems) == 2:
             elem1, elem2 = binding_elems
 
-            idx1 = [i for i, s in enumerate(symbols) if s == elem1]
-            idx2 = [i for i, s in enumerate(symbols) if s == elem2]
+            idx1 = [i for i in region if symbols[i] == elem1]
+            idx2 = [i for i in region if symbols[i] == elem2]
 
             if len(idx1) == 0 or len(idx2) == 0:
-                raise ValueError(f"No atoms found for binding motif {binding_elems}")
+                raise ValueError(f"No atoms found for binding motif {binding_elems} "
+                                 f"around anchor {self.binding_motif.anchor!r}")
 
             best_pair = None
             best_key = None
@@ -333,9 +382,7 @@ class Ligand:
                         continue
                     p2 = coords[j]
                     dist = float(np.linalg.norm(p1 - p2))
-                    key = (dist > MAX_BITE_DISTANCE,
-                           int(cn[i]) + int(cn[j]),
-                           dist)
+                    key = (int(cn[i]) + int(cn[j]), dist)
                     if best_key is None or key < best_key:
                         best_key = key
                         best_pair = (i, j)
@@ -350,9 +397,10 @@ class Ligand:
         elif len(binding_elems) == 1:
             elem = binding_elems[0]
 
-            elem_indices = [i for i, s in enumerate(symbols) if s == elem]
+            elem_indices = [i for i in region if symbols[i] == elem]
             if len(elem_indices) == 0:
-                raise ValueError(f"No atoms found for binding element {elem!r}")
+                raise ValueError(f"No atoms found for binding element {elem!r} "
+                                 f"around anchor {self.binding_motif.anchor!r}")
 
             elem_cn = cn[np.asarray(elem_indices, dtype=int)]
 

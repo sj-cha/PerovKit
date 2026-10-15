@@ -982,6 +982,7 @@ class Slab:
                 lig.smiles,
                 lig.charge,
                 tuple(lig.binding_motif.atoms),
+                lig.binding_motif.anchor,
                 # The anchor is part of the ligand TYPE, not an incidental attribute: the
                 # per-type metadata below stores one binding_motif_indices and one
                 # binding_atoms_indices for every instance sharing this key. Without these two
@@ -1005,6 +1006,7 @@ class Slab:
                         "smiles": lig.smiles,
                         "charge": lig.charge,
                         "binding_motif_atoms": list(lig.binding_motif.atoms),
+                        "binding_motif_anchor": lig.binding_motif.anchor,
                         "binding_motif_indices": (list(lig.binding_motif.indices)
                                                   if lig.binding_motif.indices else None),
                         "binding_atoms_indices": list(getattr(lig, "binding_atoms", [])),
@@ -1031,6 +1033,7 @@ class Slab:
                 lig.smiles,
                 lig.charge,
                 tuple(lig.binding_motif.atoms),
+                lig.binding_motif.anchor,
                 # The anchor is part of the ligand TYPE, not an incidental attribute: the
                 # per-type metadata below stores one binding_motif_indices and one
                 # binding_atoms_indices for every instance sharing this key. Without these two
@@ -1171,8 +1174,7 @@ class Slab:
                 mol=None,
                 smiles=tmeta["smiles"],
                 charge=tmeta["charge"],
-                binding_motif=BindingMotif(tmeta["binding_motif_atoms"],
-                                           tmeta.get("binding_motif_indices")),
+                binding_motif=BindingMotif._from_metadata(tmeta),
                 name=tmeta["name"],
                 plane=inst_meta["plane"],
                 volume=tmeta["volume"],
@@ -1300,8 +1302,7 @@ class Slab:
                     mol=None,
                     smiles=tmeta["smiles"],
                     charge=tmeta["charge"],
-                    binding_motif=BindingMotif(tmeta["binding_motif_atoms"],
-                                               tmeta.get("binding_motif_indices")),
+                    binding_motif=BindingMotif._from_metadata(tmeta),
                     name=tmeta["name"],
                     plane=inst_meta["plane"],
                     volume=tmeta["volume"],

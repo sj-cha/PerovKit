@@ -429,6 +429,7 @@ class Core:
         motif = list(lig.binding_motif.atoms) if lig.binding_motif else None
         motif_idx = (list(lig.binding_motif.indices)
                      if lig.binding_motif and lig.binding_motif.indices else None)
+        motif_anchor = lig.binding_motif.anchor if lig.binding_motif else None
         return {
             "label": self.A_label,
             "kind": "molecular",
@@ -438,6 +439,7 @@ class Core:
                 "smiles": lig.smiles,
                 "charge": int(lig.charge),
                 "binding_motif_atoms": motif,
+                "binding_motif_anchor": motif_anchor,
                 "binding_motif_indices": motif_idx,
                 "binding_atoms_indices": list(getattr(lig, "binding_atoms", [])),
                 "n_atoms": len(lig.atoms),
@@ -467,14 +469,12 @@ class Core:
             ids[g * n_atoms:(g + 1) * n_atoms] = g
         atoms.set_array("a_site_id", ids)
 
-        motif_atoms = lmeta.get("binding_motif_atoms")
         template = Ligand._from_data(
             atoms=atoms[0:n_atoms],
             mol=None,
             smiles=lmeta["smiles"],
             charge=lmeta["charge"],
-            binding_motif=(BindingMotif(motif_atoms, lmeta.get("binding_motif_indices"))
-                           if motif_atoms else None),
+            binding_motif=BindingMotif._from_metadata(lmeta),
             name=lmeta["name"],
             volume=lmeta.get("volume"),
             binding_atoms=list(map(int, lmeta.get("binding_atoms_indices", []))),
