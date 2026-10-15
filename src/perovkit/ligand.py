@@ -69,6 +69,25 @@ class BindingMotif:
         return cls(atoms, anchor=anchor, indices=indices)
 
 
+class _SyncedMol:
+    """
+    Descriptor for Ligand.mol: on every access the conformer is overwritten with the
+    current ASE positions, so it follows orientation, placement and any later edit
+    made through the parent structure's shared position buffer.
+    """
+    def __get__(self, lig, owner=None):
+        if lig is None:
+            raise AttributeError  # tells dataclass the field has no default
+        mol = lig.__dict__.get("_mol")
+        # a size mismatch is left for the __post_init__ check to report
+        if mol is not None and mol.GetNumConformers() and mol.GetNumAtoms() == len(lig.atoms):
+            mol.GetConformer().SetPositions(lig.atoms.get_positions())
+        return mol
+
+    def __set__(self, lig, mol):
+        lig.__dict__["_mol"] = mol
+
+
 @dataclass
 class Ligand:
     """
@@ -76,7 +95,7 @@ class Ligand:
 
     Attributes:
         atoms (ASE Atoms): ASE Atoms object.
-        mol (Chem.Mol): RDKit Mol object.
+        mol (Chem.Mol): RDKit Mol object; its conformer follows ``atoms`` positions.
         smiles (str): SMILES string of the ligand without explicit hydrogens.
         charge (int): Formal charge of the ligand.
         binding_motif (BindingMotif): Specification of how a ligand anchors to a surface.
@@ -89,7 +108,7 @@ class Ligand:
         _anchor_offset (float): Offset (Å) applied along the axis perpendicular to the plane.
     """
     atoms: Atoms
-    mol: Chem.Mol
+    mol: Chem.Mol = _SyncedMol()
     smiles: str
     charge: int
     binding_motif: BindingMotif
@@ -266,10 +285,12 @@ class Ligand:
 
     def clone(self) -> Ligand:
         """
-        Return a shallow copy with independent atoms and indices.
+        Return a shallow copy with independent atoms, mol and indices.
         """
         lig = copy.copy(self)
         lig.atoms = self.atoms.copy()
+        if self.mol is not None:
+            lig.mol = Chem.Mol(self.mol)  # own conformer, so it can follow its own atoms
         if self.indices is not None:
             lig.indices = self.indices.copy()
         return lig
