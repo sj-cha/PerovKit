@@ -6,7 +6,6 @@ from typing import Optional, Tuple, List
 
 import numpy as np
 from ase import Atoms
-from ase.data import atomic_numbers, covalent_radii
 from ase.io import read, write
 from ase.io.vasp import write_vasp
 from rdkit import Chem
@@ -62,9 +61,6 @@ class Ligand:
         binding_atoms (List[int]): Local indices of atoms used as anchors.
         plane (Tuple[int, int, int]): Miller index of the surface the ligand is bound to.
         indices (np.ndarray): Global atom indices when placed in a parent NanoCrystal/Slab.
-        _neighbor_cutoff (float): Bond-detection SCALE (dimensionless) used during binding
-            atoms detection: two atoms count as bonded when their separation is within
-            ``_neighbor_cutoff * (r_cov[i] + r_cov[j])``. NOT an absolute distance.
         _anchor_offset (float): Offset (Å) applied along the axis perpendicular to the plane.
     """
     atoms: Atoms
@@ -78,10 +74,12 @@ class Ligand:
     binding_atoms: List[int] = field(default_factory=list)
     plane: Optional[Tuple[int, int, int]] = None
     indices: Optional[np.ndarray] = None
-    _neighbor_cutoff: float = 1.2
     _anchor_offset: float = 0.0
 
     def __post_init__(self):
+        mol = self.mol
+        if mol is None or [a.GetSymbol() for a in mol.GetAtoms()] != self.atoms.get_chemical_symbols():
+            raise ValueError("mol and atoms must list the same elements in the same order")
         self._get_volume()
         if self.binding_motif:
             self._get_binding_atoms_indices()
@@ -265,7 +263,6 @@ class Ligand:
         lig.binding_atoms = []
         lig.plane = None
         lig.indices = None
-        lig._neighbor_cutoff = 1.2
         lig._anchor_offset = 0.0
         for k, v in kwargs.items():
             setattr(lig, k, v)
@@ -281,17 +278,9 @@ class Ligand:
 
     def _coordination_numbers(self) -> np.ndarray:
         """
-        Coordination number of every atom, from covalent radii.
+        Coordination number of every atom, from the RDKit bond graph.
         """
-        symbols = self.atoms.get_chemical_symbols()
-        radii = np.array([covalent_radii[atomic_numbers[s]] for s in symbols], dtype=float)
-        coords = self.atoms.get_positions()
-
-        d = np.linalg.norm(coords[:, None, :] - coords[None, :, :], axis=-1)
-        cut = float(self._neighbor_cutoff) * (radii[:, None] + radii[None, :])
-        adjacency = d <= cut
-        np.fill_diagonal(adjacency, False)
-        return adjacency.sum(axis=1)
+        return np.array([a.GetDegree() for a in self.mol.GetAtoms()], dtype=int)
 
 
     def _get_binding_atoms_indices(self) -> List[int]:

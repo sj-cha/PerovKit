@@ -932,7 +932,6 @@ class NanoCrystal:
                 name=tmeta["name"],
                 plane=inst_meta["plane"],
                 volume=tmeta["volume"],
-                _neighbor_cutoff=1.2,
                 binding_atoms=binding_atoms,
             )
 
@@ -1055,7 +1054,6 @@ class NanoCrystal:
                     name=tmeta["name"],
                     plane=inst_meta["plane"],
                     volume=tmeta["volume"],
-                    _neighbor_cutoff=1.2,
                     binding_atoms=binding_atoms,
                 )
 
