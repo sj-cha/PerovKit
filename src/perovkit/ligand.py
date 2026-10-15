@@ -471,7 +471,7 @@ class Ligand:
             if self.name is not None:
                 filename = f"{self.name}.{fmt}"
             else:
-                filename = f"{self.smiles}.{fmt}"
+                filename = f"{formula}.{fmt}"
         
         path = Path(filename)
         path.parent.mkdir(parents=True, exist_ok=True)  
