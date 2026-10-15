@@ -14,10 +14,6 @@ from rdkit.Chem import AllChem, rdDetermineBonds, rdMolTransforms
 
 from .utils.rotation import rotation_about_axis, rotation_from_u_to_v
 
-# Largest donor-donor separation (A) still treated as one bidentate head. Measured on the
-# bound forms this library places: carboxylate 2.26, sulfonate 2.48, phosphonate 2.60,
-# catecholate 2.81. Beyond this the two atoms cannot reach the same surface site, so they are
-# not a chelating pair however favourably they score on coordination.
 MAX_BITE_DISTANCE = 3.5
 
 
@@ -25,32 +21,11 @@ MAX_BITE_DISTANCE = 3.5
 class BindingMotif:
     """
     Specification of how a ligand anchors to a surface.
-
-    Attributes:
-        atoms (list[str]): Chemical symbols of the binding atoms (length 1 or 2).
-        indices (list[int]): Optional explicit atom indices, one per entry of ``atoms``, into
-            the ligand's own ASE Atoms. When given they are AUTHORITATIVE and no search is
-            run; when omitted the atoms are found by minimum coordination as before.
-
-            An element symbol cannot identify WHICH atom anchors. A phosphonate has three
-            oxygens -- one doubly bonded, one anionic, one protonated -- and ``["O", "O"]``
-            does not say which two touch the surface, so the answer has to be guessed from
-            geometry and the guess moves with the conformer. A caller that located the head
-            by SMARTS, or that knows which atom carries the negative charge, already has the
-            answer; this field is how it says so. The indices are into the ligand's atom
-            order INCLUDING hydrogens, which is what ``Chem.AddHs`` produces and what
-            ``Ligand.from_smiles`` builds the geometry from.
     """
     atoms: list[str]
     indices: Optional[list[int]] = None
 
     def __post_init__(self):
-        # Checked here, not in Ligand, because the explicit-indices branch of
-        # _get_binding_atoms_indices returns BEFORE the len(binding_elems) dispatch that raises
-        # NotImplementedError. Without this, a 3-atom motif WITH indices skipped that guard and
-        # died later inside the private _orient_ligand on a bare `assert 2 >= len(...) > 0` --
-        # and under `python -O`, where asserts are stripped, it built silently with three
-        # binding atoms and an axis taken from the first two.
         if not 1 <= len(self.atoms) <= 2:
             raise NotImplementedError(
                 f"Binding motifs with more than 2 atoms are not yet supported; "
@@ -307,22 +282,6 @@ class Ligand:
     def _coordination_numbers(self) -> np.ndarray:
         """
         Coordination number of every atom, from covalent radii.
-
-        Two atoms count as bonded when their separation is within
-        ``_neighbor_cutoff * (r_cov[i] + r_cov[j])``. That is, ``_neighbor_cutoff`` is a
-        SCALE on the sum of covalent radii, not an absolute distance.
-
-        It used to be read as an absolute distance, and its default of 1.2 Å is shorter than
-        nearly every heavy-atom bond: P-O is ~1.5 Å and C-O ~1.4 Å, so on the heads this library
-        anchors only O-H (~0.97 Å) ever fell inside it. (It is not shorter than EVERY heavy-atom
-        bond -- nitrile and isocyanide C#N embed at 1.15-1.17 Å, just inside it -- which made the
-        old rule wrong rather than uniformly blind.) Every oxygen that was not a hydroxyl therefore scored a coordination
-        number of 0, the minimum-coordination rule below degenerated into "skip the OH, then
-        take the lowest atom index", and a bridging ester C-O-P oxygen was indistinguishable
-        from a terminal P=O. Read as a scale the same stored 1.2 is correct: it admits O-H
-        (1.2 * 0.97 = 1.16 Å) and P-O (1.2 * 1.73 = 2.08 Å) while still excluding the
-        geminal O...O contact across a phosphonate (~2.55 Å against a 1.58 Å cutoff), so no
-        persisted value has to change.
         """
         symbols = self.atoms.get_chemical_symbols()
         radii = np.array([covalent_radii[atomic_numbers[s]] for s in symbols], dtype=float)
@@ -338,31 +297,6 @@ class Ligand:
     def _get_binding_atoms_indices(self) -> List[int]:
         """
         Detect the atom indices that match the binding motif.
-
-        If the motif carries explicit ``indices`` they are authoritative and no search runs:
-        an element symbol cannot say WHICH oxygen of a phosphonate anchors, and a caller that
-        knows (from a SMARTS match, a deprotonation site, a formal charge) should not have to
-        encode that knowledge as a distance. Otherwise the atoms are chosen by MINIMUM
-        COORDINATION -- the two-atom branch breaking ties on the shortest separation within the
-        bite distance, the one-atom branch on the lowest atom index. The two branches do NOT
-        tie-break alike, and the one-atom tie-break is arbitrary.
-
-        The two-atom branch used to rank on distance ALONE, with no coordination term, so on a
-        phosphonate it selected whichever oxygen pair happened to be closest in the embedded
-        conformer -- frequently the P=O together with the P-OH, anchoring the surface through a
-        protonated oxygen and leaving the anionic one pointing away. Because the choice was made
-        on conformer geometry it was also not stable: the same SMILES embedded under a different
-        seed could anchor through a different pair, so repeated placements of one molecule
-        sampled more than one binding mode.
-
-        WHAT THIS DOES NOT FIX. Coordination cannot separate symmetry-equivalent donors, and
-        where the candidate coordination sums TIE the old conformer-dependence survives
-        unchanged. Measured: ``CP(=O)(O)O`` still splits 13/7 across 20 embedding seeds because
-        both candidate pairs sum to 3; sulfonate, sulfate, sulfamate and carboxylate are
-        byte-identical to the old behaviour because all their donors tie at cn=1. For those,
-        explicit ``indices`` are the only determinate answer. The gain here is specific: heads
-        whose donors DIFFER in coordination -- above all a phosphonate's P-OH against its P=O
-        and P-O(-) -- stop being chosen by conformer accident.
         """
         symbols = self.atoms.get_chemical_symbols()
         coords  = self.atoms.get_positions()
@@ -410,16 +344,6 @@ class Ligand:
                         continue
                     p2 = coords[j]
                     dist = float(np.linalg.norm(p1 - p2))
-                    # Chelation FIRST, then coordination, then separation. Ranking on
-                    # coordination alone with an unbounded distance tie-break is wrong: a lower
-                    # coordination sum then wins at ANY separation, and the pair returned here
-                    # becomes the binding AXIS in `_orient_ligand`. On
-                    # CCCCC([O-])COP(=O)(O)OC that selected an alkoxide O and a phosphate O
-                    # 5.1-5.3 A apart -- opposite ends of the molecule, on every placement seed
-                    # -- in place of the geminal phosphate pair at 2.6 A, because the two lone
-                    # cn=1 atoms beat a pair containing a cn=2 oxygen. Two atoms that cannot
-                    # reach the same surface site are not a bidentate head, so a pair beyond the
-                    # bite distance loses to any pair inside it whatever its coordination.
                     key = (dist > MAX_BITE_DISTANCE,
                            int(cn[i]) + int(cn[j]),
                            dist)
