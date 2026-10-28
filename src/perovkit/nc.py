@@ -325,8 +325,10 @@ class NanoCrystal:
             for i, lig in enumerate(self.ligands):
                 lig.id = i
 
-            # Remove ligand references from octahedra and remap ids
+            # Remove ligand references from octahedra and remap ids. Entries are rebuilt rather
+            # than edited in place: frames loaded together by from_ase share one octahedra dict.
             if self.octahedra is not None:
+                octahedra = {}
                 for b_abs, octa in self.octahedra.items():
                     old_ids = octa["Ligand"]
                     new_ids = []
@@ -335,7 +337,8 @@ class NanoCrystal:
                             continue
                         # Shift ids that were above the removed one
                         new_ids.append(lid - 1 if lid > id else lid)
-                    octa["Ligand"] = new_ids
+                    octahedra[b_abs] = {**octa, "Ligand": new_ids}
+                self.core.octahedra = octahedra
 
         self._build_index_map()
         self._build_and_link_atoms()
@@ -636,12 +639,12 @@ class NanoCrystal:
 
 
     def _assign_ligands_to_octahedra(self) -> None:
-        octahedra = self.octahedra
-        if not octahedra:
+        if not self.octahedra:
             return
 
-        for octa in octahedra.values():
-            octa["Ligand"] = []
+        # Fresh entries rather than clearing in place: frames loaded together by from_ase share one octahedra dict.
+        octahedra = {b_abs: {**octa, "Ligand": []} for b_abs, octa in self.octahedra.items()}
+        self.core.octahedra = octahedra
 
         at = self.core.atoms
         syms = np.array(at.get_chemical_symbols())
