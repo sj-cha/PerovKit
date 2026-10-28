@@ -1247,24 +1247,48 @@ class Slab:
         }
         ligands_meta = topo["ligands"]
 
+        # Everything that is the same for every frame is resolved once, outside the loop.
+        order = np.argsort(sort_idx) if sort_idx is not None else None
+        motifs = {t["id"]: BindingMotif._from_metadata(t) for t in ligand_types_meta}
+
+        if n_core_atoms > n_total_atoms_json:
+            raise ValueError(
+                f"n_core_atoms={n_core_atoms}, but JSON has only {n_total_atoms_json} atoms."
+            )
+
+        lig_slices: List[slice] = []
+        cursor = n_core_atoms
+        for inst_meta in ligands_meta:
+            n_atoms = type_id_to_meta[inst_meta["spec_id"]]["n_atoms"]
+            if cursor + n_atoms > n_total_atoms_json:
+                raise ValueError(
+                    f"Ligand slice out of range: need up to {cursor + n_atoms}, "
+                    f"but JSON has only {n_total_atoms_json} atoms."
+                )
+            lig_slices.append(slice(cursor, cursor + n_atoms))
+            cursor += n_atoms
+
         slabs: List[Slab] = []
         for atoms_i in atoms_list:
-            if sort_idx is not None:
-                atoms_i = atoms_i[np.argsort(sort_idx)]
-
             if n_total_atoms_json != len(atoms_i):
                 raise ValueError(
                     f"Atom count mismatch: JSON={n_total_atoms_json}, XYZ={len(atoms_i)}."
                 )
 
-            if n_core_atoms > len(atoms_i):
-                raise ValueError(
-                    f"n_core_atoms={n_core_atoms}, but XYZ has only {len(atoms_i)} atoms."
-                )
+            # Split plain arrays instead of slicing atoms_i: every ASE slice copies all
+            # arrays and re-indexes the constraints, which dominated the per-frame cost.
+            numbers = atoms_i.numbers
+            positions = atoms_i.positions
+            if order is not None:
+                numbers = numbers[order]
+                positions = positions[order]
 
-            core_atoms = atoms_i[:n_core_atoms]
-            core_atoms.set_cell(core_cell)
-            core_atoms.set_pbc(core_pbc)
+            core_atoms = Atoms(
+                numbers=numbers[:n_core_atoms],
+                positions=positions[:n_core_atoms],
+                pbc=core_pbc,
+                cell=core_cell,
+            )
 
             core = Core(
                 A=Core.a_site_from_json(core_meta["A"], core_atoms),
@@ -1278,22 +1302,17 @@ class Slab:
             )
 
             ligands: List[Ligand] = []
-            cursor = n_core_atoms
 
-            for inst_meta in ligands_meta:
+            for inst_meta, sl in zip(ligands_meta, lig_slices):
                 spec_id = inst_meta["spec_id"]
                 tmeta = type_id_to_meta[spec_id]
 
-                n_atoms = tmeta["n_atoms"]
-
-                if cursor + n_atoms > len(atoms_i):
-                    raise ValueError(
-                        f"Ligand slice out of range: need up to {cursor + n_atoms}, "
-                        f"but XYZ has only {len(atoms_i)} atoms."
-                    )
-
-                lig_atoms = atoms_i[cursor : cursor + n_atoms]
-                cursor += n_atoms
+                lig_atoms = Atoms(
+                    numbers=numbers[sl],
+                    positions=positions[sl],
+                    pbc=atoms_i.pbc,
+                    cell=atoms_i.cell,
+                )
 
                 binding_atoms = list(map(int, tmeta.get("binding_atoms_indices", [])))
 
@@ -1302,7 +1321,7 @@ class Slab:
                     mol=None,
                     smiles=tmeta["smiles"],
                     charge=tmeta["charge"],
-                    binding_motif=BindingMotif._from_metadata(tmeta),
+                    binding_motif=motifs[spec_id],
                     name=tmeta["name"],
                     plane=inst_meta["plane"],
                     volume=tmeta["volume"],
@@ -1311,10 +1330,7 @@ class Slab:
 
                 ligands.append(lig)
 
-            slab = cls(
-                core=core,
-                ligand_specs=[],
-            )
+            slab = cls._from_data(core=core)
             slab.ligands = ligands
             slab.ligand_coverage = {t["name"]: t["coverage"] for t in ligand_types_meta}
             slab.core.octahedra = octahedra
@@ -1327,20 +1343,35 @@ class Slab:
         return slabs[0] if single_input else slabs
 
 
+    @classmethod
+    def _from_data(cls, core: Core) -> Slab:
+        """
+        Construct a Slab around `core` bypassing __post_init__, which deep-copies it.
+        Used when deserializing from the metadata, where the core is already private.
+        """
+        slab = object.__new__(cls)
+        slab.core = core
+        slab.ligand_specs = []
+        slab.ligands = []
+        slab.ligand_coverage = {}
+        slab.binding_sites = []
+        slab._atoms = None
+        slab._setup_pbc()
+        return slab
+
+
     def _build_and_link_atoms(self) -> None:
         core_atoms = self.core.atoms
-        all_symbols = list(core_atoms.get_chemical_symbols())
-        all_positions = [core_atoms.get_positions()]
+        all_numbers = [core_atoms.numbers]
+        all_positions = [core_atoms.positions]
 
         for lig in self.ligands:
-            all_symbols.extend(lig.atoms.get_chemical_symbols())
-            all_positions.append(lig.atoms.get_positions())
-
-        all_positions = np.vstack(all_positions)
+            all_numbers.append(lig.atoms.numbers)
+            all_positions.append(lig.atoms.positions)
 
         self._atoms = Atoms(
-            symbols=all_symbols,
-            positions=all_positions,
+            numbers=np.concatenate(all_numbers),
+            positions=np.vstack(all_positions),
             pbc=core_atoms.pbc,
             cell=core_atoms.get_cell(),
         )
