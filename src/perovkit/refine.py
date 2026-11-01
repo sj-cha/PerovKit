@@ -15,6 +15,7 @@ import os
 from typing import List, Optional, Sequence
 
 from ase.data import vdw_radii
+import numba
 import numpy as np
 from rdkit import Chem
 from scipy.optimize import minimize
@@ -23,10 +24,14 @@ from scipy.spatial import cKDTree
 _ROTATABLE = Chem.MolFromSmarts("[!$(*#*)&!D1]-&!@[!$(*#*)&!D1]")
 
 # Atoms of one ligand four or more bonds apart are kept INTRA_SCALE x the sum of their
-# van der Waals radii apart: 1.92 A for H...H, 2.32 for C...H, 2.72 for C...C. A single
+# van der Waals radii apart: 1.68 A for H...H, 2.03 for C...H, 2.38 for C...C. A single
 # 1.6 A radius let the two stretched acyl chains of lecithin settle 1.3-1.6 A apart (H...H),
-# hundreds of kcal/mol in UFF.
-INTRA_SCALE = 0.8
+# hundreds of kcal/mol in UFF. 0.8 leaves cleaner chains but jams the densest packings
+# (zwitterions on a nanocrystal at 50%).
+INTRA_SCALE = 0.7
+# Intramolecular overlaps weigh INTRA_WEIGHT x a contact. At 1x, pulling the anchors of a
+# lecithin onto their sites folded its head group to 1.38 A H...H across the phosphodiester.
+INTRA_WEIGHT = 10.0
 
 
 def _intra_pairs(model, X, scale):
@@ -49,13 +54,9 @@ def _intra_pairs(model, X, scale):
     hit = (d < limit) & (d > 1e-9)
     return pa[hit], pb[hit], d[hit], limit[hit]
 
-# The torsion loops are compiled with numba when it is installed (PEROVKIT_NUMBA=0 turns
-# that off); otherwise the numpy code below runs them.
-try:
-    import numba
-except ImportError:
-    numba = None
-JIT = numba is not None and os.environ.get("PEROVKIT_NUMBA", "1") != "0"
+# The torsion loops are compiled with numba; PEROVKIT_NUMBA=0 runs the numpy code below
+# instead, the reference they are checked against.
+JIT = os.environ.get("PEROVKIT_NUMBA", "1") != "0"
 
 
 def _turn_torsions(X, phis, bonds, moving, starts):
@@ -409,10 +410,11 @@ def _ligand_terms(model, x, groups, targets, trees, contact, k_anchor, k_contact
     pa, pb, d, limit = _intra_pairs(model, x[None], intra)
     if len(pa):
         tangled = True
+        k_intra = INTRA_WEIGHT * k_contact
         v = (x[pa] - x[pb]) / d[:, None]
         over = limit - d
-        E += k_contact * float(over @ over)
-        f = -2.0 * k_contact * over[:, None] * v
+        E += k_intra * float(over @ over)
+        f = -2.0 * k_intra * over[:, None] * v
         np.add.at(G, pa, f)
         np.add.at(G, pb, -f)
     return E, G, closest, tangled
@@ -452,10 +454,11 @@ def _many_terms(model, X, groups, T, trees, contact, k_anchor, k_contact, intra)
     pa, pb, d, limit = _intra_pairs(model, X, intra)
     if len(pa):
         tangled = True
+        k_intra = INTRA_WEIGHT * k_contact
         v = (flat[pa] - flat[pb]) / d[:, None]
         over = limit - d
-        E += k_contact * float(over @ over)
-        f = -2.0 * k_contact * over[:, None] * v
+        E += k_intra * float(over @ over)
+        f = -2.0 * k_intra * over[:, None] * v
         np.add.at(G_flat, pa, f)
         np.add.at(G_flat, pb, -f)
     return E, G, closest, tangled, np.sqrt(sq / len(groups))
