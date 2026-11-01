@@ -16,6 +16,10 @@ dependencies = [
     "rdkit",  
 ]
 
+[project.optional-dependencies]
+# compiles the torsion loops of multi-motif refinement (about 10x faster kernels)
+fast = ["numba"]
+
 [tool.setuptools.packages.find]
 where = ["src"]
 
