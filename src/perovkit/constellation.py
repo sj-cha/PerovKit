@@ -66,8 +66,9 @@ class Fit:
     Coordinates are ``(x - center) @ rotation.T + pivot``, then turned by ``theta`` about
     ``axis`` through ``pivot`` when the fit leaves that spin free (two anchors, or anchors
     on one line). A refined or stretched fit stores its coordinates at ``theta`` in ``xyz``
-    instead, and says which in ``origin``: "fit", "refined", or "unstuck" (chains
-    stretched just until they clear the core).
+    instead, and says which in ``origin``: "fit", "stretched" (a library conformer with
+    its chains already stood up), "refined", or "unstuck" (chains stretched just until
+    they clear the core).
     """
     conformer: int
     rotation: np.ndarray
@@ -519,7 +520,8 @@ class ConstellationSampler:
                        pivot=res["pivot"], axis=axis, theta=0.0, rmsd=float(res["rmsd"][c]),
                        alignment=float(res["alignment"][c]),
                        footprint=float(res["footprint"][c]), energy=float(lib.energies[c]),
-                       cost=float(res["cost"][c]))
+                       cost=float(res["cost"][c]),
+                       origin="stretched" if lib.stretched[c] else "fit")
             x0 = base.coords(lib) - base.pivot
             coords = np.einsum("sij,mj->smi", spins, x0) + base.pivot          # (S, m, 3)
             return base, coords, self._core_clearance(coords, excluded)
