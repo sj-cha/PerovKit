@@ -1,6 +1,6 @@
 from __future__ import annotations
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, List
+from typing import TYPE_CHECKING, List, Optional
 
 import numpy as np
 from rdkit import Chem
@@ -42,6 +42,7 @@ class ConformerLibrary:
         n_conformers: int = 50,
         prune_rms: float = 0.5,
         optimize: bool = True,
+        mirror: Optional[bool] = None,
         random_seed: int = 42,
     ) -> ConformerLibrary:
         """
@@ -57,6 +58,10 @@ class ConformerLibrary:
             n_conformers (int): Number of ETKDG embeddings to attempt.
             prune_rms (float): RMSD (Å) below which ETKDG discards a conformer as a duplicate.
             optimize (bool): Minimize every conformer with UFF and record its energy.
+            mirror (Optional[bool]): Add the mirror image of every conformer. A rotation
+                cannot turn a conformer into its mirror image, and with three or more anchors
+                it is often the mirror that keeps the body off the surface. None adds them
+                when no atom carries a chiral tag, since mirroring would invert it.
             random_seed (int): Seed for ETKDG embedding.
         """
         if ligand.mol is None:
@@ -83,6 +88,11 @@ class ConformerLibrary:
             energies -= energies.min()
 
         coords = np.array([c.GetPositions() for c in mol.GetConformers()], dtype=float)
+        if mirror is None:
+            mirror = all(a.GetChiralTag() == Chem.ChiralType.CHI_UNSPECIFIED for a in mol.GetAtoms())
+        if mirror:
+            coords = np.concatenate([coords, coords * np.array([-1.0, 1.0, 1.0])])
+            energies = np.concatenate([energies, energies])
         anchors, directions = _anchor_geometry(mol, ligand.binding_groups, coords)
         return cls(coords=coords, energies=energies, anchors=anchors, directions=directions)
 
