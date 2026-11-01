@@ -90,7 +90,7 @@ class FitPose:
         self.axis = candidate.fits[0].axis
         self.spins = self.axis is not None
         self.variants = [f.coords(lib) for f in candidate.fits]
-        self.origins = ["refined" if f.xyz is not None else "fit" for f in candidate.fits]
+        self.origins = [f.origin for f in candidate.fits]
         self.variant = 0
         self.reach = 0.0
         for x in self.variants:
@@ -125,8 +125,11 @@ def stretch_pose(pose: FitPose, core_tree, cutoff: float) -> bool:
     """
     Put a stretched copy of the pose's best variant first: its dangling chains anti and
     raised along the mean normal of its sites, its anchors untouched. Returns whether the
-    ligand had chains to stretch and the result clears the core.
+    pose now starts stretched: it had chains to stretch and the result clears the core,
+    or site selection already stretched it.
     """
+    if pose.origins[pose.variant] == "stretched":
+        return True
     normal = np.mean([np.asarray(s.plane, dtype=float) / np.linalg.norm(s.plane)
                       for s in pose.candidate.sites], axis=0)
     res = stretch(pose.ligand.torsion_model(), pose.variants[0], pose.ligand.binding_groups,
@@ -166,7 +169,8 @@ def refine_pose(
     best, best_d = None, -float("inf")
     for margin in MARGINS:
         res = refine(pose.ligand.torsion_model(), coords, pose.ligand.binding_groups,
-                     pose.candidate.targets, trees, contact=cutoff + margin)
+                     pose.candidate.targets, trees, contact=cutoff + margin,
+                     stop_at=cutoff + margin / 2, stop_rmsd=max_rmsd)
         if res.anchor_rmsd > max_rmsd:
             continue
         d = min_distance(res.coords, neighbors_coords)
@@ -351,6 +355,7 @@ def refine_clusters(
                 [poses[i].ligand.binding_groups for i in members],
                 [poses[i].candidate.targets for i in members],
                 trees, cutoff + margin, tree_builder,
+                stop_at=cutoff + margin / 2, stop_rmsd=max_rmsd,
             )
             if any(r.anchor_rmsd > max_rmsd for r in results):
                 continue
