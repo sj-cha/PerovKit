@@ -19,9 +19,11 @@ from scipy.spatial import cKDTree
 from .core import Core, BindingSite
 from .ligand import Ligand, LigandSpec, BindingMotif
 from .constellation import ConstellationSampler
+from .refine import INTRA_SCALE
 from .placement import (SingleMotifPose, MultiMotifPose, bounding_spheres, optimize_pose,
                         place_about_normal, motif_pools, refine_clusters, refine_pose,
-                        select_constellations, stretch_poses, tree_min_distance)
+                        select_constellations, stretch_poses, tree_min_distance,
+                        intramolecular_contacts)
 from .utils.geometry import farthest_point_sampling, per_face_farthest_point_sampling, compute_bounding_spheres, build_neighbor_map
 
 
@@ -359,8 +361,10 @@ class NanoCrystal:
                 for p in multi_motif_poses
             ])
             bent = sum(p.origins[p.variant] != "fit" for p in multi_motif_poses)
+            closest, n_close = intramolecular_contacts(poses, ligand_coords_list)
             log(f"[Log] Multi-motif anchors sit {dev.mean():.2f} Å (max {dev.max():.2f} Å) from their sites; "
-                f"{bent} of {len(multi_motif_poses)} ligands refined in torsion space.")
+                f"{bent} of {len(multi_motif_poses)} ligands refined in torsion space; closest intramolecular "
+                f"contact {closest:.2f} Å ({n_close} pairs within {INTRA_SCALE:g}x their vdW radii).")
 
         stripped_atoms = Atoms(
             symbols=stripped_symbols,

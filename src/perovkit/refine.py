@@ -14,12 +14,40 @@ import math
 import os
 from typing import List, Optional, Sequence
 
+from ase.data import vdw_radii
 import numpy as np
 from rdkit import Chem
 from scipy.optimize import minimize
 from scipy.spatial import cKDTree
 
 _ROTATABLE = Chem.MolFromSmarts("[!$(*#*)&!D1]-&!@[!$(*#*)&!D1]")
+
+# Atoms of one ligand four or more bonds apart are kept INTRA_SCALE x the sum of their
+# van der Waals radii apart: 1.92 A for H...H, 2.32 for C...H, 2.72 for C...C. A single
+# 1.6 A radius let the two stretched acyl chains of lecithin settle 1.3-1.6 A apart (H...H),
+# hundreds of kcal/mol in UFF.
+INTRA_SCALE = 0.8
+
+
+def _intra_pairs(model, X, scale):
+    """
+    Pairs (a, b) of atoms of one pose, four or more bonds apart, closer than scale x their
+    summed radii, in the flattened (L * n, 3) poses X, with those limits.
+    """
+    L, n, _ = X.shape
+    flat = X.reshape(-1, 3)
+    shifted = X + (np.arange(L) * 1.0e4)[:, None, None] * np.array([1.0, 0.0, 0.0])
+    reach = 2.0 * scale * float(model.radii.max())
+    close = cKDTree(shifted.reshape(-1, 3)).query_pairs(reach, output_type="ndarray")
+    if not len(close):
+        return close[:, 0], close[:, 1], np.zeros(0), np.zeros(0)
+    pa, pb = close[:, 0], close[:, 1]
+    keep = model.far[pa % n, pb % n]
+    pa, pb = pa[keep], pb[keep]
+    limit = scale * (model.radii[pa % n] + model.radii[pb % n])
+    d = np.linalg.norm(flat[pa] - flat[pb], axis=1)
+    hit = (d < limit) & (d > 1e-9)
+    return pa[hit], pb[hit], d[hit], limit[hit]
 
 # The torsion loops are compiled with numba when it is installed (PEROVKIT_NUMBA=0 turns
 # that off); otherwise the numpy code below runs them.
@@ -174,6 +202,7 @@ class TorsionModel:
         tails (np.ndarray): (k,) torsions whose moving side holds no binding atom, so they
             turn a dangling chain without moving any anchor.
         heavy (np.ndarray): (n_atoms,) non-hydrogen atoms.
+        radii (np.ndarray): (n_atoms,) van der Waals radii (Bondi, Å).
     """
     bonds: np.ndarray
     masks: np.ndarray
@@ -181,6 +210,7 @@ class TorsionModel:
     quads: np.ndarray
     tails: np.ndarray
     heavy: np.ndarray
+    radii: np.ndarray
     _moving: list = field(init=False, repr=False)
     _weights: np.ndarray = field(init=False, repr=False)
 
@@ -233,7 +263,10 @@ class TorsionModel:
         quads = np.array([(outer(i, j), i, j, outer(j, i)) for i, j in bonds], dtype=int).reshape(-1, 4)
         binding = np.asarray(list(binding), dtype=int)
         tails = ~masks[:, binding].any(axis=1) if len(binding) else np.zeros(len(bonds), dtype=bool)
-        return cls(bonds=bonds, masks=masks, far=topo >= 4, quads=quads, tails=tails, heavy=heavy)
+        # 1.8 Å for the elements ASE has no van der Waals radius for
+        radii = np.nan_to_num(vdw_radii[[a.GetAtomicNum() for a in mol.GetAtoms()]], nan=1.8)
+        return cls(bonds=bonds, masks=masks, far=topo >= 4, quads=quads, tails=tails, heavy=heavy,
+                   radii=radii)
 
     @property
     def n_torsions(self) -> int:
@@ -373,22 +406,15 @@ def _ligand_terms(model, x, groups, targets, trees, contact, k_anchor, k_contact
             E += k_contact * float(over @ over)
             np.add.at(G, atom, -2.0 * k_contact * over[:, None] * v)
     # close pairs from a tree rather than every pair four bonds apart (thousands of them)
-    close = cKDTree(x).query_pairs(intra, output_type="ndarray")
-    if len(close):
-        pa, pb = close[:, 0], close[:, 1]
-        keep = model.far[pa, pb]
-        pa, pb = pa[keep], pb[keep]
-        v = x[pa] - x[pb]
-        d = np.linalg.norm(v, axis=1)
-        hit = (d < intra) & (d > 1e-9)
-        if hit.any():
-            tangled = True
-            pa, pb, d, v = pa[hit], pb[hit], d[hit], v[hit] / d[hit, None]
-            over = intra - d
-            E += k_contact * float(over @ over)
-            f = -2.0 * k_contact * over[:, None] * v
-            np.add.at(G, pa, f)
-            np.add.at(G, pb, -f)
+    pa, pb, d, limit = _intra_pairs(model, x[None], intra)
+    if len(pa):
+        tangled = True
+        v = (x[pa] - x[pb]) / d[:, None]
+        over = limit - d
+        E += k_contact * float(over @ over)
+        f = -2.0 * k_contact * over[:, None] * v
+        np.add.at(G, pa, f)
+        np.add.at(G, pb, -f)
     return E, G, closest, tangled
 
 
@@ -423,23 +449,15 @@ def _many_terms(model, X, groups, T, trees, contact, k_anchor, k_contact, intra)
             E += k_contact * float(over @ over)
             np.add.at(G_flat, atom, -2.0 * k_contact * over[:, None] * v)
     # one tree for the intramolecular pairs of all poses, each pose shifted far apart
-    shifted = X + (np.arange(L) * 1.0e4)[:, None, None] * np.array([1.0, 0.0, 0.0])
-    close = cKDTree(shifted.reshape(-1, 3)).query_pairs(intra, output_type="ndarray")
-    if len(close):
-        pa, pb = close[:, 0], close[:, 1]
-        keep = model.far[pa % n, pb % n]
-        pa, pb = pa[keep], pb[keep]
-        v = flat[pa] - flat[pb]
-        d = np.linalg.norm(v, axis=1)
-        hit = (d < intra) & (d > 1e-9)
-        if hit.any():
-            tangled = True
-            pa, pb, d, v = pa[hit], pb[hit], d[hit], v[hit] / d[hit, None]
-            over = intra - d
-            E += k_contact * float(over @ over)
-            f = -2.0 * k_contact * over[:, None] * v
-            np.add.at(G_flat, pa, f)
-            np.add.at(G_flat, pb, -f)
+    pa, pb, d, limit = _intra_pairs(model, X, intra)
+    if len(pa):
+        tangled = True
+        v = (flat[pa] - flat[pb]) / d[:, None]
+        over = limit - d
+        E += k_contact * float(over @ over)
+        f = -2.0 * k_contact * over[:, None] * v
+        np.add.at(G_flat, pa, f)
+        np.add.at(G_flat, pb, -f)
     return E, G, closest, tangled, np.sqrt(sq / len(groups))
 
 
@@ -469,7 +487,7 @@ def refine(
     contact: float,
     k_anchor: float = 20.0,
     k_contact: float = 40.0,
-    intra: float = 1.6,
+    intra: float = INTRA_SCALE,
     w_torsion: float = 0.02,
     max_iter: int = 400,
     pull: Optional[tuple] = None,
@@ -489,7 +507,8 @@ def refine(
             their ``data`` must hold the positions, periodic images included.
         contact (float): Soft-sphere radius (Å) against the fixed atoms.
         k_anchor, k_contact (float): Weights (per Å^2) of anchor and contact penalties.
-        intra (float): Soft-sphere radius (Å) between ligand atoms four or more bonds apart.
+        intra (float): Ligand atoms four or more bonds apart are pushed this times their
+            summed van der Waals radii apart (see INTRA_SCALE).
         w_torsion (float): Weight of 1 - cos(change) per torsion, a mild pull to the conformer.
         max_iter (int): L-BFGS-B iterations.
         pull: Optional (direction, atom mask, k): lowers the energy by k per Å that the
@@ -545,9 +564,10 @@ def stretch(
     """
     Straighten the dangling chains of a ligand and raise them along `normal`.
 
-    Every tail torsion is set anti (180°); then only the tail torsions are optimized, so no
-    anchor moves, to lift the tail's heavy atoms along `normal` while keeping clear of the
-    fixed atoms in `trees` and of the ligand itself. With `stop_at` it stops as soon as
+    Every tail torsion is set anti (180°), from the anchors outward, or gauche (±60°) where
+    anti would run the chain into the rest of the ligand; then only the tail torsions are
+    optimized, so no anchor moves, to lift the tail's heavy atoms along `normal` while
+    keeping clear of the fixed atoms in `trees` and of the ligand itself. With `stop_at` it stops as soon as
     every contact with the fixed atoms is that far, when the point is only to unstick a
     chain from the surface rather than to stand it up. Returns None for a ligand without
     tails.
@@ -555,13 +575,32 @@ def stretch(
     if not model.tails.any():
         return None
     x = coords.copy()
-    for (i, j), mask, quad, tail in zip(model.bonds, model.masks, model.quads, model.tails):
-        if not tail:
-            continue
+    # From the anchors outward: each tail torsion goes anti, or gauche when anti would put
+    # the atoms it moves into the rest of the ligand (two chains stretched side by side).
+    order = [b for b in range(model.n_torsions - 1, -1, -1) if model.tails[b]]
+    for b in order:
+        (i, j), mask, quad = model.bonds[b], model.masks[b], model.quads[b]
         u = x[j] - x[i]
         u /= np.linalg.norm(u)
-        R = _rotation(u, np.pi - _dihedral(x[quad]))
-        x[mask] = (x[mask] - x[i]) @ R.T + x[i]
+        phi = _dihedral(x[quad])
+        moved, rest = np.flatnonzero(mask), np.flatnonzero(~mask)
+        rest_tree = cKDTree(x[rest])
+        reach = 2.0 * INTRA_SCALE * float(model.radii.max())
+        best, best_overlap = None, np.inf
+        for target in (np.pi, np.pi / 3, -np.pi / 3):
+            R = _rotation(u, target - phi)
+            y = (x[mask] - x[i]) @ R.T + x[i]
+            d, k = rest_tree.query(y, k=min(8, len(rest)), distance_upper_bound=reach)
+            other = rest[np.minimum(k, len(rest) - 1)]
+            limit = INTRA_SCALE * (model.radii[moved][:, None] + model.radii[other])
+            short = np.where(np.isfinite(d) & model.far[moved[:, None], other], limit - d, 0.0)
+            overlap = float(np.sum(np.maximum(short, 0.0) ** 2))
+            if overlap == 0.0:
+                best = y
+                break
+            if overlap < best_overlap:
+                best, best_overlap = y, overlap
+        x[mask] = best
     lifted = model.masks[model.tails].any(axis=0) & model.heavy
     frozen = np.concatenate([np.ones(6, dtype=bool), ~model.tails])
     return refine(model, x, groups, targets, trees, contact, max_iter=max_iter,
@@ -578,7 +617,7 @@ def refine_joint(
     tree_builder,
     k_anchor: float = 20.0,
     k_contact: float = 40.0,
-    intra: float = 1.6,
+    intra: float = INTRA_SCALE,
     w_torsion: float = 0.02,
     max_iter: int = 400,
     stop_at: Optional[float] = None,
