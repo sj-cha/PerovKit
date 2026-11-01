@@ -19,7 +19,7 @@ from scipy.spatial import cKDTree
 
 from .conformers import ConformerLibrary
 from .core import BindingSite
-from .refine import TorsionModel, refine
+from .refine import TorsionModel, refine, stretch
 
 
 def rotations_about_axis(axis: np.ndarray, thetas: np.ndarray) -> np.ndarray:
@@ -65,7 +65,8 @@ class Fit:
 
     Coordinates are ``(x - center) @ rotation.T + pivot``, then turned by ``theta`` about
     ``axis`` through ``pivot`` when the fit leaves that spin free (two anchors, or anchors
-    on one line). A refined fit stores its coordinates at ``theta`` in ``xyz`` instead.
+    on one line). A refined or stretched fit stores its coordinates at ``theta`` in ``xyz``
+    instead, and says which in ``origin`` ("fit", "refined" or "stretched").
     """
     conformer: int
     rotation: np.ndarray
@@ -79,6 +80,7 @@ class Fit:
     energy: float
     cost: float
     xyz: Optional[np.ndarray] = None
+    origin: str = "fit"
 
     def coords(self, lib: ConformerLibrary, theta: Optional[float] = None) -> np.ndarray:
         theta = self.theta if theta is None else theta
@@ -566,9 +568,11 @@ class ConstellationSampler:
 
     def _rescue(self, starts: List[tuple], model: TorsionModel, groups: List[List[int]]) -> Optional[Candidate]:
         """
-        Refine the cheapest starting points, one per conformer up to mirroring (symmetric
+        Rescue the cheapest starting points, one per conformer up to mirroring (symmetric
         constellations repeat the same fits), up to n_refine; the first that clears the
-        core wins.
+        core wins. A start whose anchors already fit is first stretched (only its dangling
+        chains move, a fraction of a refinement's cost): rigid fits mostly clash because a
+        chain lies on the surface. Otherwise, or if that is not enough, it is refined.
         """
         tried = set()
         for cost, key, base, start, sites, targets, excluded in sorted(starts, key=lambda t: t[0]):
@@ -577,10 +581,50 @@ class ConstellationSampler:
             if key in tried:
                 continue
             tried.add(key)
-            fit = self._refine_fit(base, start, model, groups, targets, excluded)
+            fit = None
+            if base.rmsd <= self.max_rmsd and model.tails.any():
+                fit = self._stretch_fit(base, start, model, groups, sites, targets, excluded)
+            if fit is None:
+                fit = self._refine_fit(base, start, model, groups, targets, excluded)
             if fit is not None:
                 return Candidate(sites=sites, targets=targets, fits=[fit])
         return None
+
+
+    def _surroundings(self, start: np.ndarray, pivot: np.ndarray, excluded: np.ndarray) -> list:
+        """
+        Trees of the core atoms (minus `excluded`) and placed ligand atoms around a pose.
+        """
+        reach = float(np.linalg.norm(start - pivot, axis=1).max()) + self.overlap_cutoff + 1.0
+        trees = [self._local_tree(self.core_tree, self.core_map, pivot, reach, excluded)]
+        if self._lig_tree is not None:
+            trees.append(self._local_tree(*self._lig_tree, pivot, reach))
+        return trees
+
+
+    def _stretch_fit(
+        self,
+        base: Fit,
+        start: np.ndarray,
+        model: TorsionModel,
+        groups: List[List[int]],
+        sites: List[BindingSite],
+        targets: np.ndarray,
+        excluded: np.ndarray,
+    ) -> Optional[Fit]:
+        """
+        Stretch the dangling chains of a fit that clashes with the core; returns it as a
+        fit with explicit coordinates if that clears the core, else None.
+        """
+        normal = np.mean([np.asarray(s.plane, dtype=float) / np.linalg.norm(s.plane) for s in sites], axis=0)
+        res = stretch(model, start, groups, targets, normal / np.linalg.norm(normal),
+                      self._surroundings(start, base.pivot, excluded), self.overlap_cutoff + 0.2)
+        if res is None or self._core_clearance(res.coords[None], excluded)[0] < self.overlap_cutoff:
+            return None
+        return Fit(conformer=base.conformer, rotation=base.rotation, center=base.center,
+                   pivot=base.pivot, axis=base.axis, theta=0.0, rmsd=base.rmsd,
+                   alignment=base.alignment, footprint=base.footprint, energy=base.energy,
+                   cost=base.cost, xyz=res.coords, origin="stretched")
 
 
     def _refine_fit(
@@ -596,11 +640,9 @@ class ConstellationSampler:
         Refine a fit that clashes with the core, against the core atoms and placed ligands
         around it; returns it as a fit with explicit coordinates, or None if it stays stuck.
         """
-        reach = float(np.linalg.norm(start - base.pivot, axis=1).max()) + self.overlap_cutoff + 1.0
-        trees = [self._local_tree(self.core_tree, self.core_map, base.pivot, reach, excluded)]
-        if self._lig_tree is not None:
-            trees.append(self._local_tree(*self._lig_tree, base.pivot, reach))
-        res = refine(model, start, groups, targets, trees, contact=self.overlap_cutoff + 0.2)
+        trees = self._surroundings(start, base.pivot, excluded)
+        res = refine(model, start, groups, targets, trees, contact=self.overlap_cutoff + 0.2,
+                     stop_at=self.overlap_cutoff + 0.1, stop_rmsd=self.max_rmsd)
         if res.anchor_rmsd > self.max_rmsd:
             return None
         if self._core_clearance(res.coords[None], excluded)[0] < self.overlap_cutoff:
@@ -608,7 +650,7 @@ class ConstellationSampler:
         return Fit(conformer=base.conformer, rotation=base.rotation, center=base.center,
                    pivot=base.pivot, axis=base.axis, theta=0.0, rmsd=res.anchor_rmsd,
                    alignment=base.alignment, footprint=base.footprint, energy=base.energy,
-                   cost=base.cost, xyz=res.coords)
+                   cost=base.cost, xyz=res.coords, origin="refined")
 
 
     @staticmethod
