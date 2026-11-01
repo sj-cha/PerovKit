@@ -11,6 +11,7 @@ from ase.io.vasp import write_vasp
 from rdkit import Chem
 from rdkit.Chem import AllChem, rdDetermineBonds, rdMolTransforms
 
+from .conformers import ConformerLibrary
 from .utils.rotation import rotation_about_axis, rotation_from_u_to_v
 
 
@@ -373,6 +374,20 @@ class Ligand:
             name=name,
             **kwargs)
     
+
+    def conformers(self, **kwargs) -> ConformerLibrary:
+        """
+        Conformer library of this ligand, built on first use and shared with clones made after.
+
+        Args:
+            **kwargs: Forwarded to ConformerLibrary.build; giving any rebuilds the library.
+        """
+        lib = getattr(self, "_conformers", None)
+        if lib is None or kwargs:
+            lib = ConformerLibrary.build(self, **kwargs)
+            self._conformers = lib
+        return lib
+
 
     def clone(self) -> Ligand:
         """
