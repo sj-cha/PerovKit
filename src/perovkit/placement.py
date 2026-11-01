@@ -18,7 +18,7 @@ from scipy.spatial import cKDTree
 from .constellation import Candidate, ConstellationSampler, rotations_about_axis
 from .core import BindingSite
 from .ligand import Ligand, LigandSpec
-from .refine import refine, refine_joint, stretch
+from .refine import INTRA_SCALE, _intra_pairs, refine, refine_joint, stretch
 from .utils.geometry import compute_bounding_spheres
 from .utils.rotation import rotation_about_axis, rotation_from_u_to_v
 
@@ -243,6 +243,22 @@ def refine_pose(
         if best_d >= cutoff:
             break
     return best
+
+
+def intramolecular_contacts(poses: Sequence, coords_list: List[np.ndarray]) -> Tuple[float, int]:
+    """
+    Over the multi-motif ligands: the closest pair of atoms of one ligand four or more bonds
+    apart (Å), and how many such pairs are closer than INTRA_SCALE x their summed radii.
+    """
+    closest, n = float("inf"), 0
+    for pose, x in zip(poses, coords_list):
+        if not isinstance(pose, FitPose):
+            continue
+        model = pose.ligand.torsion_model()
+        n += len(_intra_pairs(model, x[None], INTRA_SCALE)[0])
+        d = np.linalg.norm(x[:, None] - x[None], axis=-1)[np.triu(model.far)]
+        closest = min(closest, float(d.min()) if d.size else closest)
+    return closest, n
 
 
 def bounding_spheres(poses: Sequence, coords_list: List[np.ndarray]) -> Tuple[np.ndarray, np.ndarray]:
