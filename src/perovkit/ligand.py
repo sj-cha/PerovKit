@@ -12,6 +12,7 @@ from rdkit import Chem
 from rdkit.Chem import AllChem, rdDetermineBonds, rdMolTransforms
 
 from .conformers import ConformerLibrary
+from .refine import TorsionModel
 from .utils.rotation import rotation_about_axis, rotation_from_u_to_v
 
 
@@ -387,6 +388,18 @@ class Ligand:
             lib = ConformerLibrary.build(self, **kwargs)
             self._conformers = lib
         return lib
+
+
+    def torsion_model(self) -> TorsionModel:
+        """
+        Rotatable torsions used to refine this ligand, rooted at its first binding atom;
+        built on first use and shared with clones made after.
+        """
+        model = getattr(self, "_torsions", None)
+        if model is None:
+            model = TorsionModel.build(self.mol, self.binding_atoms[0])
+            self._torsions = model
+        return model
 
 
     def clone(self) -> Ligand:

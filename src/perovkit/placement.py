@@ -13,9 +13,10 @@ from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
-from .constellation import Candidate, ConstellationSampler
+from .constellation import Candidate, ConstellationSampler, rotations_about_axis
 from .core import BindingSite
 from .ligand import Ligand, LigandSpec
+from .refine import refine, refine_joint
 from .utils.geometry import compute_bounding_spheres
 from .utils.rotation import rotation_about_axis, rotation_from_u_to_v
 
@@ -74,26 +75,67 @@ class SingleMotifPose:
 
 class MultiMotifPose:
     """
-    Multi-motif ligand fitted to a constellation. Variants are the candidate's alternative
-    conformer fits, best first; theta is the spin relative to each fit's own.
+    Multi-motif ligand fitted to a constellation. Variants are coordinates of the
+    candidate's alternative conformer fits, best first, followed by any refined ones;
+    theta is the spin about the anchor axis relative to each variant.
     """
     random_start = False
 
     def __init__(self, ligand: Ligand, candidate: Candidate):
         self.ligand = ligand
         self.candidate = candidate
-        self.lib = ligand.conformers()
+        lib = ligand.conformers()
         self.center = candidate.targets.mean(axis=0)
-        self.spins = candidate.fits[0].axis is not None
-        self.n_variants = len(candidate.fits)
+        self.axis = candidate.fits[0].axis
+        self.spins = self.axis is not None
+        self.variants = [f.coords(lib) for f in candidate.fits]
         self.variant = 0
+        self.reach = 0.0
+        for x in self.variants:
+            self._extend_reach(x)
+
+    @property
+    def n_variants(self) -> int:
+        return len(self.variants)
+
+    def _extend_reach(self, x: np.ndarray) -> None:
         # spinning about an axis through the pivot keeps every atom's distance to it
-        self.reach = max(float(np.linalg.norm(f.coords(self.lib) - f.pivot, axis=1).max())
-                         for f in candidate.fits)
+        self.reach = max(self.reach, float(np.linalg.norm(x - self.center, axis=1).max()))
 
     def coords(self, theta: float, variant: int = 0) -> np.ndarray:
-        fit = self.candidate.fits[variant]
-        return fit.coords(self.lib, fit.theta + theta)
+        x = self.variants[variant]
+        if not self.spins or theta == 0.0:
+            return x.copy()
+        R = rotations_about_axis(self.axis, np.array([theta]))[0]
+        return (x - self.center) @ R.T + self.center
+
+    def add_variant(self, coords: np.ndarray) -> int:
+        self.variants.append(np.array(coords, dtype=float))
+        self._extend_reach(self.variants[-1])
+        return len(self.variants) - 1
+
+
+def refine_pose(
+    pose: MultiMotifPose,
+    coords: np.ndarray,
+    neighbors_coords: List[np.ndarray],
+    core_tree,
+    tree_builder: Callable,
+    cutoff: float,
+    max_rmsd: float,
+) -> Optional[np.ndarray]:
+    """
+    Refine a multi-motif ligand in torsion space against the core and its neighbors.
+
+    Returns the refined coordinates, or None when the anchors would end farther than
+    `max_rmsd` (RMS, Å) from their sites.
+    """
+    trees = [core_tree]
+    if neighbors_coords:
+        trees.append(tree_builder(np.vstack(neighbors_coords))[0])
+    res = refine(pose.ligand.torsion_model(), coords, pose.ligand.binding_groups,
+                 pose.candidate.targets, trees, contact=cutoff + 0.2)
+    return res.coords if res.anchor_rmsd <= max_rmsd else None
 
 
 def bounding_spheres(poses: Sequence, coords_list: List[np.ndarray]) -> Tuple[np.ndarray, np.ndarray]:
@@ -176,6 +218,86 @@ def optimize_pose(
     return best_theta, best_variant, best_coords
 
 
+def refine_clusters(
+    poses: Sequence,
+    coords_list: List[np.ndarray],
+    core_tree,
+    tree_builder: Callable,
+    mic: Callable,
+    min_distance: Callable,
+    cutoff: float,
+    max_rmsd: float,
+    margin: float = 2.0,
+) -> bool:
+    """
+    Refine jammed multi-motif ligands together, for when no ligand can clear its contacts
+    alone.
+
+    Ligands closer than `cutoff` form a contact graph; in every connected component, the
+    multi-motif members are refined jointly against the core and all other ligands, and
+    pushed apart from each other where they come within `cutoff` + 0.2 Å. A component's
+    result replaces its poses only if its anchors stay within `max_rmsd` and its closest
+    contact improves. Updates `coords_list` and the poses in place.
+
+    Returns:
+        Whether any component improved.
+    """
+    n = len(poses)
+    centers, radii = compute_bounding_spheres(coords_list)
+    close: Dict[Tuple[int, int], float] = {}
+    for a in range(n):
+        for b in range(a + 1, n):
+            if np.linalg.norm(mic(centers[a] - centers[b])) > radii[a] + radii[b] + cutoff + margin:
+                continue
+            d = np.linalg.norm(mic(coords_list[a][:, None] - coords_list[b][None]), axis=-1).min()
+            if d < cutoff + margin:
+                close[(a, b)] = float(d)
+
+    parent = list(range(n))
+    def root(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+    for (a, b), d in close.items():
+        if d < cutoff:
+            parent[root(a)] = root(b)
+    components: Dict[int, List[int]] = {}
+    for i in range(n):
+        components.setdefault(root(i), []).append(i)
+
+    improved = False
+    for comp in components.values():
+        members = [i for i in comp if isinstance(poses[i], MultiMotifPose)]
+        if len(comp) < 2 or not members:
+            continue
+        others = [c for j, c in enumerate(coords_list) if j not in members]
+        before = min(min_distance(coords_list[i], [c for j, c in enumerate(coords_list) if j != i])
+                     for i in members)
+        local = {i: k for k, i in enumerate(members)}
+        pairs = [(local[a], local[b]) for (a, b) in close if a in local and b in local]
+        trees = [core_tree, tree_builder(np.vstack(others))[0] if others else None]
+        results = refine_joint(
+            [poses[i].ligand.torsion_model() for i in members],
+            [coords_list[i] for i in members],
+            [poses[i].ligand.binding_groups for i in members],
+            [poses[i].candidate.targets for i in members],
+            trees, cutoff + 0.2, pairs, mic,
+        )
+        if any(r.anchor_rmsd > max_rmsd for r in results):
+            continue
+        trial = list(coords_list)
+        for i, r in zip(members, results):
+            trial[i] = r.coords
+        after = min(min_distance(trial[i], [c for j, c in enumerate(trial) if j != i]) for i in members)
+        if after > before + 1e-3:
+            for i, r in zip(members, results):
+                coords_list[i] = r.coords
+                poses[i].variant = poses[i].add_variant(r.coords)
+            improved = True
+    return improved
+
+
 def motif_pools(
     spec: LigandSpec,
     binding_sites: List[BindingSite],
@@ -195,6 +317,7 @@ def select_constellations(
     by_type: Dict[str, List[BindingSite]],
     sampler: ConstellationSampler,
     log: Callable = print,
+    refine: bool = True,
 ) -> List[Tuple[Ligand, Candidate]]:
     """
     Choose the constellations of one multi-motif LigandSpec and clone a ligand for each.
@@ -202,12 +325,15 @@ def select_constellations(
     With ``spec.binding_sites`` every entry lists one site atom index per motif, in motif
     order. Otherwise ``spec.coverage`` is a fraction of the most ligands the free sites
     can host (or, above 1, a count), and seeds are tried until it is met or the surface is
-    exhausted; a shortfall is reported with the reasons seeds were rejected.
+    exhausted; a shortfall is reported with the reasons seeds were rejected. With `refine`,
+    constellations whose fits all clash with the core get a torsion-space refinement first.
     """
     lig = spec.ligand
     lib = lig.conformers()
     replace = not spec.adsorb
     offset = float(spec.anchor_offset)
+    model = lig.torsion_model() if refine else None
+    groups = lig.binding_groups
     chosen: List[Candidate] = []
 
     if spec.binding_sites is not None:
@@ -223,7 +349,7 @@ def select_constellations(
                 print(f"[Warning] Binding site group {group} is not available for ligand "
                       f"{lig.name}. Skipped.")
                 continue
-            cand, reason = sampler.fit_sites(lib, sites, offset, replace)
+            cand, reason = sampler.fit_sites(lib, sites, offset, replace, model, groups)
             if cand is None:
                 print(f"[Warning] Binding site group {group} rejected for ligand {lig.name}: {reason}.")
                 continue
@@ -239,7 +365,7 @@ def select_constellations(
                 print(f"[Warning] Requested {n_target} ligands {lig.name}, but the free sites "
                       f"host at most {capacity}.")
                 n_target = capacity
-        chosen, failures = sampler.sample(lib, pools, n_target, offset, replace)
+        chosen, failures = sampler.sample(lib, pools, n_target, offset, replace, model, groups)
         if len(chosen) < n_target:
             reasons = ", ".join(f"{r} ({n}x)" for r, n in failures.most_common())
             print(f"[Warning] Placed {len(chosen)} of {n_target} requested {lig.name} ligands; "
