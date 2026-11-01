@@ -397,7 +397,7 @@ class Ligand:
         """
         model = getattr(self, "_torsions", None)
         if model is None:
-            model = TorsionModel.build(self.mol, self.binding_atoms[0])
+            model = TorsionModel.build(self.mol, self.binding_atoms[0], self.binding_atoms)
             self._torsions = model
         return model
 
