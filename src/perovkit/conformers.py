@@ -25,11 +25,14 @@ class ConformerLibrary:
         anchors (np.ndarray): (n_conf, n_motifs, 3) centroid of each motif's binding atoms.
         directions (np.ndarray): (n_conf, n_motifs, 3) unit vector from each anchor into
             the ligand, which should point away from the surface; zero where undefined.
+        body (np.ndarray): (n_atoms,) mask of the heavy atoms outside the binding groups,
+            whose spread over the surface measures a conformer's footprint.
     """
     coords: np.ndarray
     energies: np.ndarray
     anchors: np.ndarray
     directions: np.ndarray
+    body: np.ndarray
 
     @property
     def n_conformers(self) -> int:
@@ -85,16 +88,24 @@ class ConformerLibrary:
         if optimize and AllChem.UFFHasAllMoleculeParams(mol):
             results = AllChem.UFFOptimizeMoleculeConfs(mol, maxIters=2000, numThreads=0)
             energies = np.array([e for _, e in results], dtype=float)
-            energies -= energies.min()
 
         coords = np.array([c.GetPositions() for c in mol.GetConformers()], dtype=float)
+        # one non-finite energy would otherwise poison every relative energy below
+        finite = np.isfinite(energies) & np.isfinite(coords).all(axis=(1, 2))
+        coords, energies = coords[finite], energies[finite] - energies[finite].min()
         if mirror is None:
             mirror = all(a.GetChiralTag() == Chem.ChiralType.CHI_UNSPECIFIED for a in mol.GetAtoms())
         if mirror:
             coords = np.concatenate([coords, coords * np.array([-1.0, 1.0, 1.0])])
             energies = np.concatenate([energies, energies])
         anchors, directions = _anchor_geometry(mol, ligand.binding_groups, coords)
-        return cls(coords=coords, energies=energies, anchors=anchors, directions=directions)
+
+        body = np.array([a.GetAtomicNum() > 1 for a in mol.GetAtoms()])
+        body[[i for g in ligand.binding_groups for i in g]] = False
+        if not body.any():
+            body[:] = True
+        return cls(coords=coords, energies=energies, anchors=anchors, directions=directions,
+                   body=body)
 
     def pair_distances(self) -> np.ndarray:
         """

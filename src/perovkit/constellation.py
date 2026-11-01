@@ -47,6 +47,7 @@ class Fit:
     theta: float
     rmsd: float
     alignment: float
+    footprint: float
     energy: float
     cost: float
 
@@ -79,19 +80,24 @@ def fit_conformers(
     sigma_rmsd: float = 0.25,
     energy_scale: float = 5.0,
     w_align: float = 2.0,
+    w_foot: float = 1.0,
+    foot_scale: float = 2.0,
     n_spin: int = 72,
 ) -> Dict[str, np.ndarray]:
     """
     Kabsch-fit every conformer's anchors to `targets` at once.
 
-    When the fit leaves a spin free, it is set to point the motif directions along the
-    site `normals` as well as possible. Cost per conformer:
-    ``(rmsd / sigma_rmsd)^2 + energy / energy_scale + w_align * (1 - alignment)``,
-    with alignment the mean cosine between motif directions and normals.
+    The cost of a conformer is ``fit + orient``, with
+    ``fit = (rmsd / sigma_rmsd)^2 + energy / energy_scale`` and
+    ``orient = w_align * (1 - alignment) + w_foot * (footprint / foot_scale)^2``.
+    Alignment is the mean cosine between motif directions and site normals; footprint is
+    the spread (Å, RMS) of the body atoms across the mean normal, small when the ligand
+    stands up rather than lying on the surface. When the fit leaves a spin free, the
+    spin minimizing ``orient`` is taken.
 
     Returns:
         Dict of per-conformer arrays: rotation (C, 3, 3), center (C, 3), rmsd, alignment,
-        cost (C,), plus the pivot (3,) and spin axis (3,) or None shared by all.
+        footprint, fit, cost (C,), plus the pivot (3,) and spin axis (3,) or None.
     """
     P = lib.anchors
     center = P.mean(axis=1)
@@ -119,20 +125,36 @@ def fit_conformers(
     has_dir = np.linalg.norm(lib.directions, axis=-1) > 0          # (C, n)
     n_dir = np.maximum(has_dir.sum(axis=1), 1)
     dirs = np.einsum("cij,cnj->cni", R, lib.directions)
+
+    # lateral spread across the mean normal n: trace(cov) - n.cov.n of the body atoms
+    nbar = normals.mean(axis=0)
+    nbar = nbar / np.linalg.norm(nbar)
+    body = np.einsum("cij,cmj->cmi", R, lib.coords[:, lib.body] - center[:, None])
+    body -= body.mean(axis=1, keepdims=True)
+    cov = np.einsum("cmi,cmj->cij", body, body) / body.shape[1]
+    spread = np.trace(cov, axis1=1, axis2=2)
+
     if axis is not None:
         thetas = np.linspace(0.0, 2.0 * np.pi, n_spin, endpoint=False)
         spins = rotations_about_axis(axis, thetas)                    # (S, 3, 3)
         cos = np.einsum("sij,cnj,nj->csn", spins, dirs, normals)      # (C, S, n)
         align = cos.sum(axis=-1) / n_dir[:, None]
-        best = np.argmax(align, axis=1)
+        u = np.einsum("sji,j->si", spins, nbar)                       # spin^T n
+        lat2 = spread[:, None] - np.einsum("si,cij,sj->cs", u, cov, u)
+        orient = w_align * (1.0 - align) + w_foot * lat2 / foot_scale ** 2
+        best = np.argmin(orient, axis=1)
+        idx = np.arange(len(P))
         R = spins[best] @ R
-        alignment = align[np.arange(len(P)), best]
+        alignment, lat2, orient = align[idx, best], lat2[idx, best], orient[idx, best]
     else:
         alignment = np.einsum("cnj,nj->cn", dirs, normals).sum(axis=-1) / n_dir
+        lat2 = spread - np.einsum("i,cij,j->c", nbar, cov, nbar)
+        orient = w_align * (1.0 - alignment) + w_foot * lat2 / foot_scale ** 2
 
-    cost = (rmsd / sigma_rmsd) ** 2 + lib.energies / energy_scale + w_align * (1.0 - alignment)
-    return dict(rotation=R, center=center, pivot=pivot, axis=axis,
-                rmsd=rmsd, alignment=alignment, cost=cost)
+    fit = (rmsd / sigma_rmsd) ** 2 + lib.energies / energy_scale
+    return dict(rotation=R, center=center, pivot=pivot, axis=axis, rmsd=rmsd,
+                alignment=alignment, footprint=np.sqrt(np.maximum(lat2, 0.0)),
+                fit=fit, cost=fit + orient)
 
 
 class ConstellationSampler:
@@ -153,8 +175,9 @@ class ConstellationSampler:
         n_constellations (int): Feasible constellations compared per seed.
         max_branch (int): Constellations enumerated per seed.
         n_spin (int): Spin angles scanned when the fit leaves one free.
-        w_align, w_crowd (float): Weights of the direction misalignment and of the
-            squared shortfall (Å^2) below overlap_cutoff to already placed ligands.
+        w_align, w_foot, foot_scale (float): Orientation terms of the cost, see fit_conformers.
+        w_crowd (float): Weight of the squared shortfall (Å^2) below overlap_cutoff to
+            already placed ligands.
     """
 
     def __init__(
@@ -171,6 +194,8 @@ class ConstellationSampler:
         max_branch: int = 64,
         n_spin: int = 36,
         w_align: float = 2.0,
+        w_foot: float = 1.0,
+        foot_scale: float = 2.0,
         w_crowd: float = 1.0,
     ):
         self.core_tree, self.core_map = tree_builder(np.asarray(core_positions, dtype=float))
@@ -185,6 +210,8 @@ class ConstellationSampler:
         self.max_branch = max_branch
         self.n_spin = n_spin
         self.w_align = w_align
+        self.w_foot = w_foot
+        self.foot_scale = foot_scale
         self.w_crowd = w_crowd
         self.placed: List[np.ndarray] = []
         self._lig_tree = None
@@ -360,7 +387,8 @@ class ConstellationSampler:
         normals = np.array([np.asarray(s.plane, dtype=float) / np.linalg.norm(s.plane)
                             for s in sites])
         targets = positions + anchor_offset * normals
-        res = fit_conformers(lib, targets, normals, w_align=self.w_align)
+        res = fit_conformers(lib, targets, normals, w_align=self.w_align,
+                             w_foot=self.w_foot, foot_scale=self.foot_scale)
 
         ok = np.flatnonzero(res["rmsd"] <= self.max_rmsd)
         if len(ok) == 0:
@@ -377,12 +405,15 @@ class ConstellationSampler:
                   if axis is not None else np.zeros(1))
         spins = rotations_about_axis(axis, thetas) if axis is not None else np.eye(3)[None]
         has_dir = np.linalg.norm(lib.directions, axis=-1) > 0
+        nbar = normals.mean(axis=0)
+        nbar = nbar / np.linalg.norm(nbar)
 
         fits: List[Fit] = []
         for c in ok:
             base = Fit(conformer=int(c), rotation=res["rotation"][c], center=res["center"][c],
                        pivot=res["pivot"], axis=axis, theta=0.0, rmsd=float(res["rmsd"][c]),
-                       alignment=float(res["alignment"][c]), energy=float(lib.energies[c]),
+                       alignment=float(res["alignment"][c]),
+                       footprint=float(res["footprint"][c]), energy=float(lib.energies[c]),
                        cost=float(res["cost"][c]))
             x0 = base.coords(lib) - base.pivot
             coords = np.einsum("sij,mj->smi", spins, x0) + base.pivot          # (S, m, 3)
@@ -395,15 +426,20 @@ class ConstellationSampler:
             dirs = np.einsum("sij,nj->sni", spins @ base.rotation, lib.directions[c])
             cos = np.einsum("sni,ni->sn", dirs, normals)
             align = (cos * has_dir[c]).sum(axis=1) / max(has_dir[c].sum(), 1)
+            body = coords[:, lib.body]
+            perp = body - np.einsum("smi,i->sm", body, nbar)[..., None] * nbar
+            lat2 = np.mean(np.sum((perp - perp.mean(axis=1, keepdims=True)) ** 2, axis=-1), axis=1)
             d_lig = self._ligand_clearance(coords)
             short = np.maximum(0.0, self.overlap_cutoff - np.minimum(d_core, d_lig))
-            score = self.w_align * (1.0 - align) + self.w_crowd * short ** 2
+            score = (self.w_align * (1.0 - align) + self.w_foot * lat2 / self.foot_scale ** 2
+                     + self.w_crowd * short ** 2)
             score[~feasible] = np.inf
 
             s = int(np.argmin(score))
             base.theta = float(thetas[s])
             base.alignment = float(align[s])
-            base.cost = (base.cost - self.w_align * (1.0 - res["alignment"][c])) + float(score[s])
+            base.footprint = float(np.sqrt(lat2[s]))
+            base.cost = float(res["fit"][c]) + float(score[s])
             fits.append(base)
 
         if not fits:

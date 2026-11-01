@@ -776,8 +776,12 @@ class LigandSpec:
             or, failing that, inferred from the ligand charge (positive -> A-site,
             otherwise X-site) for backward compatibility. Ligands with several motifs
             take the site of each motif and leave this None.
-        coverage (Optional[float]): Fractional coverage of available binding sites.
-        binding_sites (Optional[list[int]]): Explicit surface site indices to use.
+        coverage (Optional[float]): Fractional coverage of available binding sites; above 1,
+            a number of ligands. For a multi-motif ligand the fraction is of the most ligands
+            the free sites can host, each site type serving its free sites divided by the
+            motifs that need it.
+        binding_sites (Optional[list[int]]): Explicit surface site indices to use. For a
+            multi-motif ligand, a list of groups with one site index per motif, in motif order.
         anchor_offset (float): Offset (Å) along the binding axis. When `adsorb` is
             True this sets the spacing between the surface species and the adsorbate.
         adsorb (bool): If True, adsorb the ligand on top of the surface site instead

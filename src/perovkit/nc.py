@@ -18,7 +18,9 @@ from scipy.spatial import cKDTree
 
 from .core import Core, BindingSite
 from .ligand import Ligand, LigandSpec, BindingMotif
-from .utils.rotation import rotation_about_axis, rotation_from_u_to_v
+from .constellation import ConstellationSampler
+from .placement import (SitePose, FitPose, bounding_spheres, optimize_pose,
+                        place_about_normal, motif_pools, select_constellations)
 from .utils.geometry import farthest_point_sampling, per_face_farthest_point_sampling, compute_bounding_spheres, build_neighbor_map
 
 
@@ -49,13 +51,23 @@ class NanoCrystal:
             self.binding_sites = deepcopy(self.core.binding_sites)
         else:
             self.binding_sites = []
+        # Multi-motif ligands need site combinations, so they choose first
         self.ligand_specs.sort(
             key=lambda spec: (
+                0 if spec.ligand.n_motifs > 1 else 1,
                 0 if spec.ligand.charge > 0 else 1,
                 -spec.ligand.volume,
             )
         )
         self._atoms: Optional[Atoms] = None
+
+
+    def _symbol_map(self) -> Dict[str, str]:
+        return {
+            "A": self.core.A_label,
+            "B": self.core.B,
+            "X": self.core.X,
+        }
 
 
     def _select_site_pool(self, spec: LigandSpec) -> Tuple[List[BindingSite], str]:
@@ -66,11 +78,7 @@ class NanoCrystal:
         target is inferred from the ligand charge (positive -> A-site, otherwise
         X-site) for backward compatibility. Returns (pool, label).
         """
-        symbol_map = {
-            "A": self.core.A_label,
-            "B": self.core.B,
-            "X": self.core.X,
-        }
+        symbol_map = self._symbol_map()
         if spec.site is not None:
             target = symbol_map[spec.site]
             label = f"{spec.site}-site"
@@ -93,11 +101,10 @@ class NanoCrystal:
         active_radius_factor: float = math.sqrt(2)/2,
         random_seed: int = 42,
         verbose: bool = True,
+        max_anchor_rmsd: float = 0.5,   # Å
     ) -> None:
 
         assert not self.ligands, "Ligands have already been placed."
-        if any(spec.ligand.n_motifs > 1 for spec in self.ligand_specs):
-            raise NotImplementedError("Placing ligands with several binding motifs is not supported yet.")
 
         log = print if verbose else (lambda *a, **k: None)
 
@@ -116,10 +123,27 @@ class NanoCrystal:
         core_positions = self.core.atoms.get_positions()
 
         ligands: List[Ligand] = []
-        sites: List[BindingSite] = []
+        poses: List[SitePose | FitPose] = []
+        sampler: Optional[ConstellationSampler] = None
 
         for spec in self.ligand_specs:
             lig = spec.ligand
+
+            if lig.n_motifs > 1:
+                if sampler is None:
+                    sampler = ConstellationSampler(
+                        core_positions, *self._sampler_geometry(), self._rng,
+                        displaced=displaced_indices, overlap_cutoff=overlap_cutoff,
+                        max_rmsd=max_anchor_rmsd,
+                    )
+                pools, by_type = motif_pools(spec, self.binding_sites, self._symbol_map())
+                for lig_cloned, cand in select_constellations(spec, pools, by_type, sampler, log):
+                    ligands.append(lig_cloned)
+                    poses.append(FitPose(lig_cloned, cand))
+                    if not spec.adsorb:
+                        displaced_indices.extend(cand.atom_indices)
+                self.ligand_coverage[spec.ligand.name] = spec.coverage
+                continue
 
             pool, ligand_type = self._select_site_pool(spec)
             available = [s for s in pool if not s.passivated]
@@ -161,7 +185,8 @@ class NanoCrystal:
                 site.passivated = True
 
                 ligands.append(lig_cloned)
-                sites.append(site)
+                poses.append(SitePose(lig_cloned, np.array(site.plane, dtype=float),
+                                      np.array(site.position, dtype=float)))
                 # Replace mode removes the surface atom(s); adsorb mode keeps them.
                 if not spec.adsorb:
                     displaced_indices.extend(site.atom_indices)
@@ -173,9 +198,8 @@ class NanoCrystal:
         n_lig = len(ligands)
         assert n_lig > 0, "No ligands to place."
 
-        # Binding site positions and planes
-        site_positions = np.array([s.position for s in sites])
-        site_planes = np.array([s.plane for s in sites], dtype=float)
+        # Where each ligand binds: its site, or the centroid of its sites
+        site_positions = np.array([p.center for p in poses])
 
         # Core atoms coordinates except displaced ones
         n_core = core_positions.shape[0]
@@ -194,20 +218,14 @@ class NanoCrystal:
 
         self._core_tree = core_tree
 
-        # Initialize rotation angles around surface normal and current coordinates
-        thetas = np.array([2.0 * math.pi * self._rng.random() for _ in range(n_lig)], dtype=float)
-        ligand_coords_list: List[np.ndarray] = []
-        for i in range(n_lig):
-            coords_i = self._place_one_ligand(
-                ligands[i],
-                site_planes[i],
-                site_positions[i],
-                thetas[i],
-            )
-            ligand_coords_list.append(coords_i)
+        # Initialize rotation angles and current coordinates; multi-motif ligands start
+        # from the spin their constellation fit chose
+        thetas = np.array([2.0 * math.pi * self._rng.random() if p.random_start else 0.0
+                           for p in poses], dtype=float)
+        ligand_coords_list: List[np.ndarray] = [p.coords(t) for p, t in zip(poses, thetas)]
 
         # Rotation optimization loop
-        centers, radii = compute_bounding_spheres(ligand_coords_list)
+        centers, radii = bounding_spheres(poses, ligand_coords_list)
         neighbor_map: Dict[int, List[int]] = build_neighbor_map(
             centers, radii, self.overlap_cutoff
         )
@@ -239,24 +257,22 @@ class NanoCrystal:
 
                 d_old = dists[i]
 
-                best_theta, best_coords = self._optimize_rotation(
-                    i,
-                    ligands,
+                best_theta, best_variant, best_coords = self._optimize_rotation(
+                    poses[i],
                     neighbors_coords,
-                    site_planes,
-                    site_positions,
                 )
                 d_new = self._min_distance(best_coords, neighbors_coords)
 
                 if d_new > d_old + 1e-3:
                     ligand_coords_list[i] = best_coords
                     thetas[i] = best_theta
+                    poses[i].variant = best_variant
                     improved = True
 
             if not improved:
                 raise RuntimeError("[Log] No improvement in active cluster. Stopping.")
 
-            centers, radii = compute_bounding_spheres(ligand_coords_list)
+            centers, radii = bounding_spheres(poses, ligand_coords_list)
             neighbor_map = build_neighbor_map(centers, radii, self.overlap_cutoff)
             global_min, conflict_ligs, dists = self._get_conflict_ligands(
                 ligand_coords_list,
@@ -277,6 +293,14 @@ class NanoCrystal:
         core_symbols = self.core.atoms.get_chemical_symbols()
         stripped_symbols = [s for s, keep in zip(core_symbols, core_mask) if keep]
         stripped_positions = core_positions[core_mask]
+
+        fit_poses = [p for p in poses if isinstance(p, FitPose)]
+        if fit_poses:
+            dev = np.concatenate([
+                np.linalg.norm((p.ligand.anchor_positions - p.candidate.targets), axis=1)
+                for p in fit_poses
+            ])
+            log(f"[Log] Multi-motif anchors sit {dev.mean():.2f} Å (max {dev.max():.2f} Å) from their sites.")
 
         stripped_atoms = Atoms(
             symbols=stripped_symbols,
@@ -522,122 +546,28 @@ class NanoCrystal:
         return sorted(list(active))
 
 
-    def _place_one_ligand(
-        self,
-        ligand: Ligand,
-        plane: np.ndarray,
-        site_pos: np.ndarray,
-        theta: float,
-    ) -> np.ndarray:
-
-        coords_loc = ligand.atoms.get_positions()
-
-        # Rotate to surface normal
-        R_align = rotation_from_u_to_v(
-            np.array([0.0, 0.0, 1.0], dtype=float),
-            plane,
-        )
-        coords_aligned = coords_loc @ R_align.T
-
-        # Rotate around surface normal 
-        R_rot = rotation_about_axis(plane, theta)
-        coords_rot = coords_aligned @ R_rot.T
-
-        anchor_offset = plane / np.linalg.norm(plane) * float(getattr(ligand, "_anchor_offset", 0.0))
-        anchor_pos = site_pos + anchor_offset
-
-        # Translate to binding site position
-        coords_final = coords_rot + anchor_pos
-
-        return coords_final
+    def _sampler_geometry(self):
+        """
+        Tree builder and (identity) minimum-image convention for the constellation sampler.
+        """
+        return (lambda pts: (cKDTree(pts), np.arange(len(pts)))), (lambda d: d)
 
 
     def _optimize_rotation(
         self,
-        i: int,
-        ligands: List[Ligand],
+        pose: SitePose | FitPose,
         neighbors_coords: List[np.ndarray],
-        site_planes: np.ndarray, 
-        site_positions: np.ndarray,
-    ) -> Tuple[float, np.ndarray]:
-
-        cutoff = self.overlap_cutoff
-        ligand_i = ligands[i]
-
-        # Search parameters
-        coarse_step_deg = self.coarse_step_deg
-        fine_step_deg = self.fine_step_deg
-        window_deg = self.window_deg
-
-        # Initialization
-        best_theta = None
-        best_min_d = -float("inf")
-        best_coords_i = None
-        theta0 = 2.0 * math.pi * self._rng.random()
-        
-        # Coarse search
-        n_coarse = max(int(round(360.0 / coarse_step_deg)), 1)
-
-        for k in range(n_coarse):
-            theta = theta0 + 2.0 * math.pi * (k / n_coarse)
-            theta = theta % (2.0 * math.pi)
-
-            coords_i = self._place_one_ligand(
-                ligands[i],
-                site_planes[i],
-                site_positions[i],
-                theta,
-            )
-            min_d = self._min_distance(coords_i, neighbors_coords)
-
-            better = False
-            if best_theta is None:
-                better = True
-            else:
-                # Case 1: both new and best are below cutoff
-                if best_min_d < cutoff and min_d > best_min_d:
-                    better = True
-                # Case 2: best is below cutoff, new candidate is above cutoff
-                elif best_min_d < cutoff and min_d >= cutoff:
-                    better = True
-                # Case 3: both new and best are above cutoff, prefer larger min_d
-                elif best_min_d >= cutoff and min_d >= cutoff and min_d > best_min_d:
-                    better = True
-
-            if better:
-                best_theta = theta
-                best_min_d = min_d
-                best_coords_i = coords_i
-
-        if best_min_d >= cutoff:
-            return best_theta, best_coords_i
-        
-        # Fine search 
-        window_rad = math.radians(window_deg)
-        fine_step_rad = math.radians(fine_step_deg)
-
-        n_fine = int(round(2.0 * window_rad / fine_step_rad)) + 1
-        for k in range(n_fine):
-            delta = -window_rad + k * (2.0 * window_rad / (n_fine - 1))
-            theta = (best_theta + delta) % (2.0 * math.pi)
-
-            coords_i = self._place_one_ligand(ligand_i, site_planes[i], site_positions[i], theta)
-            min_d = self._min_distance(coords_i, neighbors_coords)
-
-            better = False
-            if best_min_d < cutoff and min_d > best_min_d:
-                better = True
-            elif best_min_d < cutoff and min_d >= cutoff:
-                better = True
-            elif best_min_d >= cutoff and min_d >= cutoff and min_d > best_min_d:
-                better = True
-
-            if better:
-                best_theta = theta
-                best_min_d = min_d
-                best_coords_i = coords_i
-
-        return best_theta, best_coords_i
+    ) -> Tuple[float, int, np.ndarray]:
+        return optimize_pose(
+            pose,
+            neighbors_coords,
+            self._min_distance,
+            self._rng,
+            self.overlap_cutoff,
+            self.coarse_step_deg,
+            self.fine_step_deg,
+            self.window_deg,
+        )
 
 
     def _assign_ligands_to_octahedra(self) -> None:
@@ -657,7 +587,13 @@ class NanoCrystal:
         ligand_ids = []
 
         for lig in self.ligands:
-            if lig.charge <= 0 and getattr(lig, "anchor_pos", None) is not None:
+            if lig.n_motifs > 1:
+                # every motif bound to an X or B site belongs to the octahedron there
+                for motif, pos in zip(lig.binding_motifs, lig.anchor_positions):
+                    if motif.site in ("X", "B"):
+                        anchor_positions.append(pos)
+                        ligand_ids.append(int(lig.id))
+            elif lig.charge <= 0 and getattr(lig, "anchor_pos", None) is not None:
                 anchor_positions.append(np.asarray(lig.anchor_pos, dtype=float))
                 ligand_ids.append(int(lig.id))
 
@@ -669,7 +605,8 @@ class NanoCrystal:
 
             for j, b_loc_j in enumerate(b_loc):
                 b_abs = int(b_idx[int(b_loc_j)])
-                octahedra[b_abs]["Ligand"].append(ligand_ids[j])
+                if ligand_ids[j] not in octahedra[b_abs]["Ligand"]:
+                    octahedra[b_abs]["Ligand"].append(ligand_ids[j])
 
 
     def _build_index_map(self) -> None:
