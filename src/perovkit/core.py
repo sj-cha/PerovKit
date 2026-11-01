@@ -426,22 +426,13 @@ class Core:
             return self.A
 
         lig = self.A[0]
-        motif = list(lig.binding_motif.atoms) if lig.binding_motif else None
-        motif_idx = (list(lig.binding_motif.indices)
-                     if lig.binding_motif and lig.binding_motif.indices else None)
-        motif_anchor = lig.binding_motif.anchor if lig.binding_motif else None
         return {
             "label": self.A_label,
             "kind": "molecular",
             "n_instances": len(self.A),
             "ligand": {
-                "name": lig.name,
-                "smiles": lig.smiles,
+                **lig._type_metadata(),
                 "charge": int(lig.charge),
-                "binding_motif_atoms": motif,
-                "binding_motif_anchor": motif_anchor,
-                "binding_motif_indices": motif_idx,
-                "binding_atoms_indices": list(getattr(lig, "binding_atoms", [])),
                 "n_atoms": len(lig.atoms),
                 "volume": float(lig.volume) if lig.volume is not None else None,
             },

@@ -19,16 +19,23 @@ class BindingMotif:
     """
     Specification of how a ligand anchors to a surface.
 
+    A ligand holds one motif per independent binding group; a zwitterion, for example,
+    has one for its cationic and one for its anionic end.
+
     Attributes:
         atoms (list[str]): Element symbols of the binding atoms (1 or 2), e.g. ["O", "O"].
         anchor (str): SMARTS of the binding group, e.g. "P" for a phosphonate. The binding
             atoms are searched among the atoms of its first match and their bonded neighbors.
         indices (list[int]): Explicit binding atom indices, one per entry of ``atoms``.
             When given they are used as-is and ``anchor`` is not required.
+        site (str): Sublattice this group binds to, one of "A", "B" or "X". Required for
+            every motif of a ligand with more than one; for a single motif it may be left
+            to ``LigandSpec.site`` or the ligand charge.
     """
     atoms: list[str]
     anchor: Optional[str] = None
     indices: Optional[list[int]] = None
+    site: Optional[str] = None
 
     def __post_init__(self):
         if not 1 <= len(self.atoms) <= 2:
@@ -40,6 +47,8 @@ class BindingMotif:
             raise ValueError("BindingMotif: give an anchor SMARTS (or explicit indices)")
         if self.anchor is not None and Chem.MolFromSmarts(self.anchor) is None:
             raise ValueError(f"BindingMotif: invalid anchor SMARTS {self.anchor!r}")
+        if self.site is not None and self.site not in ("A", "B", "X"):
+            raise ValueError(f"BindingMotif: site must be one of 'A', 'B', 'X' (or None); got {self.site!r}")
         if self.indices is None:
             return
         self.indices = [int(i) for i in self.indices]
@@ -53,11 +62,26 @@ class BindingMotif:
         if len(set(self.indices)) != len(self.indices):
             raise ValueError(f"BindingMotif: indices must be distinct, got {self.indices}")
 
+    def _key(self) -> tuple:
+        return (tuple(self.atoms), self.anchor,
+                tuple(self.indices) if self.indices else None, self.site)
+
+    def _to_metadata(self) -> dict:
+        return {
+            "atoms": list(self.atoms),
+            "anchor": self.anchor,
+            "indices": list(self.indices) if self.indices else None,
+            "site": self.site,
+        }
+
     @classmethod
-    def _from_metadata(cls, meta: dict) -> Optional[BindingMotif]:
+    def _from_metadata(cls, meta: dict) -> Optional[BindingMotif | List[BindingMotif]]:
         """
-        Rebuild from serialized ligand metadata; None when the ligand has no motif.
+        Rebuild from serialized ligand metadata, in the form ``Ligand.binding_motif`` takes:
+        one motif, a list of several, or None when the ligand has none.
         """
+        if meta.get("binding_motifs") is not None:
+            return _pack_motifs([cls(**m) for m in meta["binding_motifs"]])
         atoms = meta.get("binding_motif_atoms")
         if not atoms:
             return None
@@ -67,6 +91,21 @@ class BindingMotif:
             # written before anchors existed: pin the binding atoms resolved back then
             indices = meta.get("binding_atoms_indices")
         return cls(atoms, anchor=anchor, indices=indices)
+
+
+def _pack_motifs(value) -> Optional[BindingMotif | List[BindingMotif]]:
+    """
+    Normalize a binding_motif value: a single motif stays as it is (also when given as a
+    one-element list), several become a list, and an empty one becomes None.
+    """
+    if value is None or isinstance(value, BindingMotif):
+        return value
+    motifs = list(value)
+    if not all(isinstance(m, BindingMotif) for m in motifs):
+        raise TypeError("binding_motif must be a BindingMotif or a list of them")
+    if not motifs:
+        return None
+    return motifs[0] if len(motifs) == 1 else motifs
 
 
 class _SyncedMol:
@@ -98,12 +137,15 @@ class Ligand:
         mol (Chem.Mol): RDKit Mol object; its conformer follows ``atoms`` positions.
         smiles (str): SMILES string of the ligand without explicit hydrogens.
         charge (int): Formal charge of the ligand.
-        binding_motif (BindingMotif): Specification of how a ligand anchors to a surface.
+        binding_motif (BindingMotif | List[BindingMotif]): How the ligand anchors to a
+            surface: one motif, or a list with one motif per binding group.
         name (str): User-defined identifier.
         id (int): Ligand ID assigned after placement.
         volume (float): Molecular volume (Å^3).
-        binding_atoms (List[int]): Local indices of atoms used as anchors.
-        plane (Tuple[int, int, int]): Miller index of the surface the ligand is bound to.
+        binding_atoms (List[int]): Local indices of atoms used as anchors, motif after motif
+            (see ``binding_groups`` for the split).
+        planes (List[Tuple[int, int, int]]): Miller index of the surface each motif is bound
+            to; ``plane`` is the first one.
         indices (np.ndarray): Global atom indices when placed in a parent NanoCrystal/Slab.
         _anchor_offset (float): Offset (Å) applied along the axis perpendicular to the plane.
     """
@@ -111,12 +153,12 @@ class Ligand:
     mol: Chem.Mol = _SyncedMol()
     smiles: str
     charge: int
-    binding_motif: BindingMotif
+    binding_motif: Optional[BindingMotif | List[BindingMotif]]
     name: str
     id: Optional[int] = None
     volume: float = None
     binding_atoms: List[int] = field(default_factory=list)
-    plane: Optional[Tuple[int, int, int]] = None
+    planes: List[Tuple[int, int, int]] = field(default_factory=list)
     indices: Optional[np.ndarray] = None
     _anchor_offset: float = 0.0
 
@@ -124,11 +166,40 @@ class Ligand:
         mol = self.mol
         if mol is None or [a.GetSymbol() for a in mol.GetAtoms()] != self.atoms.get_chemical_symbols():
             raise ValueError("mol and atoms must list the same elements in the same order")
+        self.binding_motif = _pack_motifs(self.binding_motif)
         self._get_volume()
         if self.binding_motif:
             self._get_binding_atoms_indices()
             self._orient_ligand()
 
+
+    @property
+    def binding_motifs(self) -> List[BindingMotif]:
+        """
+        The binding motifs as a list, whether the ligand has none, one or several.
+        """
+        m = self.binding_motif
+        if m is None:
+            return []
+        return [m] if isinstance(m, BindingMotif) else list(m)
+
+    @property
+    def n_motifs(self) -> int:
+        return len(self.binding_motifs)
+
+    @property
+    def binding_groups(self) -> List[List[int]]:
+        """
+        ``binding_atoms`` split per motif: each motif owns as many atoms as it lists elements.
+        """
+        motifs = self.binding_motifs
+        if not motifs:
+            return [list(self.binding_atoms)] if self.binding_atoms else []
+        groups, start = [], 0
+        for m in motifs:
+            groups.append(list(self.binding_atoms[start:start + len(m.atoms)]))
+            start += len(m.atoms)
+        return groups
 
     @property
     def anchor_pos(self) -> Optional[np.ndarray]:
@@ -137,12 +208,30 @@ class Ligand:
         pos = self.atoms.get_positions()
         return pos[np.asarray(self.binding_atoms, dtype=int)].mean(axis=0)
 
+    @property
+    def anchor_positions(self) -> Optional[np.ndarray]:
+        """
+        Anchor of every motif, the centroid of its binding atoms: (n_motifs, 3).
+        """
+        if not self.binding_atoms:
+            return None
+        pos = self.atoms.get_positions()
+        return np.array([pos[np.asarray(g, dtype=int)].mean(axis=0) for g in self.binding_groups])
+
+    @property
+    def plane(self) -> Optional[Tuple[int, int, int]]:
+        return self.planes[0] if self.planes else None
+
+    @plane.setter
+    def plane(self, value) -> None:
+        self.planes = [] if value is None else [value]
+
 
     @classmethod
     def from_file(
         cls,
         filename: str,
-        binding_motif: BindingMotif,
+        binding_motif: BindingMotif | List[BindingMotif],
         name: str,
         charge: Optional[int] = None,
         **kwargs
@@ -153,7 +242,8 @@ class Ligand:
 
         Args:
             filename (str): Path to the XYZ file.
-            binding_motif (BindingMotif): Specification of how a ligand anchors to a surface.
+            binding_motif (BindingMotif | List[BindingMotif]): How the ligand anchors to a
+                surface; a list gives one motif per binding group.
             name (str): User-defined identifier.
             charge (Optional[int]): Formal charge; if None, tries -1, 0, +1 in order.
             **kwargs: Forwarded to the Ligand constructor.
@@ -204,7 +294,7 @@ class Ligand:
     def from_smiles(
         cls,
         smiles: str,
-        binding_motif: BindingMotif = None,
+        binding_motif: BindingMotif | List[BindingMotif] = None,
         random_seed: int = 42,
         name: str = None,
         optimize: bool = False,
@@ -215,7 +305,8 @@ class Ligand:
 
         Args:
             smiles (str): SMILES string of the ligand.
-            binding_motif (BindingMotif): Specification of how a ligand anchors to a surface.
+            binding_motif (BindingMotif | List[BindingMotif]): How the ligand anchors to a
+                surface; a list gives one motif per binding group.
             random_seed (int): Random seed for ETKDG embedding.
             name (str): User-defined identifier.
             optimize (bool): If True, fully relax with UFF; otherwise set rotatable bonds 
@@ -293,13 +384,14 @@ class Ligand:
             lig.mol = Chem.Mol(self.mol)  # own conformer, so it can follow its own atoms
         if self.indices is not None:
             lig.indices = self.indices.copy()
+        lig.planes = list(self.planes)
         return lig
 
 
     @classmethod
     def _from_data(cls, **kwargs) -> Ligand:
         """
-        Construct a Ligand bypassing __post_init__. 
+        Construct a Ligand bypassing __post_init__.
         Used when deserializing from the metadata.
         """
         lig = object.__new__(cls)
@@ -307,12 +399,72 @@ class Ligand:
         lig.id = None
         lig.volume = None
         lig.binding_atoms = []
-        lig.plane = None
+        lig.planes = []
         lig.indices = None
         lig._anchor_offset = 0.0
         for k, v in kwargs.items():
             setattr(lig, k, v)
+        lig.binding_motif = _pack_motifs(getattr(lig, "binding_motif", None))
         return lig
+
+
+    def _type_key(self) -> tuple:
+        """
+        Everything that makes two placed ligands the same JSON ligand type.
+        """
+        # The motifs and resolved binding atoms are part of the TYPE: the per-type metadata
+        # stores one set of them for every instance sharing this key. Without them, two
+        # placements of the same molecule anchored through DIFFERENT atoms collide into one
+        # type and both reload with the first one's anchor, silently. `from_smiles` derives
+        # charge from the SMILES and defaults name to None, so that collision needs no opt-in.
+        return (
+            self.name,
+            self.smiles,
+            self.charge,
+            tuple(m._key() for m in self.binding_motifs),
+            tuple(self.binding_atoms or ()),
+        )
+
+
+    def _type_metadata(self) -> dict:
+        """
+        Per-type JSON metadata: identity, binding motifs and resolved binding atoms.
+
+        ``binding_motifs`` is what this version reads back; the flat ``binding_motif_*``
+        keys are kept for single-motif ligands so that older versions can still load them.
+        """
+        motifs = self.binding_motifs
+        legacy = motifs[0] if len(motifs) == 1 else None
+        meta = {
+            "name": self.name,
+            "smiles": self.smiles,
+            "charge": self.charge,
+        }
+        if len(motifs) <= 1:
+            meta.update({
+                "binding_motif_atoms": list(legacy.atoms) if legacy else None,
+                "binding_motif_anchor": legacy.anchor if legacy else None,
+                "binding_motif_indices": (list(legacy.indices)
+                                          if legacy and legacy.indices else None),
+            })
+        meta["binding_atoms_indices"] = list(self.binding_atoms or [])
+        meta["binding_motifs"] = [m._to_metadata() for m in motifs]
+        return meta
+
+
+    def _instance_metadata(self) -> dict:
+        """
+        Per-instance plane metadata; ``planes`` is written only when there is more than one.
+        """
+        meta = {"plane": list(self.plane)}
+        if len(self.planes) > 1:
+            meta["planes"] = [list(p) for p in self.planes]
+        return meta
+
+
+    @staticmethod
+    def _planes_from_metadata(inst_meta: dict) -> list:
+        return inst_meta.get("planes") or [inst_meta["plane"]]
 
 
     def _get_volume(self):
@@ -329,37 +481,68 @@ class Ligand:
         return np.array([a.GetDegree() for a in self.mol.GetAtoms()], dtype=int)
 
 
-    def _anchor_region(self) -> List[int]:
+    def _anchor_region(self, motif: BindingMotif, claimed: set = frozenset()) -> List[int]:
         """
         Atoms of the first anchor match and their bonded neighbors, sorted by index.
+
+        Matches touching `claimed` atoms (bound by an earlier motif) are skipped, so motifs
+        sharing one SMARTS take its groups in order.
         """
-        anchor = self.binding_motif.anchor
+        anchor = motif.anchor
         mol = self.mol
         matches = mol.GetSubstructMatches(Chem.MolFromSmarts(anchor))
         if not matches:
             raise ValueError(f"anchor {anchor!r} matches nothing in ligand {self.smiles!r}")
+        matches = [m for m in matches if claimed.isdisjoint(m)]
+        if not matches:
+            raise ValueError(f"anchor {anchor!r} has no group left in ligand {self.smiles!r} "
+                             f"once the earlier motifs took theirs")
 
         first = set(matches[0])
         # matches sharing atoms with the first one are the same group seen from another atom
-        if any(first.isdisjoint(m) for m in matches[1:]):
+        if self.n_motifs == 1 and any(first.isdisjoint(m) for m in matches[1:]):
             print(f"[Warning] anchor {anchor!r} matches more than one group in ligand "
                   f"{self.name or self.smiles}; using the first match {sorted(first)}.")
 
         region = set(first)
         for i in first:
             region.update(n.GetIdx() for n in mol.GetAtomWithIdx(i).GetNeighbors())
-        return sorted(region)
+        return sorted(region - claimed)
 
 
     def _get_binding_atoms_indices(self) -> List[int]:
         """
-        Detect the atom indices that match the binding motif.
+        Detect the atom indices that match the binding motifs, motif after motif.
+        """
+        binding_atoms: List[int] = []
+        for motif in self.binding_motifs:
+            binding_atoms += self._resolve_motif(motif, set(binding_atoms))
+        self.binding_atoms = binding_atoms
+
+        # One motif warns in _anchor_region; several sharing a SMARTS are checked together
+        if self.n_motifs > 1:
+            anchors = [m.anchor for m in self.binding_motifs if m.indices is None]
+            for anchor in dict.fromkeys(anchors):
+                groups: List[set] = []
+                for match in self.mol.GetSubstructMatches(Chem.MolFromSmarts(anchor)):
+                    if all(g.isdisjoint(match) for g in groups):
+                        groups.append(set(match))
+                if len(groups) > anchors.count(anchor):
+                    print(f"[Warning] anchor {anchor!r} matches {len(groups)} groups in ligand "
+                          f"{self.name or self.smiles}, but only {anchors.count(anchor)} "
+                          f"motif(s) use it; the other groups stay unbound.")
+        return self.binding_atoms
+
+
+    def _resolve_motif(self, motif: BindingMotif, claimed: set) -> List[int]:
+        """
+        Binding atom indices of one motif, never reusing `claimed` atoms.
         """
         symbols = self.atoms.get_chemical_symbols()
         coords  = self.atoms.get_positions()
 
-        binding_elems = list(self.binding_motif.atoms)
-        explicit = self.binding_motif.indices
+        binding_elems = list(motif.atoms)
+        explicit = motif.indices
 
         if explicit is not None:
             idx = [int(i) for i in explicit]
@@ -371,16 +554,17 @@ class Ligand:
                     )
             if len(set(idx)) != len(idx):
                 raise ValueError(f"binding motif indices must be distinct, got {idx}")
+            if not claimed.isdisjoint(idx):
+                raise ValueError(f"binding motif indices {idx} reuse atoms of another motif")
             for i, elem in zip(idx, binding_elems):
                 if symbols[i] != elem:
                     raise ValueError(
                         f"binding motif index {i} is {symbols[i]!r}, but the motif declares "
                         f"{elem!r}; the indices and the element symbols disagree"
                     )
-            self.binding_atoms = idx
-            return self.binding_atoms
+            return idx
 
-        region = self._anchor_region()
+        region = self._anchor_region(motif, claimed)
         cn = self._coordination_numbers()
 
         if len(binding_elems) == 2:
@@ -391,7 +575,7 @@ class Ligand:
 
             if len(idx1) == 0 or len(idx2) == 0:
                 raise ValueError(f"No atoms found for binding motif {binding_elems} "
-                                 f"around anchor {self.binding_motif.anchor!r}")
+                                 f"around anchor {motif.anchor!r}")
 
             best_pair = None
             best_key = None
@@ -413,7 +597,7 @@ class Ligand:
                     f"No distinct atom pair found for binding motif {binding_elems}"
                 )
 
-            self.binding_atoms = list(best_pair)
+            return list(best_pair)
 
         elif len(binding_elems) == 1:
             elem = binding_elems[0]
@@ -421,7 +605,7 @@ class Ligand:
             elem_indices = [i for i in region if symbols[i] == elem]
             if len(elem_indices) == 0:
                 raise ValueError(f"No atoms found for binding element {elem!r} "
-                                 f"around anchor {self.binding_motif.anchor!r}")
+                                 f"around anchor {motif.anchor!r}")
 
             elem_cn = cn[np.asarray(elem_indices, dtype=int)]
 
@@ -431,21 +615,25 @@ class Ligand:
             # choose the first one among candidates
             chosen_global = elem_indices[candidate_local[0]]
 
-            self.binding_atoms = [chosen_global]
+            return [chosen_global]
 
-        else:
-            raise NotImplementedError(
-                "Binding motifs with more than 2 atoms are not yet supported."
-            )
-
-        return self.binding_atoms
+        raise NotImplementedError(
+            "Binding motifs with more than 2 atoms are not yet supported."
+        )
 
 
     def _orient_ligand(self, n_angles: int = 720):
         """
         Orient the ligand so the binding axis is canonical and the body points up.
+
+        A ligand with several motifs is only centered on the mean of its anchors: its
+        orientation is set at placement, by fitting every anchor to its own site.
         """
         coords = self.atoms.get_positions()
+        if self.n_motifs > 1:
+            self.atoms.set_positions(coords - self.anchor_positions.mean(axis=0))
+            return None
+
         binding_idx = self.binding_atoms
         assert 2 >= len(binding_idx) > 0, "Need 1 or 2 binding atoms"
 
@@ -569,8 +757,10 @@ class LigandSpec:
         ligand (Ligand): The ligand to attach.
         site (Optional[str]): Which sublattice to target, one of "A", "B", or "X".
             This selects the binding sites explicitly instead of inferring them from
-            the ligand charge. If None, the target is inferred from the ligand charge
-            (positive -> A-site, otherwise X-site) for backward compatibility.
+            the ligand charge. If None, the target is taken from the motif's own ``site``
+            or, failing that, inferred from the ligand charge (positive -> A-site,
+            otherwise X-site) for backward compatibility. Ligands with several motifs
+            take the site of each motif and leave this None.
         coverage (Optional[float]): Fractional coverage of available binding sites.
         binding_sites (Optional[list[int]]): Explicit surface site indices to use.
         anchor_offset (float): Offset (Å) along the binding axis. When `adsorb` is
@@ -593,5 +783,25 @@ class LigandSpec:
             raise ValueError(
                 f"site must be one of 'A', 'B', 'X' (or None); got {self.site!r}"
             )
+        motifs = self.ligand.binding_motifs
+        if len(motifs) == 1 and motifs[0].site is not None:
+            if self.site is None:
+                self.site = motifs[0].site
+            elif self.site != motifs[0].site:
+                raise ValueError(
+                    f"LigandSpec.site={self.site!r} contradicts the motif's site={motifs[0].site!r}"
+                )
+        elif len(motifs) > 1:
+            if self.site is not None:
+                raise ValueError(
+                    "LigandSpec.site applies to single-motif ligands; give each BindingMotif "
+                    "of a multi-motif ligand its own site instead"
+                )
+            missing = [k for k, m in enumerate(motifs) if m.site is None]
+            if missing:
+                raise ValueError(
+                    f"every motif of a multi-motif ligand needs a site ('A', 'B' or 'X'); "
+                    f"motif(s) {missing} of ligand {self.ligand.name!r} have none"
+                )
         if self.name is None:
             self.name = self.ligand.name

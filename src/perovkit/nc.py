@@ -96,6 +96,8 @@ class NanoCrystal:
     ) -> None:
 
         assert not self.ligands, "Ligands have already been placed."
+        if any(spec.ligand.n_motifs > 1 for spec in self.ligand_specs):
+            raise NotImplementedError("Placing ligands with several binding motifs is not supported yet.")
 
         log = print if verbose else (lambda *a, **k: None)
 
@@ -739,22 +741,7 @@ class NanoCrystal:
         type_counts: Dict[int, int] = {}
 
         for lig in self.ligands:
-            key = (
-                lig.name,
-                lig.smiles,
-                lig.charge,
-                tuple(lig.binding_motif.atoms),
-                lig.binding_motif.anchor,
-                # The anchor is part of the ligand TYPE, not an incidental attribute: the
-                # per-type metadata below stores one binding_motif_indices and one
-                # binding_atoms_indices for every instance sharing this key. Without these two
-                # entries, two placements of the same molecule anchored through DIFFERENT atoms
-                # collide into one type and both reload with the first one's anchor, silently.
-                # `from_smiles` derives charge from the SMILES and defaults name to None, so
-                # that collision needs no user opt-in.
-                tuple(lig.binding_motif.indices) if lig.binding_motif.indices else None,
-                tuple(getattr(lig, "binding_atoms", []) or ()),
-            )
+            key = lig._type_key()
 
             if key not in type_key_to_id:
                 type_id = len(ligand_types_meta)
@@ -764,14 +751,7 @@ class NanoCrystal:
                 ligand_types_meta.append(
                     {
                         "id": type_id,
-                        "name": lig.name,
-                        "smiles": lig.smiles,
-                        "charge": lig.charge,
-                        "binding_motif_atoms": list(lig.binding_motif.atoms),
-                        "binding_motif_anchor": lig.binding_motif.anchor,
-                        "binding_motif_indices": (list(lig.binding_motif.indices)
-                                                  if lig.binding_motif.indices else None),
-                        "binding_atoms_indices": list(getattr(lig, "binding_atoms", [])),
+                        **lig._type_metadata(),
                         "coverage": self.ligand_coverage.get(lig.name),
                         "n_atoms": len(lig.atoms),
                         "volume": float(lig.volume),
@@ -790,29 +770,14 @@ class NanoCrystal:
 
         ligands_meta = []
         for i, lig in enumerate(self.ligands):
-            key = (
-                lig.name,
-                lig.smiles,
-                lig.charge,
-                tuple(lig.binding_motif.atoms),
-                lig.binding_motif.anchor,
-                # The anchor is part of the ligand TYPE, not an incidental attribute: the
-                # per-type metadata below stores one binding_motif_indices and one
-                # binding_atoms_indices for every instance sharing this key. Without these two
-                # entries, two placements of the same molecule anchored through DIFFERENT atoms
-                # collide into one type and both reload with the first one's anchor, silently.
-                # `from_smiles` derives charge from the SMILES and defaults name to None, so
-                # that collision needs no user opt-in.
-                tuple(lig.binding_motif.indices) if lig.binding_motif.indices else None,
-                tuple(getattr(lig, "binding_atoms", []) or ()),
-            )
+            key = lig._type_key()
             spec_id = type_key_to_id[key]
 
             ligands_meta.append(
                 {   
                     "ligand_id": i,
                     "spec_id": spec_id,
-                    "plane": list(lig.plane),
+                    **lig._instance_metadata(),
                 }
             )
 
@@ -936,7 +901,7 @@ class NanoCrystal:
                 binding_motif=BindingMotif._from_metadata(tmeta),
                 name=tmeta["name"],
                 id=inst_meta["ligand_id"],
-                plane=inst_meta["plane"],
+                planes=Ligand._planes_from_metadata(inst_meta),
                 volume=tmeta["volume"],
                 binding_atoms=binding_atoms,
             )
@@ -1082,7 +1047,7 @@ class NanoCrystal:
                     binding_motif=motifs[spec_id],
                     name=tmeta["name"],
                     id=inst_meta["ligand_id"],
-                    plane=inst_meta["plane"],
+                    planes=Ligand._planes_from_metadata(inst_meta),
                     volume=tmeta["volume"],
                     binding_atoms=binding_atoms,
                 )
