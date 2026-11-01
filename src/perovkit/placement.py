@@ -7,11 +7,13 @@ their site; multi-motif ligands spin about the axis through their anchors when t
 anchors leave it free, and are otherwise rigid.
 """
 from __future__ import annotations
+from concurrent.futures import ProcessPoolExecutor
 import math
 import random
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
+from scipy.spatial import cKDTree
 
 from .constellation import Candidate, ConstellationSampler, rotations_about_axis
 from .core import BindingSite
@@ -121,23 +123,84 @@ class MultiMotifPose:
         return k
 
 
-def stretch_pose(pose: MultiMotifPose, core_tree, cutoff: float) -> bool:
-    """
-    Put a stretched copy of the pose's best variant first: its dangling chains anti and
-    raised along the mean normal of its sites, its anchors untouched. Returns whether the
-    pose now starts stretched: it had chains to stretch and the result clears the core,
-    or site selection already stretched it.
-    """
-    if pose.origins[pose.variant] == "stretched":
-        return True
+def _site_normal(pose: MultiMotifPose) -> np.ndarray:
     normal = np.mean([np.asarray(s.plane, dtype=float) / np.linalg.norm(s.plane)
                       for s in pose.candidate.sites], axis=0)
-    res = stretch(pose.ligand.torsion_model(), pose.variants[0], pose.ligand.binding_groups,
-                  pose.candidate.targets, normal / np.linalg.norm(normal), [core_tree], cutoff + 0.2)
-    if res is None or float(core_tree.query(res.coords)[0].min()) < cutoff:
-        return False
-    pose.variant = pose.add_variant(res.coords, origin="stretched", first=True)
-    return True
+    return normal / np.linalg.norm(normal)
+
+
+_WORKER_CORE = None
+
+
+def _single_threaded_blas() -> None:
+    """
+    Run the OpenBLAS that scipy uses on one thread (Linux; silently nothing elsewhere).
+    Every L-BFGS step calls into it, which wakes all its threads (64 here); in a pool of
+    workers those threads starved each other, and adding workers made stretching slower.
+    The copy bundled with numpy wheels is left alone: the refinement barely uses it, and
+    resetting it in a forked worker cost more than it saved.
+    """
+    import ctypes
+    try:
+        paths = {line.split()[-1] for line in open("/proc/self/maps")
+                 if "openblas" in line and "/numpy.libs/" not in line}
+    except OSError:
+        return
+    for path in paths:
+        try:
+            lib = ctypes.CDLL(path)
+        except OSError:
+            continue
+        for name in ("scipy_openblas_set_num_threads64_", "scipy_openblas_set_num_threads",
+                     "openblas_set_num_threads64_", "openblas_set_num_threads"):
+            if hasattr(lib, name):
+                getattr(lib, name)(1)
+
+
+def _init_stretch_worker(core_points: np.ndarray) -> None:
+    global _WORKER_CORE
+    _single_threaded_blas()
+    _WORKER_CORE = cKDTree(core_points)
+
+
+def _stretch_job(job: tuple) -> Optional[np.ndarray]:
+    model, coords, groups, targets, normal, contact = job
+    res = stretch(model, coords, groups, targets, normal, [_WORKER_CORE], contact)
+    return None if res is None else res.coords
+
+
+def stretch_poses(poses: Sequence, core_tree, cutoff: float, n_workers: int = 1) -> int:
+    """
+    Put a stretched copy of each multi-motif pose's best variant first: its dangling
+    chains anti and raised along the mean normal of its sites, its anchors untouched.
+
+    Stretching sees only the core, so the ligands are independent and, with `n_workers`
+    above 1, go to that many processes; each builds the core tree once.
+
+    Returns:
+        How many poses now start stretched: they had chains to stretch and the result
+        clears the core, or site selection had already stretched them.
+    """
+    multi_motif_poses = [p for p in poses if isinstance(p, MultiMotifPose)]
+    done = sum(p.origins[p.variant] == "stretched" for p in multi_motif_poses)
+    todo = [p for p in multi_motif_poses
+            if p.origins[p.variant] != "stretched" and p.ligand.torsion_model().tails.any()]
+    jobs = [(p.ligand.torsion_model(), p.variants[0], p.ligand.binding_groups,
+             p.candidate.targets, _site_normal(p), cutoff + 0.2) for p in todo]
+    if n_workers > 1 and len(jobs) > 1:
+        with ProcessPoolExecutor(max_workers=min(n_workers, len(jobs)),
+                                 initializer=_init_stretch_worker,
+                                 initargs=(core_tree.data,)) as pool:
+            results = list(pool.map(_stretch_job, jobs,
+                                    chunksize=max(1, len(jobs) // (4 * n_workers))))
+    else:
+        results = [None if (r := stretch(*job[:4], job[4], [core_tree], job[5])) is None else r.coords
+                   for job in jobs]
+    for pose, coords in zip(todo, results):
+        if coords is not None and float(core_tree.query(coords)[0].min()) >= cutoff:
+            pose.variant = pose.add_variant(coords, origin="stretched", first=True)
+            done += 1
+    return done
 
 
 # Soft-sphere radii (cutoff + margin) tried in turn. A wide margin clears contacts with

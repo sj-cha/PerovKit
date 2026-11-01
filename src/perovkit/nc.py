@@ -21,7 +21,7 @@ from .ligand import Ligand, LigandSpec, BindingMotif
 from .constellation import ConstellationSampler
 from .placement import (SingleMotifPose, MultiMotifPose, bounding_spheres, optimize_pose,
                         place_about_normal, motif_pools, refine_clusters, refine_pose,
-                        select_constellations, stretch_pose, tree_min_distance)
+                        select_constellations, stretch_poses, tree_min_distance)
 from .utils.geometry import farthest_point_sampling, per_face_farthest_point_sampling, compute_bounding_spheres, build_neighbor_map
 
 
@@ -105,6 +105,7 @@ class NanoCrystal:
         max_anchor_rmsd: float = 0.5,   # Å
         refine_torsions: bool = True,
         stretch_tails: bool = True,
+        n_workers: int = 1,
     ) -> None:
 
         assert not self.ligands, "Ligands have already been placed."
@@ -232,10 +233,10 @@ class NanoCrystal:
         # surface before packing: a coiled library conformer tangles with its neighbors
         n_stretched = 0
         if stretch_tails:
-            multi_motif_poses = [p for p in poses if isinstance(p, MultiMotifPose)]
-            n_stretched = sum(stretch_pose(p, self._core_tree, self.overlap_cutoff) for p in multi_motif_poses)
+            n_stretched = stretch_poses(poses, self._core_tree, self.overlap_cutoff, n_workers)
             if n_stretched:
-                log(f"[Log] Stretched the tails of {n_stretched} of {len(multi_motif_poses)} multi-motif ligands.")
+                n_multi = sum(isinstance(p, MultiMotifPose) for p in poses)
+                log(f"[Log] Stretched the tails of {n_stretched} of {n_multi} multi-motif ligands.")
 
         # Initialize rotation angles and current coordinates; multi-motif ligands start
         # from the spin their constellation fit chose
