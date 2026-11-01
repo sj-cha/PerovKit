@@ -240,6 +240,7 @@ class ConstellationSampler:
         n_refine: int = 8,
     ):
         self.core_tree, self.core_map = tree_builder(np.asarray(core_positions, dtype=float))
+        self._n_core = len(core_positions)
         self.tree_builder = tree_builder
         self.mic = mic
         self.rng = rng
@@ -667,24 +668,32 @@ class ConstellationSampler:
     def _core_clearance(self, coords: np.ndarray, excluded: np.ndarray, k: int = 8) -> np.ndarray:
         """
         Per-pose distance to the nearest core atom not in `excluded`: (S,) for (S, m, 3).
+
+        Only contacts up to overlap_cutoff + 0.5 Å are searched, inf beyond: every use of
+        the result looks at contacts below the cutoff, and bounding the search is what
+        makes the scan over spins and fits affordable.
         """
         S, m, _ = coords.shape
         n = self.core_tree.n
-        dist, idx = self.core_tree.query(coords.reshape(-1, 3), k=min(k, n))
+        dist, idx = self.core_tree.query(coords.reshape(-1, 3), k=min(k, n),
+                                         distance_upper_bound=self.overlap_cutoff + 0.5)
         dist = dist.reshape(S * m, -1)
         idx = idx.reshape(S * m, -1)
         valid = idx < n
-        atom = np.where(valid, self.core_map[np.minimum(idx, n - 1)], -1)
-        dist = np.where(valid & ~np.isin(atom, excluded), dist, np.inf)
+        blocked = np.zeros(self._n_core + 1, dtype=bool)   # last slot: no neighbor found
+        blocked[np.asarray(excluded, dtype=int)] = True
+        atom = np.where(valid, self.core_map[np.minimum(idx, n - 1)], self._n_core)
+        dist = np.where(valid & ~blocked[atom], dist, np.inf)
         return dist.min(axis=1).reshape(S, m).min(axis=1)
 
 
     def _ligand_clearance(self, coords: np.ndarray) -> np.ndarray:
         """
-        Per-pose distance to the nearest atom of an already placed ligand: (S,).
+        Per-pose distance to the nearest atom of an already placed ligand: (S,), inf beyond
+        overlap_cutoff, where it no longer counts as crowding.
         """
         if self._lig_tree is None:
             return np.full(len(coords), np.inf)
         tree, _ = self._lig_tree
-        dist, _ = tree.query(coords.reshape(-1, 3), k=1)
+        dist, _ = tree.query(coords.reshape(-1, 3), k=1, distance_upper_bound=self.overlap_cutoff)
         return dist.reshape(coords.shape[0], -1).min(axis=1)
