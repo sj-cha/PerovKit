@@ -33,6 +33,31 @@ def rotations_about_axis(axis: np.ndarray, thetas: np.ndarray) -> np.ndarray:
     return np.eye(3) + s * K + (1.0 - c) * (K @ K)
 
 
+def assign_faces(sites: Sequence[BindingSite]) -> List[tuple]:
+    """
+    The face each site counts toward when spreading ligands over a nanocrystal.
+
+    A site on a face counts toward it. A site on an edge or corner lies on two or three
+    faces at once: along each edge (or among the corners of one kind) the sites are dealt
+    to those faces in turn, so that every face gets its share instead of all edges going
+    to one axis. On a slab every site keeps its plane.
+    """
+    faces: List[Optional[tuple]] = [None] * len(sites)
+    shared: Dict[tuple, List[int]] = {}
+    for i, s in enumerate(sites):
+        plane = tuple(int(v) for v in s.plane)
+        if sum(v != 0 for v in plane) <= 1:
+            faces[i] = plane
+        else:
+            shared.setdefault(plane, []).append(i)
+    for plane, idx in shared.items():
+        options = [tuple(v if a == ax else 0 for a, v in enumerate(plane))
+                   for ax in range(3) if plane[ax] != 0]
+        for k, i in enumerate(sorted(idx, key=lambda i: tuple(sites[i].position))):
+            faces[i] = options[k % len(options)]
+    return faces
+
+
 @dataclass
 class Fit:
     """
@@ -230,6 +255,7 @@ class ConstellationSampler:
         self.n_refine = n_refine
         self.placed: List[np.ndarray] = []
         self._lig_tree = None
+        self.occupancy: Dict[tuple, float] = {}
 
 
     @staticmethod
@@ -253,8 +279,16 @@ class ConstellationSampler:
         groups: Optional[List[List[int]]] = None,
     ) -> Tuple[List[Candidate], Counter]:
         """
-        Accept up to `n_target` constellations, seeding them in farthest-point order over
-        the first motif's pool so that they spread over the surface.
+        Accept up to `n_target` constellations, spread evenly over the faces of the surface.
+
+        Seeds are the first motif's sites, grouped by face (see assign_faces: edge and
+        corner sites are shared out among their faces; a slab surface is one face). The next
+        seed comes from the face whose occupancy, ligands accepted over its capacity, is
+        lowest; the capacity of a face is its free sites of the first motif's type divided
+        by the motifs needing that type, so occupancy evens out per site, as coverage is
+        defined, even where faces lost different numbers of sites. Within the face the seed
+        is the one farthest from every occupied site, recomputed after each acceptance. A
+        face whose seeds fail simply stays behind, and the other faces take up the shortfall.
 
         Args:
             lib (ConformerLibrary): Conformers of the ligand.
@@ -270,18 +304,51 @@ class ConstellationSampler:
         """
         accepted: List[Candidate] = []
         failures: Counter = Counter()
-        for i in self._fps_order(pools[0]):
-            if len(accepted) >= n_target:
+        seeds = pools[0]
+        if not seeds:
+            return accepted, failures
+        per_ligand = sum(p is seeds for p in pools)   # motifs drawing on the seed pool
+
+        faces: Dict[tuple, List[int]] = {}
+        for i, (s, f) in enumerate(zip(seeds, assign_faces(seeds))):
+            if not s.passivated:
+                faces.setdefault(f, []).append(i)
+        capacity = {f: len(ix) / per_ligand for f, ix in faces.items()}
+        placed: Counter = Counter()
+
+        X = np.array([s.position for s in seeds], dtype=float)
+        sites = {id(s): s for p in pools for s in p}.values()
+        taken = np.array([s.position for s in sites if s.passivated], dtype=float).reshape(-1, 3)
+        gap = np.full(len(seeds), np.inf)
+        for y in taken:
+            gap = np.minimum(gap, np.linalg.norm(self.mic(X - y), axis=1))
+        tried = np.zeros(len(seeds), dtype=bool)
+
+        while len(accepted) < n_target:
+            open_faces = [f for f, ix in faces.items()
+                          if any(not tried[i] and not seeds[i].passivated for i in ix)]
+            if not open_faces:
                 break
-            if pools[0][i].passivated:
-                continue
-            cand, reason = self._best_candidate(lib, pools, pools[0][i], anchor_offset, replace,
+            face = min(open_faces, key=lambda f: (placed[f] / capacity[f], -capacity[f], f))
+            free = [i for i in faces[face] if not tried[i] and not seeds[i].passivated]
+            if np.isinf(gap[free]).all():
+                i = free[self.rng.randint(0, len(free) - 1)]
+            else:
+                i = free[int(np.argmax(gap[free]))]
+            tried[i] = True
+
+            cand, reason = self._best_candidate(lib, pools, seeds[i], anchor_offset, replace,
                                                 model, groups)
             if cand is None:
                 failures[reason] += 1
                 continue
             self.accept(cand, lib, replace)
             accepted.append(cand)
+            placed[face] += 1
+            for s in cand.sites:
+                gap = np.minimum(gap, np.linalg.norm(self.mic(X - s.position), axis=1))
+
+        self.occupancy = {f: placed[f] / capacity[f] for f in faces}
         return accepted, failures
 
 
@@ -328,25 +395,6 @@ class ConstellationSampler:
                 s.passivated = True
                 n += 1
         return n
-
-
-    def _fps_order(self, pool: List[BindingSite]) -> List[int]:
-        """
-        Farthest-point ordering of a pool under the minimum-image convention.
-        """
-        n = len(pool)
-        if n == 0:
-            return []
-        X = np.array([s.position for s in pool], dtype=float)
-        order = [self.rng.randint(0, n - 1)]
-        d = np.linalg.norm(self.mic(X - X[order[0]]), axis=1)
-        d[order[0]] = -1.0
-        while len(order) < n:
-            nxt = int(np.argmax(d))
-            order.append(nxt)
-            d = np.minimum(d, np.linalg.norm(self.mic(X - X[nxt]), axis=1))
-            d[order] = -1.0
-        return order
 
 
     def _constellations(
