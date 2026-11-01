@@ -21,7 +21,7 @@ from .ligand import Ligand, LigandSpec, BindingMotif
 from .constellation import ConstellationSampler
 from .placement import (SingleMotifPose, MultiMotifPose, bounding_spheres, optimize_pose,
                         place_about_normal, motif_pools, refine_clusters, refine_pose,
-                        select_constellations)
+                        select_constellations, stretch_pose, tree_min_distance)
 from .utils.geometry import farthest_point_sampling, per_face_farthest_point_sampling, compute_bounding_spheres, build_neighbor_map
 
 
@@ -104,6 +104,7 @@ class NanoCrystal:
         verbose: bool = True,
         max_anchor_rmsd: float = 0.5,   # Å
         refine_torsions: bool = True,
+        stretch_tails: bool = True,
     ) -> None:
 
         assert not self.ligands, "Ligands have already been placed."
@@ -227,11 +228,27 @@ class NanoCrystal:
 
         self._core_tree = core_tree
 
+        # Straighten the dangling chains of multi-motif ligands and raise them off the
+        # surface before packing: a coiled library conformer tangles with its neighbors
+        n_stretched = 0
+        if stretch_tails:
+            multi_motif_poses = [p for p in poses if isinstance(p, MultiMotifPose)]
+            n_stretched = sum(stretch_pose(p, self._core_tree, self.overlap_cutoff) for p in multi_motif_poses)
+            if n_stretched:
+                log(f"[Log] Stretched the tails of {n_stretched} of {len(multi_motif_poses)} multi-motif ligands.")
+
         # Initialize rotation angles and current coordinates; multi-motif ligands start
         # from the spin their constellation fit chose
         thetas = np.array([2.0 * math.pi * self._rng.random() if p.random_start else 0.0
                            for p in poses], dtype=float)
-        ligand_coords_list: List[np.ndarray] = [p.coords(t) for p, t in zip(poses, thetas)]
+        ligand_coords_list: List[np.ndarray] = [p.coords(t, getattr(p, "variant", 0))
+                                                for p, t in zip(poses, thetas)]
+
+        # Stretched chains leave few, shallow contacts: relax them all together while the
+        # shell is still upright, before single ligands start turning
+        if n_stretched and refine_torsions:
+            refine_clusters(poses, ligand_coords_list, self._core_tree, *self._sampler_geometry(),
+                            self._exact_min_distance, self.overlap_cutoff, max_anchor_rmsd)
 
         # Rotation optimization loop
         centers, radii = bounding_spheres(poses, ligand_coords_list)
@@ -264,24 +281,28 @@ class NanoCrystal:
                 neighbor_idx = neighbor_map.get(i, [])
                 neighbors_coords = [ligand_coords_list[j] for j in neighbor_idx]
 
-                d_old = dists[i]
+                # A multi-motif ligand is judged by its closest contact of either kind:
+                # _min_distance stops at a core contact, which would let a long ligand
+                # trade a sliver of core distance for running its tail through a neighbor
+                multi = isinstance(poses[i], MultiMotifPose)
+                min_distance = self._exact_min_distance if multi else self._min_distance
+                d_old = min_distance(ligand_coords_list[i], neighbors_coords) if multi else dists[i]
 
                 best_theta, best_variant, best_coords = self._optimize_rotation(
                     poses[i],
                     neighbors_coords,
                 )
-                d_new = self._min_distance(best_coords, neighbors_coords)
+                d_new = min_distance(best_coords, neighbors_coords)
 
                 # Multi-motif ligands that turning cannot clear may still bend out of the way.
                 # Bending can reach past the neighbor spheres, so every other ligand counts.
-                if (refine_torsions and isinstance(poses[i], MultiMotifPose)
-                        and d_new < self.overlap_cutoff):
+                if refine_torsions and multi and d_new < self.overlap_cutoff:
                     others = [c for j, c in enumerate(ligand_coords_list) if j != i]
                     refined = refine_pose(poses[i], best_coords, others, self._core_tree,
                                           self._sampler_geometry()[0], self.overlap_cutoff,
-                                          max_anchor_rmsd)
+                                          max_anchor_rmsd, min_distance)
                     if refined is not None:
-                        d_ref = self._min_distance(refined, others)
+                        d_ref = min_distance(refined, others)
                         if d_ref > d_new:
                             best_theta, best_variant = 0.0, poses[i].add_variant(refined)
                             best_coords, d_new = refined, d_ref
@@ -291,7 +312,7 @@ class NanoCrystal:
                     thetas[i] = best_theta
                     poses[i].variant = best_variant
                     improved = True
-                    if isinstance(poses[i], MultiMotifPose):
+                    if multi:
                         # a refined variant may reach farther: let the ligands still to move see it
                         centers, radii = bounding_spheres(poses, ligand_coords_list)
                         neighbor_map = build_neighbor_map(centers, radii, self.overlap_cutoff)
@@ -300,7 +321,7 @@ class NanoCrystal:
                 # nobody could move alone: let jammed multi-motif ligands give way together
                 improved = refine_clusters(
                     poses, ligand_coords_list, self._core_tree, *self._sampler_geometry(),
-                    self._min_distance, self.overlap_cutoff, max_anchor_rmsd,
+                    self._exact_min_distance, self.overlap_cutoff, max_anchor_rmsd,
                 )
 
             if not improved:
@@ -334,8 +355,7 @@ class NanoCrystal:
                 np.linalg.norm((p.ligand.anchor_positions - p.candidate.targets), axis=1)
                 for p in multi_motif_poses
             ])
-            bent = sum(p.variant >= len(p.candidate.fits) or p.candidate.fits[p.variant].xyz is not None
-                       for p in multi_motif_poses)
+            bent = sum(p.origins[p.variant] != "fit" for p in multi_motif_poses)
             log(f"[Log] Multi-motif anchors sit {dev.mean():.2f} Å (max {dev.max():.2f} Å) from their sites; "
                 f"{bent} of {len(multi_motif_poses)} ligands refined in torsion space.")
 
@@ -590,15 +610,27 @@ class NanoCrystal:
         return (lambda pts: (cKDTree(pts), np.arange(len(pts)))), (lambda d: d)
 
 
+    def _exact_min_distance(self, coords: np.ndarray, neighbors_coords: List[np.ndarray]) -> float:
+        """
+        Closest contact of `coords` with the core or any of `neighbors_coords`.
+        """
+        return tree_min_distance(self._core_tree, self._sampler_geometry()[0], self.overlap_cutoff,
+                                 neighbors_coords, early_core=False)(coords)
+
+
     def _optimize_rotation(
         self,
         pose: SingleMotifPose | MultiMotifPose,
         neighbors_coords: List[np.ndarray],
     ) -> Tuple[float, int, np.ndarray]:
+        min_distance = self._min_distance
+        if isinstance(pose, MultiMotifPose):
+            min_distance = tree_min_distance(self._core_tree, self._sampler_geometry()[0],
+                                             self.overlap_cutoff, neighbors_coords, early_core=False)
         return optimize_pose(
             pose,
             neighbors_coords,
-            self._min_distance,
+            min_distance,
             self._rng,
             self.overlap_cutoff,
             self.coarse_step_deg,

@@ -16,7 +16,7 @@ import numpy as np
 from .constellation import Candidate, ConstellationSampler, rotations_about_axis
 from .core import BindingSite
 from .ligand import Ligand, LigandSpec
-from .refine import refine, refine_joint
+from .refine import refine, refine_joint, stretch
 from .utils.geometry import compute_bounding_spheres
 from .utils.rotation import rotation_about_axis, rotation_from_u_to_v
 
@@ -77,7 +77,8 @@ class MultiMotifPose:
     """
     Multi-motif ligand fitted to a constellation. Variants are coordinates of the
     candidate's alternative conformer fits, best first, followed by any refined ones;
-    theta is the spin about the anchor axis relative to each variant.
+    a stretched variant goes first. `origins` says where each came from ("fit",
+    "refined", "stretched"); theta is the spin about the anchor axis relative to each.
     """
     random_start = False
 
@@ -89,6 +90,7 @@ class MultiMotifPose:
         self.axis = candidate.fits[0].axis
         self.spins = self.axis is not None
         self.variants = [f.coords(lib) for f in candidate.fits]
+        self.origins = ["refined" if f.xyz is not None else "fit" for f in candidate.fits]
         self.variant = 0
         self.reach = 0.0
         for x in self.variants:
@@ -109,10 +111,36 @@ class MultiMotifPose:
         R = rotations_about_axis(self.axis, np.array([theta]))[0]
         return (x - self.center) @ R.T + self.center
 
-    def add_variant(self, coords: np.ndarray) -> int:
-        self.variants.append(np.array(coords, dtype=float))
-        self._extend_reach(self.variants[-1])
-        return len(self.variants) - 1
+    def add_variant(self, coords: np.ndarray, origin: str = "refined", first: bool = False) -> int:
+        k = 0 if first else len(self.variants)
+        self.variants.insert(k, np.array(coords, dtype=float))
+        self.origins.insert(k, origin)
+        if first:
+            self.variant += 1
+        self._extend_reach(self.variants[k])
+        return k
+
+
+def stretch_pose(pose: MultiMotifPose, core_tree, cutoff: float) -> bool:
+    """
+    Put a stretched copy of the pose's best variant first: its dangling chains anti and
+    raised along the mean normal of its sites, its anchors untouched. Returns whether the
+    ligand had chains to stretch and the result clears the core.
+    """
+    normal = np.mean([np.asarray(s.plane, dtype=float) / np.linalg.norm(s.plane)
+                      for s in pose.candidate.sites], axis=0)
+    res = stretch(pose.ligand.torsion_model(), pose.variants[0], pose.ligand.binding_groups,
+                  pose.candidate.targets, normal / np.linalg.norm(normal), [core_tree], cutoff + 0.2)
+    if res is None or float(core_tree.query(res.coords)[0].min()) < cutoff:
+        return False
+    pose.variant = pose.add_variant(res.coords, origin="stretched", first=True)
+    return True
+
+
+# Soft-sphere radii (cutoff + margin) tried in turn. A wide margin clears contacts with
+# room to spare, but in a dense shell it also pushes on every contact that is already
+# fine, and can leave a real one below the cutoff; the narrow one then acts on those alone.
+MARGINS = (0.2, 0.05)
 
 
 def refine_pose(
@@ -123,19 +151,30 @@ def refine_pose(
     tree_builder: Callable,
     cutoff: float,
     max_rmsd: float,
+    min_distance: Callable,
 ) -> Optional[np.ndarray]:
     """
     Refine a multi-motif ligand in torsion space against the core and its neighbors.
 
-    Returns the refined coordinates, or None when the anchors would end farther than
-    `max_rmsd` (RMS, Å) from their sites.
+    Returns the refined coordinates with the largest `min_distance(coords, neighbors)`,
+    stopping at the first margin that clears `cutoff`, or None when every attempt leaves
+    the anchors farther than `max_rmsd` (RMS, Å) from their sites.
     """
     trees = [core_tree]
     if neighbors_coords:
         trees.append(tree_builder(np.vstack(neighbors_coords))[0])
-    res = refine(pose.ligand.torsion_model(), coords, pose.ligand.binding_groups,
-                 pose.candidate.targets, trees, contact=cutoff + 0.2)
-    return res.coords if res.anchor_rmsd <= max_rmsd else None
+    best, best_d = None, -float("inf")
+    for margin in MARGINS:
+        res = refine(pose.ligand.torsion_model(), coords, pose.ligand.binding_groups,
+                     pose.candidate.targets, trees, contact=cutoff + margin)
+        if res.anchor_rmsd > max_rmsd:
+            continue
+        d = min_distance(res.coords, neighbors_coords)
+        if d > best_d:
+            best, best_d = res.coords, d
+        if best_d >= cutoff:
+            break
+    return best
 
 
 def bounding_spheres(poses: Sequence, coords_list: List[np.ndarray]) -> Tuple[np.ndarray, np.ndarray]:
@@ -150,6 +189,31 @@ def bounding_spheres(poses: Sequence, coords_list: List[np.ndarray]) -> Tuple[np
             centers[i] = pose.center
             radii[i] = pose.reach
     return centers, radii
+
+
+def tree_min_distance(
+    core_tree,
+    tree_builder: Callable,
+    cutoff: float,
+    neighbors_coords: List[np.ndarray],
+    early_core: bool = True,
+) -> Callable:
+    """
+    The structures' _min_distance against one fixed set of neighbors, from a tree built
+    once: a long multi-motif ligand has nearly every other ligand as a neighbor, and the
+    rotation search evaluates it at every spin and variant. With `early_core`, like
+    _min_distance, a core contact below `cutoff` is returned without looking at the
+    ligands; without it, the result is the closest contact of either kind.
+    """
+    tree = tree_builder(np.vstack(neighbors_coords))[0] if neighbors_coords else None
+
+    def min_distance(coords: np.ndarray, _neighbors=None) -> float:
+        d_core = float(core_tree.query(coords)[0].min()) if core_tree is not None else float("inf")
+        if (early_core and d_core < cutoff) or tree is None:
+            return d_core
+        return min(d_core, float(tree.query(coords, k=1)[0].min()))
+
+    return min_distance
 
 
 def optimize_pose(
@@ -233,11 +297,12 @@ def refine_clusters(
     Refine jammed multi-motif ligands together, for when no ligand can clear its contacts
     alone.
 
-    Ligands closer than `cutoff` form a contact graph; in every connected component, the
-    multi-motif members are refined jointly against the core and all other ligands, and
-    pushed apart from each other where they come within `cutoff` + 0.2 Å. A component's
-    result replaces its poses only if its anchors stay within `max_rmsd` and its closest
-    contact improves. Updates `coords_list` and the poses in place.
+    Ligands closer than `cutoff` form a contact graph; in every connected component with a
+    contact below the cutoff (a single ligand touching the core included), the multi-motif
+    members are refined jointly against the core and all other ligands, and pushed apart
+    from each other wherever they come within `cutoff` + margin (see MARGINS). A result
+    replaces the poses only if its anchors stay within `max_rmsd` and its closest contact
+    improves. Updates `coords_list` and the poses in place.
 
     Returns:
         Whether any component improved.
@@ -266,35 +331,39 @@ def refine_clusters(
     for i in range(n):
         components.setdefault(root(i), []).append(i)
 
+    def closest(coords, i):
+        return min_distance(coords[i], [c for j, c in enumerate(coords) if j != i])
+
     improved = False
     for comp in components.values():
         members = [i for i in comp if isinstance(poses[i], MultiMotifPose)]
-        if len(comp) < 2 or not members:
+        if not members:
             continue
+        before = min(closest(coords_list, i) for i in members)
+        if before >= cutoff:
+            continue  # nothing to clear: a lone ligand with no contact below the cutoff
         others = [c for j, c in enumerate(coords_list) if j not in members]
-        before = min(min_distance(coords_list[i], [c for j, c in enumerate(coords_list) if j != i])
-                     for i in members)
-        local = {i: k for k, i in enumerate(members)}
-        pairs = [(local[a], local[b]) for (a, b) in close if a in local and b in local]
         trees = [core_tree, tree_builder(np.vstack(others))[0] if others else None]
-        results = refine_joint(
-            [poses[i].ligand.torsion_model() for i in members],
-            [coords_list[i] for i in members],
-            [poses[i].ligand.binding_groups for i in members],
-            [poses[i].candidate.targets for i in members],
-            trees, cutoff + 0.2, pairs, mic,
-        )
-        if any(r.anchor_rmsd > max_rmsd for r in results):
-            continue
-        trial = list(coords_list)
-        for i, r in zip(members, results):
-            trial[i] = r.coords
-        after = min(min_distance(trial[i], [c for j, c in enumerate(trial) if j != i]) for i in members)
-        if after > before + 1e-3:
+        for margin in MARGINS:
+            results = refine_joint(
+                [poses[i].ligand.torsion_model() for i in members],
+                [coords_list[i] for i in members],
+                [poses[i].ligand.binding_groups for i in members],
+                [poses[i].candidate.targets for i in members],
+                trees, cutoff + margin, tree_builder,
+            )
+            if any(r.anchor_rmsd > max_rmsd for r in results):
+                continue
+            trial = list(coords_list)
             for i, r in zip(members, results):
-                coords_list[i] = r.coords
-                poses[i].variant = poses[i].add_variant(r.coords)
-            improved = True
+                trial[i] = r.coords
+            after = min(closest(trial, i) for i in members)
+            if after > before + 1e-3:
+                for i, r in zip(members, results):
+                    coords_list[i] = r.coords
+                    poses[i].variant = poses[i].add_variant(r.coords)
+                improved = True
+                break
     return improved
 
 

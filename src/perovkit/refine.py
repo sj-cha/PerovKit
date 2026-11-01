@@ -25,6 +25,18 @@ def _rotation(u: np.ndarray, phi: float) -> np.ndarray:
     return np.eye(3) + np.sin(phi) * K + (1.0 - np.cos(phi)) * (K @ K)
 
 
+def _dihedral(p: np.ndarray) -> float:
+    """
+    Dihedral angle (radians) of four points, positive for a right-handed turn of p[3]
+    about the axis p[1] -> p[2].
+    """
+    b1 = p[2] - p[1]
+    b1 = b1 / np.linalg.norm(b1)
+    v = (p[0] - p[1]) - np.dot(p[0] - p[1], b1) * b1
+    w = (p[3] - p[2]) - np.dot(p[3] - p[2], b1) * b1
+    return float(np.arctan2(np.dot(np.cross(b1, v), w), np.dot(v, w)))
+
+
 def _euler(a: float, b: float, c: float):
     """
     R = Rz(c) Ry(b) Rx(a) and its derivatives with respect to a, b, c.
@@ -49,13 +61,20 @@ class TorsionModel:
             side of j, which never holds the root (the first binding atom).
         masks (np.ndarray): (k, n_atoms) atoms moved by each torsion, deepest bond first.
         pairs (np.ndarray): (q, 2) atom pairs at least four bonds apart.
+        quads (np.ndarray): (k, 4) atoms (a, i, j, b) defining each torsion's dihedral.
+        tails (np.ndarray): (k,) torsions whose moving side holds no binding atom, so they
+            turn a dangling chain without moving any anchor.
+        heavy (np.ndarray): (n_atoms,) non-hydrogen atoms.
     """
     bonds: np.ndarray
     masks: np.ndarray
     pairs: np.ndarray
+    quads: np.ndarray
+    tails: np.ndarray
+    heavy: np.ndarray
 
     @classmethod
-    def build(cls, mol: Chem.Mol, root: int) -> TorsionModel:
+    def build(cls, mol: Chem.Mol, root: int, binding: Sequence[int] = ()) -> TorsionModel:
         n = mol.GetNumAtoms()
         heavy = np.array([a.GetAtomicNum() > 1 for a in mol.GetAtoms()])
         nbrs = [[x.GetIdx() for x in a.GetNeighbors()] for a in mol.GetAtoms()]
@@ -88,7 +107,14 @@ class TorsionModel:
         bonds = np.array([(i, j) for _, i, j, _ in found], dtype=int).reshape(-1, 2)
         masks = np.array([m for *_, m in found], dtype=bool).reshape(-1, n)
         pairs = np.argwhere(np.triu(topo >= 4))
-        return cls(bonds=bonds, masks=masks, pairs=pairs)
+
+        def outer(atom: int, other: int) -> int:
+            cand = [x for x in nbrs[atom] if x != other]
+            return max(cand, key=lambda x: heavy[x])  # a heavy neighbor when there is one
+        quads = np.array([(outer(i, j), i, j, outer(j, i)) for i, j in bonds], dtype=int).reshape(-1, 4)
+        binding = np.asarray(list(binding), dtype=int)
+        tails = ~masks[:, binding].any(axis=1) if len(binding) else np.zeros(len(bonds), dtype=bool)
+        return cls(bonds=bonds, masks=masks, pairs=pairs, quads=quads, tails=tails, heavy=heavy)
 
     @property
     def n_torsions(self) -> int:
@@ -188,6 +214,8 @@ def refine(
     intra: float = 1.6,
     w_torsion: float = 0.02,
     max_iter: int = 400,
+    pull: Optional[tuple] = None,
+    frozen: Optional[np.ndarray] = None,
 ) -> Refinement:
     """
     Refine one ligand pose.
@@ -204,6 +232,9 @@ def refine(
         intra (float): Soft-sphere radius (Å) between ligand atoms four or more bonds apart.
         w_torsion (float): Weight of 1 - cos(change) per torsion, a mild pull to the conformer.
         max_iter (int): L-BFGS-B iterations.
+        pull: Optional (direction, atom mask, k): lowers the energy by k per Å that the
+            masked atoms move along the unit direction.
+        frozen (np.ndarray): Optional (6 + k,) mask of parameters held at zero.
     """
     center = targets.mean(axis=0)
     groups = [np.asarray(g, dtype=int) for g in groups]
@@ -211,18 +242,59 @@ def refine(
     def fun(params):
         x, xt, dR = model.forward(params, coords, center)
         E, G = _ligand_terms(model, x, groups, targets, trees, contact, k_anchor, k_contact, intra)
+        if pull is not None:
+            direction, mask, k_pull = pull
+            E -= k_pull * float(np.sum((x[mask] - center) @ direction))
+            G[mask] -= k_pull * direction
         phi = params[6:]
         E += w_torsion * float(np.sum(1.0 - np.cos(phi)))
         g = model.gradient(params, x, xt, dR, G)
         g[6:] += w_torsion * np.sin(phi)
         return E, g
 
+    bounds = None
+    if frozen is not None:
+        bounds = [(0.0, 0.0) if f else (None, None) for f in frozen]
     res = minimize(fun, np.zeros(6 + model.n_torsions), jac=True, method="L-BFGS-B",
-                   options={"maxiter": max_iter})
+                   bounds=bounds, options={"maxiter": max_iter})
     x, _, _ = model.forward(res.x, coords, center)
     anchors = np.array([x[g].mean(axis=0) for g in groups])
     rmsd = float(np.sqrt(np.mean(np.sum((anchors - targets) ** 2, axis=1))))
     return Refinement(coords=x, anchor_rmsd=rmsd, converged=bool(res.success))
+
+
+def stretch(
+    model: TorsionModel,
+    coords: np.ndarray,
+    groups: Sequence[Sequence[int]],
+    targets: np.ndarray,
+    normal: np.ndarray,
+    trees: Sequence,
+    contact: float,
+    k_pull: float = 1.0,
+    max_iter: int = 200,
+) -> Optional[Refinement]:
+    """
+    Straighten the dangling chains of a ligand and raise them along `normal`.
+
+    Every tail torsion is set anti (180°); then only the tail torsions are optimized, so no
+    anchor moves, to lift the tail's heavy atoms along `normal` while keeping clear of the
+    fixed atoms in `trees` and of the ligand itself. Returns None for a ligand without tails.
+    """
+    if not model.tails.any():
+        return None
+    x = coords.copy()
+    for (i, j), mask, quad, tail in zip(model.bonds, model.masks, model.quads, model.tails):
+        if not tail:
+            continue
+        u = x[j] - x[i]
+        u /= np.linalg.norm(u)
+        R = _rotation(u, np.pi - _dihedral(x[quad]))
+        x[mask] = (x[mask] - x[i]) @ R.T + x[i]
+    lifted = model.masks[model.tails].any(axis=0) & model.heavy
+    frozen = np.concatenate([np.ones(6, dtype=bool), ~model.tails])
+    return refine(model, x, groups, targets, trees, contact, max_iter=max_iter,
+                  pull=(normal, lifted, k_pull), frozen=frozen)
 
 
 def refine_joint(
@@ -232,8 +304,7 @@ def refine_joint(
     targets: Sequence[np.ndarray],
     trees: Sequence,
     contact: float,
-    pairs: Sequence[tuple],
-    mic=lambda d: d,
+    tree_builder,
     k_anchor: float = 20.0,
     k_contact: float = 40.0,
     intra: float = 1.6,
@@ -242,13 +313,16 @@ def refine_joint(
 ) -> List[Refinement]:
     """
     Refine several ligands at once, so that ligands jammed against each other can all
-    give way. Each has the terms of `refine`; every pair (a, b) in `pairs` also pushes the
-    two ligands `contact` Å apart, with differences taken through `mic`.
+    give way. Each has the terms of `refine`; atoms of different ligands are also pushed
+    `contact` Å apart. Those contacts are searched afresh at every evaluation, in a tree
+    from `tree_builder` (periodic images included), since the ligands move.
     """
     sizes = [6 + m.n_torsions for m in models]
     offsets = np.concatenate([[0], np.cumsum(sizes)])
     centers = [t.mean(axis=0) for t in targets]
     groups = [[np.asarray(g, dtype=int) for g in gs] for gs in groups]
+    owner = np.concatenate([np.full(len(c), l) for l, c in enumerate(coords)])
+    starts = np.concatenate([[0], np.cumsum([len(c) for c in coords])])
 
     def fun(P):
         E = 0.0
@@ -259,20 +333,25 @@ def refine_joint(
             e, G = _ligand_terms(model, x, groups[l], targets[l], trees, contact, k_anchor, k_contact, intra)
             E += e + w_torsion * float(np.sum(1.0 - np.cos(params[6:])))
             state.append((params, x, xt, dR, G))
-        for a, b in pairs:
-            xa, xb = state[a][1], state[b][1]
-            v = mic(xa[:, None, :] - xb[None, :, :])
-            d = np.linalg.norm(v, axis=-1)
-            ia, ib = np.nonzero((d < contact) & (d > 1e-9))
-            if len(ia):
-                dd = d[ia, ib]
-                over = contact - dd
-                f = -2.0 * k_contact * over[:, None] * v[ia, ib] / dd[:, None]
-                E += k_contact * float(over @ over)
-                np.add.at(state[a][4], ia, f)
-                np.add.at(state[b][4], ib, -f)
+        X = np.vstack([st[1] for st in state])
+        G_all = np.zeros_like(X)
+        tree, image_of = tree_builder(X)
+        dist, idx = tree.query(X, k=min(16, tree.n), distance_upper_bound=contact)
+        p, slot = np.nonzero(np.isfinite(dist))
+        q = image_of[idx[p, slot]]
+        keep = owner[p] < owner[q]          # each inter-ligand contact once
+        if keep.any():
+            p, slot, q = p[keep], slot[keep], q[keep]
+            dd = dist[p, slot]
+            v = (X[p] - tree.data[idx[p, slot]]) / dd[:, None]
+            over = contact - dd
+            f = -2.0 * k_contact * over[:, None] * v
+            E += k_contact * float(over @ over)
+            np.add.at(G_all, p, f)
+            np.add.at(G_all, q, -f)
         grad = np.empty_like(P)
         for l, (params, x, xt, dR, G) in enumerate(state):
+            G += G_all[starts[l]:starts[l + 1]]
             g = models[l].gradient(params, x, xt, dR, G)
             g[6:] += w_torsion * np.sin(params[6:])
             grad[offsets[l]:offsets[l + 1]] = g
