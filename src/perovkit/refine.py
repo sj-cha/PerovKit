@@ -34,6 +34,41 @@ def _rotation(u: np.ndarray, phi: float) -> np.ndarray:
                      [t * x * z - s * y, t * y * z + s * x, c + t * z * z]])
 
 
+def _rotations(u: np.ndarray, phi: np.ndarray) -> np.ndarray:
+    """
+    Rotations by `phi` (L,) about the unit axes `u` (L, 3): (L, 3, 3).
+    """
+    x, y, z = u[:, 0], u[:, 1], u[:, 2]
+    c, s = np.cos(phi), np.sin(phi)
+    t = 1.0 - c
+    return np.stack([
+        np.stack([c + t * x * x, t * x * y - s * z, t * x * z + s * y], axis=-1),
+        np.stack([t * x * y + s * z, c + t * y * y, t * y * z - s * x], axis=-1),
+        np.stack([t * x * z - s * y, t * y * z + s * x, c + t * z * z], axis=-1),
+    ], axis=1)
+
+
+def _euler_many(angles: np.ndarray):
+    """
+    _euler for (L, 3) angles: R (L, 3, 3) and its three derivatives (3, L, 3, 3).
+    """
+    L = len(angles)
+    ca, sa = np.cos(angles[:, 0]), np.sin(angles[:, 0])
+    cb, sb = np.cos(angles[:, 1]), np.sin(angles[:, 1])
+    cc, sc = np.cos(angles[:, 2]), np.sin(angles[:, 2])
+    zero, one = np.zeros(L), np.ones(L)
+
+    def m(rows):
+        return np.stack([np.stack(r, axis=-1) for r in rows], axis=1)
+    Rx = m([[one, zero, zero], [zero, ca, -sa], [zero, sa, ca]])
+    Ry = m([[cb, zero, sb], [zero, one, zero], [-sb, zero, cb]])
+    Rz = m([[cc, -sc, zero], [sc, cc, zero], [zero, zero, one]])
+    dRx = m([[zero, zero, zero], [zero, -sa, -ca], [zero, ca, -sa]])
+    dRy = m([[-sb, zero, cb], [zero, zero, zero], [-cb, zero, -sb]])
+    dRz = m([[-sc, -cc, zero], [cc, -sc, zero], [zero, zero, zero]])
+    return Rz @ Ry @ Rx, np.stack([Rz @ Ry @ dRx, Rz @ dRy @ Rx, dRz @ Ry @ Rx])
+
+
 def _dihedral(p: np.ndarray) -> float:
     """
     Dihedral angle (radians) of four points, positive for a right-handed turn of p[3]
@@ -173,6 +208,45 @@ class TorsionModel:
             g[6:] = np.einsum("ki,ki->k", u, torque)
         return g
 
+    def forward_many(self, P: np.ndarray, X0: np.ndarray, C: np.ndarray):
+        """
+        forward() for L poses of this ligand at once: params P (L, 6 + k), starting
+        coordinates X0 (L, n, 3) and centers C (L, 3). Each torsion is applied to all L
+        poses in one array operation, so the Python loop runs over the torsions only.
+        """
+        X = X0.copy()
+        for b, (i, j, moving) in enumerate(self._moving):
+            phi = P[:, 6 + b]
+            if not phi.any():
+                continue
+            xi = X[:, i].copy()
+            u = X[:, j] - xi
+            u /= np.linalg.norm(u, axis=1, keepdims=True)
+            R = _rotations(u, phi)
+            X[:, moving] = np.matmul(X[:, moving] - xi[:, None], R.transpose(0, 2, 1)) + xi[:, None]
+        R, dR = _euler_many(P[:, 3:6])
+        Xt = X - C[:, None]
+        return np.matmul(Xt, R.transpose(0, 2, 1)) + C[:, None] + P[:, None, :3], Xt, dR
+
+    def gradient_many(self, P: np.ndarray, X: np.ndarray, Xt: np.ndarray, dR: np.ndarray,
+                      G: np.ndarray) -> np.ndarray:
+        """
+        gradient() for L poses at once, after forward_many: (L, 6 + k).
+        """
+        g = np.empty_like(P)
+        g[:, :3] = G.sum(axis=1)
+        for k in range(3):
+            g[:, 3 + k] = np.einsum("lnd,lnd->l", G, np.matmul(Xt, dR[k].transpose(0, 2, 1)))
+        if self.n_torsions:
+            i, j = self.bonds[:, 0], self.bonds[:, 1]
+            u = X[:, j] - X[:, i]
+            u /= np.linalg.norm(u, axis=2, keepdims=True)
+            M = self._weights
+            torque = (np.einsum("kn,lnd->lkd", M, np.cross(X, G))
+                      - np.cross(X[:, i], np.einsum("kn,lnd->lkd", M, G)))
+            g[:, 6:] = np.einsum("lkd,lkd->lk", u, torque)
+        return g
+
 
 @dataclass
 class Refinement:
@@ -228,6 +302,57 @@ def _ligand_terms(model, x, groups, targets, trees, contact, k_anchor, k_contact
             np.add.at(G, pa, f)
             np.add.at(G, pb, -f)
     return E, G, closest, tangled
+
+
+def _many_terms(model, X, groups, T, trees, contact, k_anchor, k_contact, intra):
+    """
+    _ligand_terms for L poses of one ligand type, X (L, n, 3) and targets T (L, m, 3), with
+    one tree query for all their atoms. Returns (E, G (L, n, 3), closest, tangled, rmsd (L,)).
+    """
+    L, n, _ = X.shape
+    G = np.zeros_like(X)
+    E = 0.0
+    sq = np.zeros(L)
+    for k, grp in enumerate(groups):
+        d = X[:, grp].mean(axis=1) - T[:, k]
+        E += k_anchor * float(np.sum(d * d))
+        sq += np.sum(d * d, axis=1)
+        G[:, grp] += (2.0 * k_anchor * d / len(grp))[:, None, :]
+    flat, G_flat = X.reshape(-1, 3), G.reshape(-1, 3)
+    closest, tangled = float("inf"), False
+    for tree in trees:
+        if tree is None or tree.n == 0:
+            continue
+        dist, idx = tree.query(flat, k=min(8, tree.n), distance_upper_bound=contact)
+        dist = dist.reshape(len(flat), -1)
+        idx = idx.reshape(len(flat), -1)
+        atom, slot = np.nonzero(np.isfinite(dist) & (dist > 1e-9))
+        if len(atom):
+            d = dist[atom, slot]
+            closest = min(closest, float(d.min()))
+            v = (flat[atom] - tree.data[idx[atom, slot]]) / d[:, None]
+            over = contact - d
+            E += k_contact * float(over @ over)
+            np.add.at(G_flat, atom, -2.0 * k_contact * over[:, None] * v)
+    # one tree for the intramolecular pairs of all poses, each pose shifted far apart
+    shifted = X + (np.arange(L) * 1.0e4)[:, None, None] * np.array([1.0, 0.0, 0.0])
+    close = cKDTree(shifted.reshape(-1, 3)).query_pairs(intra, output_type="ndarray")
+    if len(close):
+        pa, pb = close[:, 0], close[:, 1]
+        keep = model.far[pa % n, pb % n]
+        pa, pb = pa[keep], pb[keep]
+        v = flat[pa] - flat[pb]
+        d = np.linalg.norm(v, axis=1)
+        hit = (d < intra) & (d > 1e-9)
+        if hit.any():
+            tangled = True
+            pa, pb, d, v = pa[hit], pb[hit], d[hit], v[hit] / d[hit, None]
+            over = intra - d
+            E += k_contact * float(over @ over)
+            f = -2.0 * k_contact * over[:, None] * v
+            np.add.at(G_flat, pa, f)
+            np.add.at(G_flat, pb, -f)
+    return E, G, closest, tangled, np.sqrt(sq / len(groups))
 
 
 def _anchor_rmsd(x, groups, targets) -> float:
@@ -376,30 +501,45 @@ def refine_joint(
     give way. Each has the terms of `refine`; atoms of different ligands are also pushed
     `contact` Å apart. Those contacts are searched afresh at every evaluation, in a tree
     from `tree_builder` (periodic images included), since the ligands move. `stop_at` and
-    `stop_rmsd` end it early as in `refine`, with every ligand meeting them.
+    `stop_rmsd` end it early as in `refine`, with every ligand meeting them. Ligands of one
+    type are computed together, so a shell of 40 lecithins costs about as many Python-level
+    steps per evaluation as a single one.
     """
     sizes = [6 + m.n_torsions for m in models]
     offsets = np.concatenate([[0], np.cumsum(sizes)])
-    centers = [t.mean(axis=0) for t in targets]
     groups = [[np.asarray(g, dtype=int) for g in gs] for gs in groups]
     owner = np.concatenate([np.full(len(c), l) for l, c in enumerate(coords)])
     starts = np.concatenate([[0], np.cumsum([len(c) for c in coords])])
     done = {"ok": False, "x": None}
 
+    # ligands of one type are computed together (forward_many and _many_terms)
+    batches = []
+    for model in {id(m): m for m in models}.values():
+        members = [l for l, m in enumerate(models) if m is model]
+        k = 6 + model.n_torsions
+        batches.append(dict(
+            model=model, groups=groups[members[0]],
+            params=np.array([np.arange(offsets[l], offsets[l] + k) for l in members]),
+            atoms=np.concatenate([np.arange(starts[l], starts[l + 1]) for l in members]),
+            X0=np.array([coords[l] for l in members]),
+            T=np.array([targets[l] for l in members]),
+            C=np.array([targets[l].mean(axis=0) for l in members]),
+        ))
+
     def fun(P):
         E = 0.0
-        state = []
         closest, tangled, worst = float("inf"), False, 0.0
-        for l, model in enumerate(models):
-            params = P[offsets[l]:offsets[l + 1]]
-            x, xt, dR = model.forward(params, coords[l], centers[l])
-            e, G, c, t = _ligand_terms(model, x, groups[l], targets[l], trees, contact,
-                                       k_anchor, k_contact, intra)
-            closest, tangled = min(closest, c), tangled or t
-            worst = max(worst, _anchor_rmsd(x, groups[l], targets[l]))
-            E += e + w_torsion * float(np.sum(1.0 - np.cos(params[6:])))
-            state.append((params, x, xt, dR, G))
-        X = np.vstack([st[1] for st in state])
+        X = np.empty((starts[-1], 3))
+        state = []
+        for b in batches:
+            Pb = P[b["params"]]
+            Xb, Xt, dR = b["model"].forward_many(Pb, b["X0"], b["C"])
+            e, G, c, t, rmsd = _many_terms(b["model"], Xb, b["groups"], b["T"], trees, contact,
+                                           k_anchor, k_contact, intra)
+            closest, tangled, worst = min(closest, c), tangled or t, max(worst, float(rmsd.max()))
+            E += e + w_torsion * float(np.sum(1.0 - np.cos(Pb[:, 6:])))
+            X[b["atoms"]] = Xb.reshape(-1, 3)
+            state.append((Pb, Xb, Xt, dR, G))
         G_all = np.zeros_like(X)
         tree, image_of = tree_builder(X)
         dist, idx = tree.query(X, k=min(16, tree.n), distance_upper_bound=contact)
@@ -417,11 +557,11 @@ def refine_joint(
             np.add.at(G_all, p, f)
             np.add.at(G_all, q, -f)
         grad = np.empty_like(P)
-        for l, (params, x, xt, dR, G) in enumerate(state):
-            G += G_all[starts[l]:starts[l + 1]]
-            g = models[l].gradient(params, x, xt, dR, G)
-            g[6:] += w_torsion * np.sin(params[6:])
-            grad[offsets[l]:offsets[l + 1]] = g
+        for b, (Pb, Xb, Xt, dR, G) in zip(batches, state):
+            G += G_all[b["atoms"]].reshape(G.shape)
+            g = b["model"].gradient_many(Pb, Xb, Xt, dR, G)
+            g[:, 6:] += w_torsion * np.sin(Pb[:, 6:])
+            grad[b["params"]] = g
         done["x"] = P.copy()
         done["ok"] = stop_at is not None and closest >= stop_at and not tangled and worst <= stop_rmsd
         return E, grad
@@ -429,7 +569,7 @@ def refine_joint(
     res = _minimize(fun, int(offsets[-1]), None, max_iter, done)
     out = []
     for l, model in enumerate(models):
-        x, _, _ = model.forward(res.x[offsets[l]:offsets[l + 1]], coords[l], centers[l])
+        x, _, _ = model.forward(res.x[offsets[l]:offsets[l + 1]], coords[l], targets[l].mean(axis=0))
         out.append(Refinement(coords=x, anchor_rmsd=_anchor_rmsd(x, groups[l], targets[l]),
                               converged=bool(res.success)))
     return out
