@@ -80,7 +80,8 @@ class FitPose:
     Multi-motif ligand fitted to a constellation. Variants are coordinates of the
     candidate's alternative conformer fits, best first, followed by any refined ones;
     a stretched variant goes first. `origins` says where each came from ("fit",
-    "refined", "stretched"); theta is the spin about the anchor axis relative to each.
+    "refined", "unstuck", "stretched"); theta is the spin about the anchor axis relative
+    to each.
     """
     random_start = False
 
@@ -359,6 +360,7 @@ def refine_clusters(
     cutoff: float,
     max_rmsd: float,
     margin: float = 2.0,
+    stop_at: Optional[float] = None,
 ) -> bool:
     """
     Refine jammed multi-motif ligands together, for when no ligand can clear its contacts
@@ -369,7 +371,8 @@ def refine_clusters(
     members are refined jointly against the core and all other ligands, and pushed apart
     from each other wherever they come within `cutoff` + margin (see MARGINS). A result
     replaces the poses only if its anchors stay within `max_rmsd` and its closest contact
-    improves. Updates `coords_list` and the poses in place.
+    improves. Each refinement stops once every contact is `stop_at` Å (by default halfway
+    into the margin). Updates `coords_list` and the poses in place.
 
     Returns:
         Whether any component improved.
@@ -418,7 +421,7 @@ def refine_clusters(
                 [poses[i].ligand.binding_groups for i in members],
                 [poses[i].candidate.targets for i in members],
                 trees, cutoff + margin, tree_builder,
-                stop_at=cutoff + margin / 2, stop_rmsd=max_rmsd,
+                stop_at=cutoff + margin / 2 if stop_at is None else stop_at, stop_rmsd=max_rmsd,
             )
             if any(r.anchor_rmsd > max_rmsd for r in results):
                 continue

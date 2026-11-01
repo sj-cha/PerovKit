@@ -66,7 +66,8 @@ class Fit:
     Coordinates are ``(x - center) @ rotation.T + pivot``, then turned by ``theta`` about
     ``axis`` through ``pivot`` when the fit leaves that spin free (two anchors, or anchors
     on one line). A refined or stretched fit stores its coordinates at ``theta`` in ``xyz``
-    instead, and says which in ``origin`` ("fit", "refined" or "stretched").
+    instead, and says which in ``origin``: "fit", "refined", or "unstuck" (chains
+    stretched just until they clear the core).
     """
     conformer: int
     rotation: np.ndarray
@@ -614,18 +615,20 @@ class ConstellationSampler:
         excluded: np.ndarray,
     ) -> Optional[Fit]:
         """
-        Stretch the dangling chains of a fit that clashes with the core; returns it as a
-        fit with explicit coordinates if that clears the core, else None.
+        Stretch the dangling chains of a fit that clashes with the core, only until they
+        clear it; returns it as a fit with explicit coordinates ("unstuck": the stretch
+        before packing still stands it up fully) if that works, else None.
         """
         normal = np.mean([np.asarray(s.plane, dtype=float) / np.linalg.norm(s.plane) for s in sites], axis=0)
         res = stretch(model, start, groups, targets, normal / np.linalg.norm(normal),
-                      self._surroundings(start, base.pivot, excluded), self.overlap_cutoff + 0.2)
+                      self._surroundings(start, base.pivot, excluded), self.overlap_cutoff + 0.2,
+                      stop_at=self.overlap_cutoff + 0.1)
         if res is None or self._core_clearance(res.coords[None], excluded)[0] < self.overlap_cutoff:
             return None
         return Fit(conformer=base.conformer, rotation=base.rotation, center=base.center,
                    pivot=base.pivot, axis=base.axis, theta=0.0, rmsd=base.rmsd,
                    alignment=base.alignment, footprint=base.footprint, energy=base.energy,
-                   cost=base.cost, xyz=res.coords, origin="stretched")
+                   cost=base.cost, xyz=res.coords, origin="unstuck")
 
 
     def _refine_fit(
