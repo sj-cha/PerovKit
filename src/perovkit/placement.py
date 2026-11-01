@@ -393,8 +393,11 @@ def select_constellations(
 
     With ``spec.binding_sites`` every entry lists one site atom index per motif, in motif
     order. Otherwise ``spec.coverage`` is a fraction of the most ligands the free sites
-    can host (or, above 1, a count), and seeds are tried until it is met or the surface is
-    exhausted; a shortfall is reported with the reasons seeds were rejected. With `refine`,
+    can host (or, above 1, a count), spread so that every face holds about the same
+    fraction of its sites (see ConstellationSampler.sample), and seeds are tried until it
+    is met or the surface is exhausted; a shortfall is reported with the reasons seeds were
+    rejected. The first motif's sites set the per-face balance, so it is best given the
+    scarcer site type. With `refine`,
     constellations whose fits all clash with the core get a torsion-space refinement first.
     """
     lig = spec.ligand
@@ -435,6 +438,10 @@ def select_constellations(
                       f"host at most {capacity}.")
                 n_target = capacity
         chosen, failures = sampler.sample(lib, pools, n_target, offset, replace, model, groups)
+        if len(sampler.occupancy) > 1:
+            occ = list(sampler.occupancy.values())
+            log(f"[Log] {lig.name} occupancy per face: {min(occ):.2f}-{max(occ):.2f} "
+                f"over {len(occ)} faces.")
         if len(chosen) < n_target:
             reasons = ", ".join(f"{r} ({n}x)" for r, n in failures.most_common())
             print(f"[Warning] Placed {len(chosen)} of {n_target} requested {lig.name} ligands; "
