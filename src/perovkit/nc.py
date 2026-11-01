@@ -20,7 +20,8 @@ from .core import Core, BindingSite
 from .ligand import Ligand, LigandSpec, BindingMotif
 from .constellation import ConstellationSampler
 from .placement import (SitePose, FitPose, bounding_spheres, optimize_pose,
-                        place_about_normal, motif_pools, select_constellations)
+                        place_about_normal, motif_pools, refine_clusters, refine_pose,
+                        select_constellations)
 from .utils.geometry import farthest_point_sampling, per_face_farthest_point_sampling, compute_bounding_spheres, build_neighbor_map
 
 
@@ -102,6 +103,7 @@ class NanoCrystal:
         random_seed: int = 42,
         verbose: bool = True,
         max_anchor_rmsd: float = 0.5,   # Å
+        refine_torsions: bool = True,
     ) -> None:
 
         assert not self.ligands, "Ligands have already been placed."
@@ -137,13 +139,20 @@ class NanoCrystal:
                         max_rmsd=max_anchor_rmsd,
                     )
                 pools, by_type = motif_pools(spec, self.binding_sites, self._symbol_map())
-                for lig_cloned, cand in select_constellations(spec, pools, by_type, sampler, log):
+                for lig_cloned, cand in select_constellations(spec, pools, by_type, sampler, log,
+                                                              refine=refine_torsions):
                     ligands.append(lig_cloned)
                     poses.append(FitPose(lig_cloned, cand))
                     if not spec.adsorb:
                         displaced_indices.extend(cand.atom_indices)
                 self.ligand_coverage[spec.ligand.name] = spec.coverage
                 continue
+
+            if sampler is not None:
+                # sites under a multi-motif ligand cannot take one more
+                n_blocked = sampler.block_covered(self.binding_sites, overlap_cutoff + 1.0)
+                if n_blocked:
+                    log(f"[Log] Left out {n_blocked} free sites covered by multi-motif ligands.")
 
             pool, ligand_type = self._select_site_pool(spec)
             available = [s for s in pool if not s.passivated]
@@ -263,11 +272,36 @@ class NanoCrystal:
                 )
                 d_new = self._min_distance(best_coords, neighbors_coords)
 
+                # Multi-motif ligands that turning cannot clear may still bend out of the way.
+                # Bending can reach past the neighbor spheres, so every other ligand counts.
+                if (refine_torsions and isinstance(poses[i], FitPose)
+                        and d_new < self.overlap_cutoff):
+                    others = [c for j, c in enumerate(ligand_coords_list) if j != i]
+                    refined = refine_pose(poses[i], best_coords, others, self._core_tree,
+                                          self._sampler_geometry()[0], self.overlap_cutoff,
+                                          max_anchor_rmsd)
+                    if refined is not None:
+                        d_ref = self._min_distance(refined, others)
+                        if d_ref > d_new:
+                            best_theta, best_variant = 0.0, poses[i].add_variant(refined)
+                            best_coords, d_new = refined, d_ref
+
                 if d_new > d_old + 1e-3:
                     ligand_coords_list[i] = best_coords
                     thetas[i] = best_theta
                     poses[i].variant = best_variant
                     improved = True
+                    if isinstance(poses[i], FitPose):
+                        # a refined variant may reach farther: let the ligands still to move see it
+                        centers, radii = bounding_spheres(poses, ligand_coords_list)
+                        neighbor_map = build_neighbor_map(centers, radii, self.overlap_cutoff)
+
+            if not improved and refine_torsions:
+                # nobody could move alone: let jammed multi-motif ligands give way together
+                improved = refine_clusters(
+                    poses, ligand_coords_list, self._core_tree, *self._sampler_geometry(),
+                    self._min_distance, self.overlap_cutoff, max_anchor_rmsd,
+                )
 
             if not improved:
                 raise RuntimeError("[Log] No improvement in active cluster. Stopping.")
@@ -300,7 +334,10 @@ class NanoCrystal:
                 np.linalg.norm((p.ligand.anchor_positions - p.candidate.targets), axis=1)
                 for p in fit_poses
             ])
-            log(f"[Log] Multi-motif anchors sit {dev.mean():.2f} Å (max {dev.max():.2f} Å) from their sites.")
+            bent = sum(p.variant >= len(p.candidate.fits) or p.candidate.fits[p.variant].xyz is not None
+                       for p in fit_poses)
+            log(f"[Log] Multi-motif anchors sit {dev.mean():.2f} Å (max {dev.max():.2f} Å) from their sites; "
+                f"{bent} of {len(fit_poses)} ligands refined in torsion space.")
 
         stripped_atoms = Atoms(
             symbols=stripped_symbols,

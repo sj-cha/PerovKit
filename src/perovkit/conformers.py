@@ -27,16 +27,25 @@ class ConformerLibrary:
             the ligand, which should point away from the surface; zero where undefined.
         body (np.ndarray): (n_atoms,) mask of the heavy atoms outside the binding groups,
             whose spread over the surface measures a conformer's footprint.
+        mirrored (bool): Whether the second half of the conformers mirrors the first.
     """
     coords: np.ndarray
     energies: np.ndarray
     anchors: np.ndarray
     directions: np.ndarray
     body: np.ndarray
+    mirrored: bool = False
 
     @property
     def n_conformers(self) -> int:
         return len(self.coords)
+
+    def unique_id(self, conformer: int) -> int:
+        """
+        The conformer, or the one it mirrors: on a mirror-symmetric surface the two make
+        the same attempt.
+        """
+        return conformer % (self.n_conformers // 2) if self.mirrored else conformer
 
     @classmethod
     def build(
@@ -47,6 +56,7 @@ class ConformerLibrary:
         optimize: bool = True,
         mirror: Optional[bool] = None,
         random_seed: int = 42,
+        n_threads: int = 0,
     ) -> ConformerLibrary:
         """
         Embed conformers with ETKDG and, optionally, minimize them with UFF.
@@ -59,13 +69,15 @@ class ConformerLibrary:
         Args:
             ligand (Ligand): Ligand with an RDKit mol and resolved binding atoms.
             n_conformers (int): Number of ETKDG embeddings to attempt.
-            prune_rms (float): RMSD (Å) below which ETKDG discards a conformer as a duplicate.
+            prune_rms (float): RMSD (Å) below which ETKDG discards a conformer as a duplicate,
+                comparing atoms by index rather than up to symmetry.
             optimize (bool): Minimize every conformer with UFF and record its energy.
             mirror (Optional[bool]): Add the mirror image of every conformer. A rotation
                 cannot turn a conformer into its mirror image, and with three or more anchors
                 it is often the mirror that keeps the body off the surface. None adds them
                 when no atom carries a chiral tag, since mirroring would invert it.
             random_seed (int): Seed for ETKDG embedding.
+            n_threads (int): Threads for embedding and minimization; 0 uses all.
         """
         if ligand.mol is None:
             raise ValueError("ConformerLibrary needs the ligand's RDKit mol")
@@ -76,8 +88,11 @@ class ConformerLibrary:
         params = AllChem.ETKDGv3()
         params.randomSeed = random_seed
         params.pruneRmsThresh = prune_rms
+        # a sulfonate turned by 120 degrees is a duplicate to ETKDG, but not to a motif that
+        # names two of its oxygens
+        params.useSymmetryForPruning = False
         params.clearConfs = False
-        params.numThreads = 0
+        params.numThreads = n_threads
         n_new = len(AllChem.EmbedMultipleConfs(mol, n_conformers, params))
         if n_new < n_conformers // 2:
             # large molecules mostly fail to embed unless started from random coordinates
@@ -86,7 +101,7 @@ class ConformerLibrary:
 
         energies = np.zeros(mol.GetNumConformers())
         if optimize and AllChem.UFFHasAllMoleculeParams(mol):
-            results = AllChem.UFFOptimizeMoleculeConfs(mol, maxIters=2000, numThreads=0)
+            results = AllChem.UFFOptimizeMoleculeConfs(mol, maxIters=2000, numThreads=n_threads)
             energies = np.array([e for _, e in results], dtype=float)
 
         coords = np.array([c.GetPositions() for c in mol.GetConformers()], dtype=float)
@@ -105,7 +120,7 @@ class ConformerLibrary:
         if not body.any():
             body[:] = True
         return cls(coords=coords, energies=energies, anchors=anchors, directions=directions,
-                   body=body)
+                   body=body, mirrored=bool(mirror))
 
     def pair_distances(self) -> np.ndarray:
         """

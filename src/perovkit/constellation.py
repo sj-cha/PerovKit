@@ -15,8 +15,11 @@ from typing import Callable, Dict, Iterator, List, Optional, Sequence, Tuple
 
 import numpy as np
 
+from scipy.spatial import cKDTree
+
 from .conformers import ConformerLibrary
 from .core import BindingSite
+from .refine import TorsionModel, refine
 
 
 def rotations_about_axis(axis: np.ndarray, thetas: np.ndarray) -> np.ndarray:
@@ -37,7 +40,7 @@ class Fit:
 
     Coordinates are ``(x - center) @ rotation.T + pivot``, then turned by ``theta`` about
     ``axis`` through ``pivot`` when the fit leaves that spin free (two anchors, or anchors
-    on one line).
+    on one line). A refined fit stores its coordinates at ``theta`` in ``xyz`` instead.
     """
     conformer: int
     rotation: np.ndarray
@@ -50,9 +53,15 @@ class Fit:
     footprint: float
     energy: float
     cost: float
+    xyz: Optional[np.ndarray] = None
 
     def coords(self, lib: ConformerLibrary, theta: Optional[float] = None) -> np.ndarray:
         theta = self.theta if theta is None else theta
+        if self.xyz is not None:
+            x = self.xyz - self.pivot
+            if self.axis is not None and theta != self.theta:
+                x = x @ rotations_about_axis(self.axis, np.array([theta - self.theta]))[0].T
+            return x + self.pivot
         x = (lib.coords[self.conformer] - self.center) @ self.rotation.T
         if self.axis is not None and theta != 0.0:
             x = x @ rotations_about_axis(self.axis, np.array([theta]))[0].T
@@ -178,6 +187,10 @@ class ConstellationSampler:
         w_align, w_foot, foot_scale (float): Orientation terms of the cost, see fit_conformers.
         w_crowd (float): Weight of the squared shortfall (Å^2) below overlap_cutoff to
             already placed ligands.
+        n_refine (int): When no constellation of a seed has a fit clear of the core, this
+            many distinct conformers are refined in torsion space before the seed is given
+            up (0 disables). Starting points include conformers up to 2 * max_rmsd off,
+            since refinement also pulls the anchors in; the result must meet max_rmsd.
     """
 
     def __init__(
@@ -197,6 +210,7 @@ class ConstellationSampler:
         w_foot: float = 1.0,
         foot_scale: float = 2.0,
         w_crowd: float = 1.0,
+        n_refine: int = 8,
     ):
         self.core_tree, self.core_map = tree_builder(np.asarray(core_positions, dtype=float))
         self.tree_builder = tree_builder
@@ -213,6 +227,7 @@ class ConstellationSampler:
         self.w_foot = w_foot
         self.foot_scale = foot_scale
         self.w_crowd = w_crowd
+        self.n_refine = n_refine
         self.placed: List[np.ndarray] = []
         self._lig_tree = None
 
@@ -234,6 +249,8 @@ class ConstellationSampler:
         n_target: int,
         anchor_offset: float = 0.0,
         replace: bool = True,
+        model: Optional[TorsionModel] = None,
+        groups: Optional[List[List[int]]] = None,
     ) -> Tuple[List[Candidate], Counter]:
         """
         Accept up to `n_target` constellations, seeding them in farthest-point order over
@@ -245,6 +262,8 @@ class ConstellationSampler:
             n_target (int): Number of ligands wanted.
             anchor_offset (float): Offset (Å) of every anchor along its site normal.
             replace (bool): Whether the ligand replaces its site atoms (else it adsorbs).
+            model, groups: Torsion model and binding groups of the ligand, to refine fits
+                that clash with the core; without them such constellations are rejected.
 
         Returns:
             The accepted candidates and a count of the reasons seeds were rejected.
@@ -256,7 +275,8 @@ class ConstellationSampler:
                 break
             if pools[0][i].passivated:
                 continue
-            cand, reason = self._best_candidate(lib, pools, pools[0][i], anchor_offset, replace)
+            cand, reason = self._best_candidate(lib, pools, pools[0][i], anchor_offset, replace,
+                                                model, groups)
             if cand is None:
                 failures[reason] += 1
                 continue
@@ -271,13 +291,18 @@ class ConstellationSampler:
         sites: List[BindingSite],
         anchor_offset: float = 0.0,
         replace: bool = True,
+        model: Optional[TorsionModel] = None,
+        groups: Optional[List[List[int]]] = None,
     ) -> Tuple[Optional[Candidate], str]:
         """
         Evaluate one given constellation; returns (candidate or None, rejection reason).
         """
         seed = sites[0]
         rel = np.array([self.mic(s.position - seed.position) for s in sites])
-        return self._evaluate(lib, sites, seed.position + rel, anchor_offset, replace)
+        cand, reason, stuck = self._evaluate(lib, sites, seed.position + rel, anchor_offset, replace)
+        if cand is None and stuck and model is not None:
+            cand = self._rescue(stuck, model, groups)
+        return cand, ("" if cand is not None else reason)
 
 
     def accept(self, cand: Candidate, lib: ConformerLibrary, replace: bool) -> None:
@@ -287,6 +312,22 @@ class ConstellationSampler:
             self.displaced.update(cand.atom_indices)
         self.placed.append(cand.fits[0].coords(lib))
         self._lig_tree = self.tree_builder(np.vstack(self.placed))
+
+
+    def block_covered(self, sites: Sequence[BindingSite], radius: float) -> int:
+        """
+        Take free sites with an accepted ligand atom within `radius` (Å) out of use: a
+        ligand anchored there would start inside that ligand. Returns how many were taken.
+        """
+        if self._lig_tree is None:
+            return 0
+        tree, _ = self._lig_tree
+        n = 0
+        for s in sites:
+            if not s.passivated and tree.query(s.position, k=1)[0] < radius:
+                s.passivated = True
+                n += 1
+        return n
 
 
     def _fps_order(self, pool: List[BindingSite]) -> List[int]:
@@ -356,17 +397,25 @@ class ConstellationSampler:
         seed: BindingSite,
         anchor_offset: float,
         replace: bool,
+        model: Optional[TorsionModel],
+        groups: Optional[List[List[int]]],
     ) -> Tuple[Optional[Candidate], str]:
         found: List[Tuple[float, Candidate]] = []
         reasons: Counter = Counter()
+        stuck: List[tuple] = []
         for sites, rel in self._constellations(pools, seed, lib):
-            cand, reason = self._evaluate(lib, sites, seed.position + rel, anchor_offset, replace)
+            cand, reason, starts = self._evaluate(lib, sites, seed.position + rel, anchor_offset, replace)
             if cand is None:
                 reasons[reason] += 1
+                stuck += starts
                 continue
             found.append((cand.fits[0].cost, cand))
             if len(found) >= self.n_constellations:
                 break
+        if not found and stuck and model is not None:
+            cand = self._rescue(stuck, model, groups)
+            if cand is not None:
+                return cand, ""
         if not found:
             return None, (reasons.most_common(1)[0][0] if reasons else "no partner site in reach")
         found.sort(key=lambda fc: fc[0])
@@ -380,9 +429,13 @@ class ConstellationSampler:
         positions: np.ndarray,
         anchor_offset: float,
         replace: bool,
-    ) -> Tuple[Optional[Candidate], str]:
+    ) -> Tuple[Optional[Candidate], str, Optional[tuple]]:
         """
         Fit every conformer to the constellation and keep the fits clear of the core.
+
+        Returns (candidate or None, rejection reason, starts), where starts are refinement
+        starting points for _rescue when no fit is clear: (cost, conformer id, fit, coords,
+        sites, targets, excluded), from the clashing fits and the near-miss conformers.
         """
         normals = np.array([np.asarray(s.plane, dtype=float) / np.linalg.norm(s.plane)
                             for s in sites])
@@ -390,10 +443,11 @@ class ConstellationSampler:
         res = fit_conformers(lib, targets, normals, w_align=self.w_align,
                              w_foot=self.w_foot, foot_scale=self.foot_scale)
 
-        ok = np.flatnonzero(res["rmsd"] <= self.max_rmsd)
-        if len(ok) == 0:
-            return None, "no conformer fits the site distances"
-        ok = ok[np.argsort(res["cost"][ok], kind="stable")][: self.n_fits]
+        near = np.flatnonzero(res["rmsd"] <= 2.0 * self.max_rmsd)
+        near = near[np.argsort(res["cost"][near], kind="stable")]
+        ok = near[res["rmsd"][near] <= self.max_rmsd][: self.n_fits]
+        if len(near) == 0:
+            return None, "no conformer fits the site distances", []
 
         excluded = set(self.displaced)
         if replace:
@@ -408,8 +462,7 @@ class ConstellationSampler:
         nbar = normals.mean(axis=0)
         nbar = nbar / np.linalg.norm(nbar)
 
-        fits: List[Fit] = []
-        for c in ok:
+        def spun(c):
             base = Fit(conformer=int(c), rotation=res["rotation"][c], center=res["center"][c],
                        pivot=res["pivot"], axis=axis, theta=0.0, rmsd=float(res["rmsd"][c]),
                        alignment=float(res["alignment"][c]),
@@ -417,10 +470,17 @@ class ConstellationSampler:
                        cost=float(res["cost"][c]))
             x0 = base.coords(lib) - base.pivot
             coords = np.einsum("sij,mj->smi", spins, x0) + base.pivot          # (S, m, 3)
+            return base, coords, self._core_clearance(coords, excluded)
 
-            d_core = self._core_clearance(coords, excluded)
+        fits: List[Fit] = []
+        starts: List[tuple] = []
+        for c in ok:
+            base, coords, d_core = spun(c)
             feasible = d_core >= self.overlap_cutoff
             if not feasible.any():
+                s = int(np.argmax(d_core))
+                starts.append((base.cost, lib.unique_id(base.conformer), base, coords[s],
+                               list(sites), targets, excluded))
                 continue
 
             dirs = np.einsum("sij,nj->sni", spins @ base.rotation, lib.directions[c])
@@ -442,10 +502,76 @@ class ConstellationSampler:
             base.cost = float(res["fit"][c]) + float(score[s])
             fits.append(base)
 
-        if not fits:
-            return None, "every fit clashes with the core"
-        fits.sort(key=lambda f: f.cost)
-        return Candidate(sites=list(sites), targets=targets, fits=fits), ""
+        if fits:
+            fits.sort(key=lambda f: f.cost)
+            return Candidate(sites=list(sites), targets=targets, fits=fits), "", []
+
+        if self.n_refine > 0:
+            for c in near[res["rmsd"][near] > self.max_rmsd][: self.n_refine]:
+                base, coords, d_core = spun(c)
+                s = int(np.argmax(d_core))
+                starts.append((base.cost, lib.unique_id(base.conformer), base, coords[s],
+                               list(sites), targets, excluded))
+        reason = "every fit clashes with the core" if len(ok) else "no conformer fits the site distances"
+        return None, reason, starts
+
+
+    def _rescue(self, starts: List[tuple], model: TorsionModel, groups: List[List[int]]) -> Optional[Candidate]:
+        """
+        Refine the cheapest starting points, one per conformer up to mirroring (symmetric
+        constellations repeat the same fits), up to n_refine; the first that clears the
+        core wins.
+        """
+        tried = set()
+        for cost, key, base, start, sites, targets, excluded in sorted(starts, key=lambda t: t[0]):
+            if len(tried) >= self.n_refine:
+                break
+            if key in tried:
+                continue
+            tried.add(key)
+            fit = self._refine_fit(base, start, model, groups, targets, excluded)
+            if fit is not None:
+                return Candidate(sites=sites, targets=targets, fits=[fit])
+        return None
+
+
+    def _refine_fit(
+        self,
+        base: Fit,
+        start: np.ndarray,
+        model: TorsionModel,
+        groups: List[List[int]],
+        targets: np.ndarray,
+        excluded: np.ndarray,
+    ) -> Optional[Fit]:
+        """
+        Refine a fit that clashes with the core, against the core atoms and placed ligands
+        around it; returns it as a fit with explicit coordinates, or None if it stays stuck.
+        """
+        reach = float(np.linalg.norm(start - base.pivot, axis=1).max()) + self.overlap_cutoff + 1.0
+        trees = [self._local_tree(self.core_tree, self.core_map, base.pivot, reach, excluded)]
+        if self._lig_tree is not None:
+            trees.append(self._local_tree(*self._lig_tree, base.pivot, reach))
+        res = refine(model, start, groups, targets, trees, contact=self.overlap_cutoff + 0.2)
+        if res.anchor_rmsd > self.max_rmsd:
+            return None
+        if self._core_clearance(res.coords[None], excluded)[0] < self.overlap_cutoff:
+            return None
+        return Fit(conformer=base.conformer, rotation=base.rotation, center=base.center,
+                   pivot=base.pivot, axis=base.axis, theta=0.0, rmsd=res.anchor_rmsd,
+                   alignment=base.alignment, footprint=base.footprint, energy=base.energy,
+                   cost=base.cost, xyz=res.coords)
+
+
+    @staticmethod
+    def _local_tree(tree, index_map, center, radius, excluded: Optional[np.ndarray] = None):
+        """
+        Tree of the points of `tree` within `radius` of `center`, minus `excluded` atoms.
+        """
+        idx = np.asarray(tree.query_ball_point(center, r=radius), dtype=int)
+        if excluded is not None and len(idx):
+            idx = idx[~np.isin(index_map[idx], excluded)]
+        return cKDTree(tree.data[idx]) if len(idx) else None
 
 
     def _core_clearance(self, coords: np.ndarray, excluded: np.ndarray, k: int = 8) -> np.ndarray:
