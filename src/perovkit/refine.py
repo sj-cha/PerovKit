@@ -327,13 +327,17 @@ def stretch(
     contact: float,
     k_pull: float = 1.0,
     max_iter: int = 200,
+    stop_at: Optional[float] = None,
 ) -> Optional[Refinement]:
     """
     Straighten the dangling chains of a ligand and raise them along `normal`.
 
     Every tail torsion is set anti (180°); then only the tail torsions are optimized, so no
     anchor moves, to lift the tail's heavy atoms along `normal` while keeping clear of the
-    fixed atoms in `trees` and of the ligand itself. Returns None for a ligand without tails.
+    fixed atoms in `trees` and of the ligand itself. With `stop_at` it stops as soon as
+    every contact with the fixed atoms is that far, when the point is only to unstick a
+    chain from the surface rather than to stand it up. Returns None for a ligand without
+    tails.
     """
     if not model.tails.any():
         return None
@@ -348,7 +352,7 @@ def stretch(
     lifted = model.masks[model.tails].any(axis=0) & model.heavy
     frozen = np.concatenate([np.ones(6, dtype=bool), ~model.tails])
     return refine(model, x, groups, targets, trees, contact, max_iter=max_iter,
-                  pull=(normal, lifted, k_pull), frozen=frozen)
+                  pull=(normal, lifted, k_pull), frozen=frozen, stop_at=stop_at)
 
 
 def refine_joint(

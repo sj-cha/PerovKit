@@ -243,8 +243,10 @@ class Slab:
         # Stretched chains leave few, shallow contacts: relax them all together while the
         # shell is still upright, before single ligands start turning
         if n_stretched and refine_torsions:
+            # stop short of the cutoff: the last contacts are cheaper to clear one ligand at a time
             refine_clusters(poses, ligand_coords_list, self._core_tree, *self._sampler_geometry(),
-                            self._exact_min_distance, self.overlap_cutoff, max_anchor_rmsd)
+                            self._exact_min_distance, self.overlap_cutoff, max_anchor_rmsd,
+                            stop_at=self.overlap_cutoff - 0.1)
 
         # Rotation optimization loop
         centers, radii = bounding_spheres(poses, ligand_coords_list)
