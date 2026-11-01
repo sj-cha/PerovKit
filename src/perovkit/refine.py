@@ -11,6 +11,7 @@ conformer cannot, and says nothing about binding energies.
 from __future__ import annotations
 from dataclasses import dataclass, field
 import math
+import os
 from typing import List, Optional, Sequence
 
 import numpy as np
@@ -19,6 +20,69 @@ from scipy.optimize import minimize
 from scipy.spatial import cKDTree
 
 _ROTATABLE = Chem.MolFromSmarts("[!$(*#*)&!D1]-&!@[!$(*#*)&!D1]")
+
+# The torsion loops are compiled with numba when it is installed (PEROVKIT_NUMBA=0 turns
+# that off); otherwise the numpy code below runs them.
+try:
+    import numba
+except ImportError:
+    numba = None
+JIT = numba is not None and os.environ.get("PEROVKIT_NUMBA", "1") != "0"
+
+
+def _turn_torsions(X, phis, bonds, moving, starts):
+    """
+    Apply torsion changes `phis` (L, k) in place to poses X (L, n, 3), deepest first:
+    torsion b turns atoms moving[starts[b]:starts[b + 1]] about bond (bonds[b, 0], bonds[b, 1]).
+    """
+    for l in range(X.shape[0]):
+        for b in range(bonds.shape[0]):
+            phi = phis[l, b]
+            if phi == 0.0:
+                continue
+            i, j = bonds[b, 0], bonds[b, 1]
+            px, py, pz = X[l, i, 0], X[l, i, 1], X[l, i, 2]
+            ux, uy, uz = X[l, j, 0] - px, X[l, j, 1] - py, X[l, j, 2] - pz
+            r = math.sqrt(ux * ux + uy * uy + uz * uz)
+            ux, uy, uz = ux / r, uy / r, uz / r
+            c, s = math.cos(phi), math.sin(phi)
+            t = 1.0 - c
+            r00, r01, r02 = c + t * ux * ux, t * ux * uy - s * uz, t * ux * uz + s * uy
+            r10, r11, r12 = t * ux * uy + s * uz, c + t * uy * uy, t * uy * uz - s * ux
+            r20, r21, r22 = t * ux * uz - s * uy, t * uy * uz + s * ux, c + t * uz * uz
+            for m in range(starts[b], starts[b + 1]):
+                a = moving[m]
+                vx, vy, vz = X[l, a, 0] - px, X[l, a, 1] - py, X[l, a, 2] - pz
+                X[l, a, 0] = r00 * vx + r01 * vy + r02 * vz + px
+                X[l, a, 1] = r10 * vx + r11 * vy + r12 * vz + py
+                X[l, a, 2] = r20 * vx + r21 * vy + r22 * vz + pz
+
+
+def _torsion_gradient(X, G, bonds, moving, starts, out):
+    """
+    dE/dphi of every torsion (L, k) into `out`: the torque of the forces G on the atoms
+    each torsion moves, about its bond as it lies in X.
+    """
+    for l in range(X.shape[0]):
+        for b in range(bonds.shape[0]):
+            i, j = bonds[b, 0], bonds[b, 1]
+            px, py, pz = X[l, i, 0], X[l, i, 1], X[l, i, 2]
+            ux, uy, uz = X[l, j, 0] - px, X[l, j, 1] - py, X[l, j, 2] - pz
+            r = math.sqrt(ux * ux + uy * uy + uz * uz)
+            tx = ty = tz = 0.0
+            for m in range(starts[b], starts[b + 1]):
+                a = moving[m]
+                rx, ry, rz = X[l, a, 0] - px, X[l, a, 1] - py, X[l, a, 2] - pz
+                gx, gy, gz = G[l, a, 0], G[l, a, 1], G[l, a, 2]
+                tx += ry * gz - rz * gy
+                ty += rz * gx - rx * gz
+                tz += rx * gy - ry * gx
+            out[l, b] = (ux * tx + uy * ty + uz * tz) / r
+
+
+if JIT:
+    _turn_torsions = numba.njit(cache=True)(_turn_torsions)
+    _torsion_gradient = numba.njit(cache=True)(_torsion_gradient)
 
 
 def _rotation(u: np.ndarray, phi: float) -> np.ndarray:
@@ -124,6 +188,10 @@ class TorsionModel:
         # forward() and gradient() run thousands of times per refinement: index once
         self._moving = [(int(i), int(j), np.flatnonzero(m)) for (i, j), m in zip(self.bonds, self.masks)]
         self._weights = self.masks.astype(float)
+        # the same, flat, for the compiled loops
+        self._bonds = np.ascontiguousarray(self.bonds, dtype=np.int64).reshape(-1, 2)
+        self._flat_moving = np.concatenate([m for *_, m in self._moving] + [np.zeros(0, dtype=np.int64)]).astype(np.int64)
+        self._starts = np.concatenate([[0], np.cumsum([len(m) for *_, m in self._moving])]).astype(np.int64)
 
     @classmethod
     def build(cls, mol: Chem.Mol, root: int, binding: Sequence[int] = ()) -> TorsionModel:
@@ -179,14 +247,20 @@ class TorsionModel:
         bonds included, rigidly, so the derivative of every torsion is a rotation about its
         bond as it lies in the final coordinates.
         """
-        x = x0.copy()
-        for (i, j, moving), phi in zip(self._moving, params[6:]):
-            if phi == 0.0:
-                continue
-            xi = x[i]
-            u = x[j] - xi
-            R = _rotation(u / math.sqrt(u @ u), phi)
-            x[moving] = (x[moving] - xi) @ R.T + xi
+        if JIT:
+            x = np.array(x0, dtype=float)[None]
+            _turn_torsions(x, np.ascontiguousarray(params[None, 6:], dtype=float),
+                           self._bonds, self._flat_moving, self._starts)
+            x = x[0]
+        else:
+            x = x0.copy()
+            for (i, j, moving), phi in zip(self._moving, params[6:]):
+                if phi == 0.0:
+                    continue
+                xi = x[i]
+                u = x[j] - xi
+                R = _rotation(u / math.sqrt(u @ u), phi)
+                x[moving] = (x[moving] - xi) @ R.T + xi
         R, dR = _euler(*params[3:6])
         xt = x - center
         return xt @ R.T + center + params[:3], xt, dR
@@ -199,7 +273,12 @@ class TorsionModel:
         g[:3] = G.sum(axis=0)
         for k in range(3):
             g[3 + k] = np.sum(G * (xt @ dR[k].T))
-        if self.n_torsions:
+        if self.n_torsions and JIT:
+            out = np.empty((1, self.n_torsions))
+            _torsion_gradient(np.ascontiguousarray(x[None]), np.ascontiguousarray(G[None]),
+                              self._bonds, self._flat_moving, self._starts, out)
+            g[6:] = out[0]
+        elif self.n_torsions:
             i, j = self.bonds[:, 0], self.bonds[:, 1]
             u = x[j] - x[i]
             u /= np.linalg.norm(u, axis=1, keepdims=True)
@@ -214,16 +293,20 @@ class TorsionModel:
         coordinates X0 (L, n, 3) and centers C (L, 3). Each torsion is applied to all L
         poses in one array operation, so the Python loop runs over the torsions only.
         """
-        X = X0.copy()
-        for b, (i, j, moving) in enumerate(self._moving):
-            phi = P[:, 6 + b]
-            if not phi.any():
-                continue
-            xi = X[:, i].copy()
-            u = X[:, j] - xi
-            u /= np.linalg.norm(u, axis=1, keepdims=True)
-            R = _rotations(u, phi)
-            X[:, moving] = np.matmul(X[:, moving] - xi[:, None], R.transpose(0, 2, 1)) + xi[:, None]
+        X = np.array(X0, dtype=float)
+        if JIT:
+            _turn_torsions(X, np.ascontiguousarray(P[:, 6:], dtype=float),
+                           self._bonds, self._flat_moving, self._starts)
+        else:
+            for b, (i, j, moving) in enumerate(self._moving):
+                phi = P[:, 6 + b]
+                if not phi.any():
+                    continue
+                xi = X[:, i].copy()
+                u = X[:, j] - xi
+                u /= np.linalg.norm(u, axis=1, keepdims=True)
+                R = _rotations(u, phi)
+                X[:, moving] = np.matmul(X[:, moving] - xi[:, None], R.transpose(0, 2, 1)) + xi[:, None]
         R, dR = _euler_many(P[:, 3:6])
         Xt = X - C[:, None]
         return np.matmul(Xt, R.transpose(0, 2, 1)) + C[:, None] + P[:, None, :3], Xt, dR
@@ -237,7 +320,12 @@ class TorsionModel:
         g[:, :3] = G.sum(axis=1)
         for k in range(3):
             g[:, 3 + k] = np.einsum("lnd,lnd->l", G, np.matmul(Xt, dR[k].transpose(0, 2, 1)))
-        if self.n_torsions:
+        if self.n_torsions and JIT:
+            out = np.empty((len(P), self.n_torsions))
+            _torsion_gradient(np.ascontiguousarray(X), np.ascontiguousarray(G),
+                              self._bonds, self._flat_moving, self._starts, out)
+            g[:, 6:] = out
+        elif self.n_torsions:
             i, j = self.bonds[:, 0], self.bonds[:, 1]
             u = X[:, j] - X[:, i]
             u /= np.linalg.norm(u, axis=2, keepdims=True)
