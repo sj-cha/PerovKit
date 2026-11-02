@@ -516,7 +516,12 @@ def select_constellations(
     replace = not spec.adsorb
     offset = float(spec.anchor_offset)
     model = lig.torsion_model() if refine else None
+    # the frame's van der Waals radii shadow the sites under it (ConstellationSampler.accept);
+    # chains and rings that torsions turn can still get out of a neighbor's way
+    tm = lig.torsion_model()
+    radii = np.where(tm.frame, tm.radii, 0.0)
     groups = lig.binding_groups
+    shadowed = sampler.n_shadowed
     chosen: List[Candidate] = []
 
     if spec.binding_sites is not None:
@@ -532,11 +537,12 @@ def select_constellations(
                 print(f"[Warning] Binding site group {group} is not available for ligand "
                       f"{lig.name}. Skipped.")
                 continue
-            cand, reason = sampler.fit_sites(lib, sites, offset, replace, model, groups, lig.mol)
+            cand, reason = sampler.fit_sites(lib, sites, offset, replace, model, groups, lig.mol,
+                                             radii)
             if cand is None:
                 print(f"[Warning] Binding site group {group} rejected for ligand {lig.name}: {reason}.")
                 continue
-            sampler.accept(cand, lib, replace)
+            sampler.accept(cand, lib, replace, radii)
             chosen.append(cand)
     else:
         capacity = sampler.capacity([m.site for m in lig.binding_motifs], by_type)
@@ -549,7 +555,7 @@ def select_constellations(
                       f"host at most {capacity}.")
                 n_target = capacity
         chosen, failures = sampler.sample(lib, pools, n_target, offset, replace, model, groups,
-                                          lig.mol)
+                                          lig.mol, radii)
         if len(sampler.occupancy) > 1:
             occ = list(sampler.occupancy.values())
             log(f"[Log] {lig.name} occupancy per face: {min(occ):.2f}-{max(occ):.2f} "
@@ -561,7 +567,8 @@ def select_constellations(
 
     mode = "Adsorbed" if spec.adsorb else "Placed"
     log(f"[Log] {mode} total {len(chosen)} {lig.name} ligands with {lig.n_motifs} motifs "
-        f"({'/'.join(m.site for m in lig.binding_motifs)} sites).")
+        f"({'/'.join(m.site for m in lig.binding_motifs)} sites); {sampler.n_shadowed - shadowed} "
+        f"free sites under them taken out of use.")
 
     out = []
     for cand in chosen:

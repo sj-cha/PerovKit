@@ -224,6 +224,33 @@ def _grid_clearance(x, n_poses, lo, h, shape, table, points, labels, blocked, bo
         out[s] = best
 
 
+@numba.njit(cache=True)
+def _over_sites(x, sites, normals, radii, out):
+    """
+    out[s]: whether pose s of x (S, m, 3) lies over any of `sites` (K, 3): an atom on the
+    outer side of the site's plane (unit `normals`) within its radius of the site laterally.
+    """
+    for s in range(x.shape[0]):
+        hit = False
+        for k in range(sites.shape[0]):
+            for a in range(x.shape[1]):
+                dx = x[s, a, 0] - sites[k, 0]
+                dy = x[s, a, 1] - sites[k, 1]
+                dz = x[s, a, 2] - sites[k, 2]
+                h = dx * normals[k, 0] + dy * normals[k, 1] + dz * normals[k, 2]
+                if h <= 0.0:
+                    continue
+                lx = dx - h * normals[k, 0]
+                ly = dy - h * normals[k, 1]
+                lz = dz - h * normals[k, 2]
+                if lx * lx + ly * ly + lz * lz < radii[a] * radii[a]:
+                    hit = True
+                    break
+            if hit:
+                break
+        out[s] = hit
+
+
 class CoreGrid:
     """
     Cells `h` Å wide over the core, each listing the core atoms (periodic images included)
@@ -311,6 +338,7 @@ class ConstellationSampler:
         foot_scale: float = 2.0,
         w_crowd: float = 1.0,
         n_refine: int = 8,
+        sites: Sequence[BindingSite] = (),
     ):
         self.core_tree, self.core_map = tree_builder(np.asarray(core_positions, dtype=float))
         self._n_core = len(core_positions)
@@ -332,6 +360,15 @@ class ConstellationSampler:
         self.placed: List[np.ndarray] = []
         self._lig_tree = None
         self._core_grid: Optional[CoreGrid] = None
+        # every surface site: a ligand takes the free ones under it out of use (accept), and
+        # a fit may not lie over one already taken (_covers_taken)
+        self.sites = list(sites)
+        self._site_positions = np.array([s.position for s in self.sites], dtype=float).reshape(-1, 3)
+        planes = np.array([s.plane for s in self.sites], dtype=float).reshape(-1, 3)
+        self._site_normals = planes / np.maximum(np.linalg.norm(planes, axis=1, keepdims=True), 1e-12)
+        self._site_tree = self.tree_builder(self._site_positions) if self.sites else None
+        self.n_shadowed = 0
+        self._radii: Optional[np.ndarray] = None   # of the ligand type being placed
         self._libraries: Dict[int, ConformerLibrary] = {}   # with templates, by id of the original
         self.occupancy: Dict[tuple, float] = {}
 
@@ -356,6 +393,7 @@ class ConstellationSampler:
         model: Optional[TorsionModel] = None,
         groups: Optional[List[List[int]]] = None,
         mol=None,
+        radii: Optional[np.ndarray] = None,
     ) -> Tuple[List[Candidate], Counter]:
         """
         Accept up to `n_target` constellations, spread evenly over the faces of the surface.
@@ -378,12 +416,16 @@ class ConstellationSampler:
             model, groups: Torsion model and binding groups of the ligand, to refine fits
                 that clash with the core; without them such constellations are rejected.
             mol: RDKit mol of the ligand; with it, rescued poses become templates (_learn).
+            radii: Radii of its atoms for their projection on the surface (zero for atoms
+                that cast none); with them, a surface site lies under one ligand at most
+                (accept, _covers_taken).
 
         Returns:
             The accepted candidates and a count of the reasons seeds were rejected.
         """
         original = lib
         lib = self._libraries.get(id(original), lib)
+        self._radii = radii
         accepted: List[Candidate] = []
         failures: Counter = Counter()
         seeds = pools[0]
@@ -427,7 +469,7 @@ class ConstellationSampler:
             if cand.fits[0].origin in ("unstuck", "refined"):
                 lib, cand = self._learn(lib, cand, model, groups, mol, replace)
                 self._libraries[id(original)] = lib
-            self.accept(cand, lib, replace)
+            self.accept(cand, lib, replace, radii)
             accepted.append(cand)
             placed[face] += 1
             for s in cand.sites:
@@ -446,12 +488,14 @@ class ConstellationSampler:
         model: Optional[TorsionModel] = None,
         groups: Optional[List[List[int]]] = None,
         mol=None,
+        radii: Optional[np.ndarray] = None,
     ) -> Tuple[Optional[Candidate], str]:
         """
         Evaluate one given constellation; returns (candidate or None, rejection reason).
         """
         original = lib
         lib = self._libraries.get(id(original), lib)
+        self._radii = radii
         seed = sites[0]
         rel = np.array([self.mic(s.position - seed.position) for s in sites])
         cand, reason, stuck = self._evaluate(lib, sites, seed.position + rel, anchor_offset, replace)
@@ -463,13 +507,68 @@ class ConstellationSampler:
         return cand, ("" if cand is not None else reason)
 
 
-    def accept(self, cand: Candidate, lib: ConformerLibrary, replace: bool) -> None:
+    def accept(self, cand: Candidate, lib: ConformerLibrary, replace: bool,
+               radii: Optional[np.ndarray] = None) -> None:
+        """
+        Take the candidate's sites, and with `radii` the free surface sites under the ligand,
+        out of use. A site is under it when an atom on its outer side, projected along the
+        site normal, covers it with its radius (zero for atoms that cast no shadow): a broad
+        multipodal ligand lying on the surface would otherwise let its neighbors start inside
+        it.
+        """
         for s in cand.sites:
             s.passivated = True
         if replace:
             self.displaced.update(cand.atom_indices)
-        self.placed.append(cand.fits[0].coords(lib))
+        x = cand.fits[0].coords(lib)
+        self.placed.append(x)
         self._lig_tree = self.tree_builder(np.vstack(self.placed))
+        if radii is not None:
+            self.n_shadowed += self._shadow(x, radii)
+
+
+    def _nearby_sites(self, center: np.ndarray, reach: float, taken: bool) -> np.ndarray:
+        """Indices of the sites within `reach` of `center` that are taken (or free)."""
+        tree, index_of = self._site_tree
+        near = np.unique(index_of[np.asarray(tree.query_ball_point(center, r=reach), dtype=int)])
+        return np.array([k for k in near if self.sites[k].passivated == taken], dtype=int)
+
+
+    def _over(self, coords: np.ndarray, pivot: np.ndarray, radii: np.ndarray,
+              sites: np.ndarray) -> np.ndarray:
+        """Per pose (S, m, 3): whether it lies over any of `sites` (indices); see _over_sites."""
+        out = np.zeros(len(coords), dtype=bool)
+        if len(sites):
+            # the sites' images nearest the pose, so that plain differences are minimum images
+            P = pivot + self.mic(self._site_positions[sites] - pivot)
+            _over_sites(np.ascontiguousarray(coords, dtype=float), np.ascontiguousarray(P),
+                        np.ascontiguousarray(self._site_normals[sites]),
+                        np.ascontiguousarray(radii, dtype=float), out)
+        return out
+
+
+    def _covers_taken(self, coords: np.ndarray, pivot: np.ndarray) -> np.ndarray:
+        """
+        Per pose (S, m, 3): whether it lies over a site already taken, as an anchor site or
+        under another ligand; a surface site lies under one ligand at most.
+        """
+        if self._site_tree is None or self._radii is None:
+            return np.zeros(len(coords), dtype=bool)
+        reach = float(np.linalg.norm(coords[0] - pivot, axis=1).max()) + float(self._radii.max())
+        return self._over(coords, pivot, self._radii, self._nearby_sites(pivot, reach, taken=True))
+
+
+    def _shadow(self, x: np.ndarray, radii: np.ndarray) -> int:
+        """Mark the free sites under pose `x` passivated; returns how many."""
+        if self._site_tree is None:
+            return 0
+        center = x.mean(axis=0)
+        reach = float(np.linalg.norm(x - center, axis=1).max()) + float(radii.max())
+        free = self._nearby_sites(center, reach, taken=False)
+        under = [k for k in free if self._over(x[None], center, radii, np.array([k]))[0]]
+        for k in under:
+            self.sites[k].passivated = True
+        return len(under)
 
 
     def block_covered(self, sites: Sequence[BindingSite], radius: float) -> int:
@@ -619,9 +718,16 @@ class ConstellationSampler:
 
         fits: List[Fit] = []
         starts: List[tuple] = []
+        n_covering = 0
         for c in ok:
             base, coords, d_core = spun(c)
             feasible = d_core >= self.overlap_cutoff
+            if feasible.any() and self._radii is not None:
+                free = ~self._covers_taken(coords, base.pivot)
+                if not (feasible & free).any():
+                    n_covering += 1
+                    continue   # no rescue: bending would not lift it off others' sites
+                feasible &= free
             if not feasible.any():
                 s = int(np.argmax(d_core))
                 starts.append((base.cost, lib.unique_id(base.conformer), base, coords[s],
@@ -659,7 +765,9 @@ class ConstellationSampler:
                 s = int(np.argmax(d_core))
                 starts.append((base.cost, lib.unique_id(base.conformer), base, coords[s],
                                list(sites), targets, excluded))
-        reason = "every fit clashes with the core" if len(ok) else "no conformer fits the site distances"
+        reason = ("no conformer fits the site distances" if not len(ok) else
+                  "every fit clashes with the core" if not n_covering else
+                  "every fit clashes with the core or lies over another ligand's sites")
         return None, reason, starts
 
 
@@ -683,6 +791,8 @@ class ConstellationSampler:
                 fit = self._stretch_fit(base, start, model, groups, sites, targets, excluded)
             if fit is None:
                 fit = self._refine_fit(base, start, model, groups, targets, excluded)
+            if fit is not None and self._covers_taken(fit.xyz[None], base.pivot)[0]:
+                fit = None
             if fit is not None:
                 return Candidate(sites=sites, targets=targets, fits=[fit])
         return None
