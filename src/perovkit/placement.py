@@ -19,7 +19,7 @@ from scipy.spatial import cKDTree
 from .constellation import Candidate, ConstellationSampler, rotations_about_axis
 from .core import BindingSite
 from .ligand import Ligand, LigandSpec
-from .refine import INTRA_SCALE, _intra_pairs, refine, refine_joint, stretch
+from .refine import INTRA_SCALE, K_CONTACT, _intra_pairs, refine, refine_joint, stretch
 from .utils.geometry import compute_bounding_spheres
 from .utils.rotation import rotation_about_axis, rotation_from_u_to_v
 
@@ -218,6 +218,10 @@ def stretch_poses(poses: Sequence, core_tree, cutoff: float, n_workers: int = 1)
 # room to spare, but in a dense shell it also pushes on every contact that is already
 # fine, and can leave a real one below the cutoff; the narrow one then acts on those alone.
 MARGINS = (0.2, 0.05)
+# Contact weights, as multiples of refine's default, that refine_clusters tries in turn when
+# the margins fail: a ligand whose anchor springs hold it against the core sits where the
+# two balance, which can be a hair below the cutoff (SB3-8 at 1.798 A, anchors 0.45 A off).
+STIFFNESS = (1.0, 2.0, 4.0)
 
 
 def refine_pose(
@@ -401,7 +405,8 @@ def refine_clusters(
     Ligands closer than `cutoff` form a contact graph; in every connected component with a
     contact below the cutoff (a single ligand touching the core included), the multi-motif
     members are refined jointly against the core and all other ligands, and pushed apart
-    from each other wherever they come within `cutoff` + margin (see MARGINS). Members whose
+    from each other wherever they come within `cutoff` + margin (see MARGINS, then with
+    stiffer contacts, STIFFNESS). Members whose
     anchors end farther than `max_rmsd` from their sites keep their poses (one in a shell
     of 89 lecithins would otherwise throw the whole shell away); the others take theirs if
     the closest contact of the component improves. Each refinement stops once every contact
@@ -448,13 +453,13 @@ def refine_clusters(
             continue  # nothing to clear: a lone ligand with no contact below the cutoff
         others = [c for j, c in enumerate(coords_list) if j not in members]
         trees = [core_tree, tree_builder(np.vstack(others))[0] if others else None]
-        for margin in MARGINS:
+        for stiff, margin in [(k, m) for k in STIFFNESS for m in MARGINS]:
             results = refine_joint(
                 [poses[i].ligand.torsion_model() for i in members],
                 [coords_list[i] for i in members],
                 [poses[i].ligand.binding_groups for i in members],
                 [poses[i].candidate.targets for i in members],
-                trees, cutoff + margin, tree_builder,
+                trees, cutoff + margin, tree_builder, k_contact=K_CONTACT * stiff,
                 stop_at=cutoff + margin / 2 if stop_at is None else stop_at, stop_rmsd=max_rmsd,
             )
             moved = [(i, r) for i, r in zip(members, results) if r.anchor_rmsd <= max_rmsd]
