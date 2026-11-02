@@ -107,7 +107,7 @@ class NanoCrystal:
         max_anchor_rmsd: float = 0.5,   # Å
         refine_torsions: bool = True,
         stretch_tails: bool = True,
-        n_workers: int = 1,
+        n_workers: int = 32,   # at most the CPUs available
     ) -> None:
 
         assert not self.ligands, "Ligands have already been placed."
