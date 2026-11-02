@@ -225,6 +225,14 @@ class TorsionModel:
         self._flat_moving = np.concatenate([m for *_, m in self._moving] + [np.zeros(0, dtype=np.int64)]).astype(np.int64)
         self._starts = np.concatenate([[0], np.cumsum([len(m) for *_, m in self._moving])]).astype(np.int64)
 
+    @property
+    def frame(self) -> np.ndarray:
+        """
+        (n_atoms,) atoms that no tail torsion moves: what holds the binding groups together,
+        which turning the dangling chains and rings cannot take out of a neighbor's way.
+        """
+        return ~self.masks[self.tails].any(axis=0)
+
     @classmethod
     def build(cls, mol: Chem.Mol, root: int, binding: Sequence[int] = ()) -> TorsionModel:
         n = mol.GetNumAtoms()
