@@ -23,7 +23,7 @@ from .refine import INTRA_SCALE
 from .placement import (SitePose, FitPose, bounding_spheres, optimize_pose,
                         place_about_normal, motif_pools, refine_clusters, refine_pose,
                         select_constellations, stretch_poses, tree_min_distance,
-                        intramolecular_contacts)
+                        intramolecular_contacts, DENSE_PAIRS)
 from .utils.geometry import farthest_point_sampling, compute_bounding_spheres, build_neighbor_map
 
 
@@ -699,6 +699,13 @@ class Slab:
                 d[..., ax] -= L * np.round(d[..., ax] / L)
         return d
 
+    def _wrap(self, points: np.ndarray) -> np.ndarray:
+        x = np.array(points, dtype=float, copy=True)
+        for ax in range(3):
+            if self._pbc[ax]:
+                x[..., ax] -= self._box[ax] * np.floor(x[..., ax] / self._box[ax])
+        return x
+
     def _build_pbc_tree(self, points: np.ndarray):
         pts = np.asarray(points, dtype=float)
         n = len(pts)
@@ -776,8 +783,14 @@ class Slab:
         
         # Distance to neighboring ligands
         neighbors = np.vstack(neighbors_coords)  # (N,3)
-        diff = coords_i[:, None, :] - neighbors[None, :, :]  # (M,N,3)
-        diff = self._mic(diff)
+        if len(coords_i) * len(neighbors) > DENSE_PAIRS:
+            # wrapped into the box, periodic images one box away hold every minimum image
+            tree, image_of = self._build_pbc_tree(self._wrap(coords_i))
+            _, k = tree.query(self._wrap(neighbors))
+            diff = self._mic(coords_i[image_of[k]] - neighbors)
+        else:
+            diff = coords_i[:, None, :] - neighbors[None, :, :]  # (M,N,3)
+            diff = self._mic(diff)
         d2 = np.sum(diff * diff, axis=-1)
         d_lig = float(np.sqrt(d2.min()))
 

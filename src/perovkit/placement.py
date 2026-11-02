@@ -275,6 +275,12 @@ def bounding_spheres(poses: Sequence, coords_list: List[np.ndarray]) -> Tuple[np
     return centers, radii
 
 
+# Above this many atom pairs, _min_distance finds each neighbor atom's nearest atom in a tree
+# and measures those pairs alone, with the same arithmetic: a long multi-motif ligand has
+# nearly every other ligand within its sweep sphere, ~10^6 pairs on a large nanocrystal.
+DENSE_PAIRS = 20000
+
+
 def tree_min_distance(
     core_tree,
     tree_builder: Callable,
