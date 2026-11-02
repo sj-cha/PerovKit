@@ -29,20 +29,21 @@ _ROTATABLE = Chem.MolFromSmarts("[!$(*#*)&!D1]-&!@[!$(*#*)&!D1]")
 # hundreds of kcal/mol in UFF. 0.8 leaves cleaner chains but jams the densest packings
 # (zwitterions on a nanocrystal at 50%).
 INTRA_SCALE = 0.7
+K_CONTACT = 40.0   # per Å^2, soft-sphere weight of a contact
 # Intramolecular overlaps weigh INTRA_WEIGHT x a contact. At 1x, pulling the anchors of a
 # lecithin onto their sites folded its head group to 1.38 A H...H across the phosphodiester.
 INTRA_WEIGHT = 10.0
 
 
-def _intra_pairs(model, X, scale):
+def _intra_pairs(model, X, scale, skin=0.0):
     """
     Pairs (a, b) of atoms of one pose, four or more bonds apart, closer than scale x their
-    summed radii, in the flattened (L * n, 3) poses X, with those limits.
+    summed radii (+ `skin`), in the flattened (L * n, 3) poses X, with those limits.
     """
     L, n, _ = X.shape
     flat = X.reshape(-1, 3)
     shifted = X + (np.arange(L) * 1.0e4)[:, None, None] * np.array([1.0, 0.0, 0.0])
-    reach = 2.0 * scale * float(model.radii.max())
+    reach = 2.0 * scale * float(model.radii.max()) + skin
     close = cKDTree(shifted.reshape(-1, 3)).query_pairs(reach, output_type="ndarray")
     if not len(close):
         return close[:, 0], close[:, 1], np.zeros(0), np.zeros(0)
@@ -51,7 +52,7 @@ def _intra_pairs(model, X, scale):
     pa, pb = pa[keep], pb[keep]
     limit = scale * (model.radii[pa % n] + model.radii[pb % n])
     d = np.linalg.norm(flat[pa] - flat[pb], axis=1)
-    hit = (d < limit) & (d > 1e-9)
+    hit = (d < limit + skin) & (d > 1e-9)
     return pa[hit], pb[hit], d[hit], limit[hit]
 
 # The torsion loops are compiled with numba; PEROVKIT_NUMBA=0 runs the numpy code below
@@ -377,53 +378,175 @@ class Refinement:
     converged: bool
 
 
-def _ligand_terms(model, x, groups, targets, trees, contact, k_anchor, k_contact, intra):
-    """
-    Anchor, contact and intramolecular penalties of one ligand and their Cartesian gradient.
+# Verlet lists: contacts are searched within their reach + SKIN, and searched again only for
+# the ligands that have moved far enough since that every pair within reach stays listed. A
+# tree search over every atom at every evaluation cost more than the rest of the objective;
+# a joint L-BFGS step moves only a few ligands by more than a few tenths of an Å.
+SKIN = 1.0
 
-    Returns (E, G, closest, tangled): the closest contact found with the fixed atoms (inf if
-    none within `contact`) and whether any intramolecular pair is closer than `intra`.
-    """
-    G = np.zeros_like(x)
+
+@numba.njit(cache=True)
+def _largest_steps(X, ref, starts, out):
+    """out[b]: largest squared displacement from `ref` of the atoms starts[b]:starts[b + 1]."""
+    for b in range(starts.shape[0] - 1):
+        m = 0.0
+        for a in range(starts[b], starts[b + 1]):
+            dx = X[a, 0] - ref[a, 0]
+            dy = X[a, 1] - ref[a, 1]
+            dz = X[a, 2] - ref[a, 2]
+            m = max(m, dx * dx + dy * dy + dz * dz)
+        out[b] = m
+
+
+@numba.njit(cache=True)
+def _fixed_terms(x, atom, partner, contact, k, G):
+    """Soft-sphere penalty of the listed (atom, fixed partner) pairs within `contact`; adds
+    its gradient to G. Returns (E, closest contact)."""
     E = 0.0
-    closest = float("inf")
-    tangled = False
-    for grp, t in zip(groups, targets):
-        d = x[grp].mean(axis=0) - t
-        E += k_anchor * float(d @ d)
-        G[grp] += 2.0 * k_anchor * d / len(grp)
-    for tree in trees:
-        if tree is None or tree.n == 0:
-            continue
-        dist, idx = tree.query(x, k=min(8, tree.n), distance_upper_bound=contact)
-        dist = dist.reshape(len(x), -1)
-        idx = idx.reshape(len(x), -1)
-        atom, slot = np.nonzero(np.isfinite(dist) & (dist > 1e-9))
-        if len(atom):
-            d = dist[atom, slot]
-            closest = min(closest, float(d.min()))
-            v = (x[atom] - tree.data[idx[atom, slot]]) / d[:, None]
+    closest = np.inf
+    for t in range(atom.shape[0]):
+        a = atom[t]
+        dx = x[a, 0] - partner[t, 0]
+        dy = x[a, 1] - partner[t, 1]
+        dz = x[a, 2] - partner[t, 2]
+        d = np.sqrt(dx * dx + dy * dy + dz * dz)
+        if d < contact and d > 1e-9:
+            closest = min(closest, d)
             over = contact - d
-            E += k_contact * float(over @ over)
-            np.add.at(G, atom, -2.0 * k_contact * over[:, None] * v)
-    # close pairs from a tree rather than every pair four bonds apart (thousands of them)
-    pa, pb, d, limit = _intra_pairs(model, x[None], intra)
-    if len(pa):
-        tangled = True
-        k_intra = INTRA_WEIGHT * k_contact
-        v = (x[pa] - x[pb]) / d[:, None]
-        over = limit - d
-        E += k_intra * float(over @ over)
-        f = -2.0 * k_intra * over[:, None] * v
-        np.add.at(G, pa, f)
-        np.add.at(G, pb, -f)
-    return E, G, closest, tangled
+            E += k * over * over
+            c = -2.0 * k * over / d
+            G[a, 0] += c * dx
+            G[a, 1] += c * dy
+            G[a, 2] += c * dz
+    return E, closest
 
 
-def _many_terms(model, X, groups, T, trees, contact, k_anchor, k_contact, intra):
+@numba.njit(cache=True)
+def _pair_terms(x, pa, pb, shift, limit, k, G):
+    """Soft-sphere penalty of the listed pairs of moving atoms, pa against the image of pb at
+    x[pb] + shift, within their `limit`; adds its gradient to G. Returns (E, closest, hits)."""
+    E = 0.0
+    closest = np.inf
+    hits = 0
+    for t in range(pa.shape[0]):
+        a, b = pa[t], pb[t]
+        dx = x[a, 0] - x[b, 0] - shift[t, 0]
+        dy = x[a, 1] - x[b, 1] - shift[t, 1]
+        dz = x[a, 2] - x[b, 2] - shift[t, 2]
+        d = np.sqrt(dx * dx + dy * dy + dz * dz)
+        if d < limit[t] and d > 1e-9:
+            hits += 1
+            closest = min(closest, d)
+            over = limit[t] - d
+            E += k * over * over
+            c = -2.0 * k * over / d
+            G[a, 0] += c * dx
+            G[a, 1] += c * dy
+            G[a, 2] += c * dz
+            G[b, 0] -= c * dx
+            G[b, 1] -= c * dy
+            G[b, 2] -= c * dz
+    return E, closest, hits
+
+
+class _Neighbors:
     """
-    _ligand_terms for L poses of one ligand type, X (L, n, 3) and targets T (L, m, 3), with
-    one tree query for all their atoms. Returns (E, G (L, n, 3), closest, tangled, rmsd (L,)).
+    Verlet lists of L poses of one ligand type, X (L, n, 3): the fixed atoms of `trees`
+    (their ``data`` holds the positions, periodic images included) within `contact` + SKIN
+    of each atom, and the pairs of one pose four or more bonds apart within their limit
+    + SKIN. A pose is searched again once one of its atoms has moved SKIN / 2.
+    """
+
+    def __init__(self, model, trees, contact, intra):
+        self.model, self.contact, self.intra = model, contact, intra
+        self.trees = [t for t in trees if t is not None and t.n > 0]
+        self.ref = None
+
+    def update(self, X):
+        L, n, _ = X.shape
+        if self.ref is None or self.ref.shape != X.shape:
+            self.ref = X.copy()
+            self.starts = np.arange(L + 1, dtype=np.int64) * n
+            stale = np.ones(L, dtype=bool)
+            self.atom = self.pa = self.pb = np.zeros(0, dtype=np.int64)
+            self.partner, self.limit = np.zeros((0, 3)), np.zeros(0)
+        else:
+            moved = np.empty(L)
+            _largest_steps(X.reshape(-1, 3), self.ref.reshape(-1, 3), self.starts, moved)
+            stale = moved > (0.5 * SKIN) ** 2
+            if not stale.any():
+                return
+            self.ref[stale] = X[stale]
+        poses = np.flatnonzero(stale)
+        atoms = (poses[:, None] * n + np.arange(n)).ravel()   # flat index of their atoms
+        keep = ~stale[self.atom // n]
+        found_atom, found_partner = [self.atom[keep]], [self.partner[keep]]
+        if self.trees:
+            own = cKDTree(X[poses].reshape(-1, 3))
+            for tree in self.trees:
+                m = own.sparse_distance_matrix(tree, self.contact + SKIN, output_type="ndarray")
+                found_atom.append(atoms[m["i"]])
+                found_partner.append(tree.data[m["j"]])
+        self.atom, self.partner = np.concatenate(found_atom), np.concatenate(found_partner)
+        pa, pb, _, limit = _intra_pairs(self.model, X[poses], self.intra, SKIN)
+        keep = ~stale[self.pa // n]
+        self.pa = np.concatenate([self.pa[keep], atoms[pa]])
+        self.pb = np.concatenate([self.pb[keep], atoms[pb]])
+        self.limit = np.concatenate([self.limit[keep], limit])
+        self.no_shift = np.zeros((len(self.pa), 3))
+
+
+class _Mutual:
+    """
+    Verlet list of the contacts between atoms of different ligands, X (N, 3) with the
+    atoms of ligand l at starts[l]:starts[l + 1], within `contact` + SKIN through the
+    periodic images of `tree_builder`: pairs (p, q) with the image of q at X[q] + shift.
+    A ligand's pairs are searched again once one of its atoms has moved SKIN / 4: the pairs
+    of two ligands date from the later of their searches, so together they have moved at
+    most 3/4 SKIN since.
+    """
+
+    def __init__(self, starts, contact, tree_builder):
+        self.starts = np.asarray(starts, dtype=np.int64)
+        self.contact, self.tree_builder = contact, tree_builder
+        self.owner = np.repeat(np.arange(len(starts) - 1), np.diff(starts))
+        self.ref = None
+        self.p = self.q = np.zeros(0, dtype=np.int64)
+        self.shift = np.zeros((0, 3))
+
+    def update(self, X):
+        if self.ref is None:
+            self.ref = X.copy()
+            stale = np.ones(len(self.starts) - 1, dtype=bool)
+        else:
+            moved = np.empty(len(self.starts) - 1)
+            _largest_steps(X, self.ref, self.starts, moved)
+            stale = moved > (0.25 * SKIN) ** 2
+            if not stale.any():
+                return
+        atoms = np.flatnonzero(stale[self.owner])
+        self.ref[atoms] = X[atoms]
+        tree, image_of = self.tree_builder(X)
+        m = cKDTree(X[atoms]).sparse_distance_matrix(tree, self.contact + SKIN, output_type="ndarray")
+        p, j = atoms[m["i"]], m["j"].astype(np.int64)
+        q = image_of[j]
+        op, oq = self.owner[p], self.owner[q]
+        # a pair of two searched ligands is found from both sides: keep it once
+        found = (op != oq) & (~stale[oq] | (op < oq))
+        keep = ~stale[self.owner[self.p]] & ~stale[self.owner[self.q]]
+        self.p = np.concatenate([self.p[keep], p[found]])
+        self.q = np.concatenate([self.q[keep], q[found]])
+        self.shift = np.concatenate([self.shift[keep], tree.data[j[found]] - X[q[found]]])
+        self.limit = np.full(len(self.p), self.contact)
+
+
+def _terms(model, X, groups, T, nb, k_anchor, k_contact):
+    """
+    Anchor, contact and intramolecular penalties of L poses of one ligand type, X (L, n, 3)
+    with anchor targets T (L, m, 3), and their Cartesian gradient, from the lists of `nb`
+    (a _Neighbors). Returns (E, G (L, n, 3), closest, tangled, rmsd (L,)): the closest
+    contact with the fixed atoms (inf if none within `contact`), whether any intramolecular
+    pair is within its limit, and the anchor RMSD of each pose.
     """
     L, n, _ = X.shape
     G = np.zeros_like(X)
@@ -434,33 +557,13 @@ def _many_terms(model, X, groups, T, trees, contact, k_anchor, k_contact, intra)
         E += k_anchor * float(np.sum(d * d))
         sq += np.sum(d * d, axis=1)
         G[:, grp] += (2.0 * k_anchor * d / len(grp))[:, None, :]
+    nb.update(X)
     flat, G_flat = X.reshape(-1, 3), G.reshape(-1, 3)
-    closest, tangled = float("inf"), False
-    for tree in trees:
-        if tree is None or tree.n == 0:
-            continue
-        dist, idx = tree.query(flat, k=min(8, tree.n), distance_upper_bound=contact)
-        dist = dist.reshape(len(flat), -1)
-        idx = idx.reshape(len(flat), -1)
-        atom, slot = np.nonzero(np.isfinite(dist) & (dist > 1e-9))
-        if len(atom):
-            d = dist[atom, slot]
-            closest = min(closest, float(d.min()))
-            v = (flat[atom] - tree.data[idx[atom, slot]]) / d[:, None]
-            over = contact - d
-            E += k_contact * float(over @ over)
-            np.add.at(G_flat, atom, -2.0 * k_contact * over[:, None] * v)
-    # one tree for the intramolecular pairs of all poses, each pose shifted far apart
-    pa, pb, d, limit = _intra_pairs(model, X, intra)
-    if len(pa):
-        tangled = True
-        k_intra = INTRA_WEIGHT * k_contact
-        v = (flat[pa] - flat[pb]) / d[:, None]
-        over = limit - d
-        E += k_intra * float(over @ over)
-        f = -2.0 * k_intra * over[:, None] * v
-        np.add.at(G_flat, pa, f)
-        np.add.at(G_flat, pb, -f)
+    e, closest = _fixed_terms(flat, nb.atom, nb.partner, nb.contact, k_contact, G_flat)
+    e_in, _, hits = _pair_terms(flat, nb.pa, nb.pb, nb.no_shift, nb.limit,
+                                INTRA_WEIGHT * k_contact, G_flat)
+    E += e + e_in
+    tangled = hits > 0
     return E, G, closest, tangled, np.sqrt(sq / len(groups))
 
 
@@ -489,7 +592,7 @@ def refine(
     trees: Sequence,
     contact: float,
     k_anchor: float = 20.0,
-    k_contact: float = 40.0,
+    k_contact: float = K_CONTACT,
     intra: float = INTRA_SCALE,
     w_torsion: float = 0.02,
     max_iter: int = 400,
@@ -525,14 +628,16 @@ def refine(
     center = targets.mean(axis=0)
     groups = [np.asarray(g, dtype=int) for g in groups]
     done = {"ok": False, "x": None}
+    nb = _Neighbors(model, trees, contact, intra)
 
     def fun(params):
         x, xt, dR = model.forward(params, coords, center)
-        E, G, closest, tangled = _ligand_terms(model, x, groups, targets, trees, contact,
-                                               k_anchor, k_contact, intra)
+        E, G, closest, tangled, rmsd = _terms(model, x[None], groups, targets[None], nb,
+                                              k_anchor, k_contact)
+        G = G[0]
         done["x"] = params.copy()
         done["ok"] = (stop_at is not None and closest >= stop_at and not tangled
-                      and _anchor_rmsd(x, groups, targets) <= stop_rmsd)
+                      and float(rmsd[0]) <= stop_rmsd)
         if pull is not None:
             direction, mask, k_pull = pull
             E -= k_pull * float(np.sum((x[mask] - center) @ direction))
@@ -619,7 +724,7 @@ def refine_joint(
     contact: float,
     tree_builder,
     k_anchor: float = 20.0,
-    k_contact: float = 40.0,
+    k_contact: float = K_CONTACT,
     intra: float = INTRA_SCALE,
     w_torsion: float = 0.02,
     max_iter: int = 400,
@@ -629,8 +734,8 @@ def refine_joint(
     """
     Refine several ligands at once, so that ligands jammed against each other can all
     give way. Each has the terms of `refine`; atoms of different ligands are also pushed
-    `contact` Å apart. Those contacts are searched afresh at every evaluation, in a tree
-    from `tree_builder` (periodic images included), since the ligands move. `stop_at` and
+    `contact` Å apart. Those contacts are listed through a tree from `tree_builder`
+    (periodic images included) and listed again whenever the ligands have moved (SKIN). `stop_at` and
     `stop_rmsd` end it early as in `refine`, with every ligand meeting them. Ligands of one
     type are computed together, so a shell of 40 lecithins costs about as many Python-level
     steps per evaluation as a single one.
@@ -638,11 +743,10 @@ def refine_joint(
     sizes = [6 + m.n_torsions for m in models]
     offsets = np.concatenate([[0], np.cumsum(sizes)])
     groups = [[np.asarray(g, dtype=int) for g in gs] for gs in groups]
-    owner = np.concatenate([np.full(len(c), l) for l, c in enumerate(coords)])
     starts = np.concatenate([[0], np.cumsum([len(c) for c in coords])])
     done = {"ok": False, "x": None}
 
-    # ligands of one type are computed together (forward_many and _many_terms)
+    # ligands of one type are computed together (forward_many and _terms)
     batches = []
     for model in {id(m): m for m in models}.values():
         members = [l for l, m in enumerate(models) if m is model]
@@ -654,7 +758,9 @@ def refine_joint(
             X0=np.array([coords[l] for l in members]),
             T=np.array([targets[l] for l in members]),
             C=np.array([targets[l].mean(axis=0) for l in members]),
+            nb=_Neighbors(model, trees, contact, intra),
         ))
+    mutual = _Mutual(starts, contact, tree_builder)
 
     def fun(P):
         E = 0.0
@@ -664,28 +770,17 @@ def refine_joint(
         for b in batches:
             Pb = P[b["params"]]
             Xb, Xt, dR = b["model"].forward_many(Pb, b["X0"], b["C"])
-            e, G, c, t, rmsd = _many_terms(b["model"], Xb, b["groups"], b["T"], trees, contact,
-                                           k_anchor, k_contact, intra)
+            e, G, c, t, rmsd = _terms(b["model"], Xb, b["groups"], b["T"], b["nb"],
+                                      k_anchor, k_contact)
             closest, tangled, worst = min(closest, c), tangled or t, max(worst, float(rmsd.max()))
             E += e + w_torsion * float(np.sum(1.0 - np.cos(Pb[:, 6:])))
             X[b["atoms"]] = Xb.reshape(-1, 3)
             state.append((Pb, Xb, Xt, dR, G))
         G_all = np.zeros_like(X)
-        tree, image_of = tree_builder(X)
-        dist, idx = tree.query(X, k=min(16, tree.n), distance_upper_bound=contact)
-        p, slot = np.nonzero(np.isfinite(dist))
-        q = image_of[idx[p, slot]]
-        keep = owner[p] < owner[q]          # each inter-ligand contact once
-        if keep.any():
-            p, slot, q = p[keep], slot[keep], q[keep]
-            dd = dist[p, slot]
-            closest = min(closest, float(dd.min()))
-            v = (X[p] - tree.data[idx[p, slot]]) / dd[:, None]
-            over = contact - dd
-            f = -2.0 * k_contact * over[:, None] * v
-            E += k_contact * float(over @ over)
-            np.add.at(G_all, p, f)
-            np.add.at(G_all, q, -f)
+        mutual.update(X)
+        e, c, _ = _pair_terms(X, mutual.p, mutual.q, mutual.shift, mutual.limit, k_contact, G_all)
+        E += e
+        closest = min(closest, c)
         grad = np.empty_like(P)
         for b, (Pb, Xb, Xt, dR, G) in zip(batches, state):
             G += G_all[b["atoms"]].reshape(G.shape)
