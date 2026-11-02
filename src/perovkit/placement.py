@@ -401,10 +401,12 @@ def refine_clusters(
     Ligands closer than `cutoff` form a contact graph; in every connected component with a
     contact below the cutoff (a single ligand touching the core included), the multi-motif
     members are refined jointly against the core and all other ligands, and pushed apart
-    from each other wherever they come within `cutoff` + margin (see MARGINS). A result
-    replaces the poses only if its anchors stay within `max_rmsd` and its closest contact
-    improves. Each refinement stops once every contact is `stop_at` Å (by default halfway
-    into the margin). Updates `coords_list` and the poses in place.
+    from each other wherever they come within `cutoff` + margin (see MARGINS). Members whose
+    anchors end farther than `max_rmsd` from their sites keep their poses (one in a shell
+    of 89 lecithins would otherwise throw the whole shell away); the others take theirs if
+    the closest contact of the component improves. Each refinement stops once every contact
+    is `stop_at` Å (by default halfway into the margin). Updates `coords_list` and the poses
+    in place.
 
     Returns:
         Whether any component improved.
@@ -455,14 +457,15 @@ def refine_clusters(
                 trees, cutoff + margin, tree_builder,
                 stop_at=cutoff + margin / 2 if stop_at is None else stop_at, stop_rmsd=max_rmsd,
             )
-            if any(r.anchor_rmsd > max_rmsd for r in results):
+            moved = [(i, r) for i, r in zip(members, results) if r.anchor_rmsd <= max_rmsd]
+            if not moved:
                 continue
             trial = list(coords_list)
-            for i, r in zip(members, results):
+            for i, r in moved:
                 trial[i] = r.coords
             after = min(closest(trial, i) for i in members)
             if after > before + 1e-3:
-                for i, r in zip(members, results):
+                for i, r in moved:
                     coords_list[i] = r.coords
                     poses[i].variant = poses[i].add_variant(r.coords)
                 improved = True
