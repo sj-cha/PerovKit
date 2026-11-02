@@ -32,6 +32,9 @@ class ConformerLibrary:
         mirrored (bool): Whether the second half of the conformers mirrors the first.
         stretched (np.ndarray): (n_conf,) conformers whose dangling chains were straightened
             and stood up (see build); placement does not stretch them again.
+        reference_energy (float): Absolute UFF energy (kcal/mol) the energies are relative to.
+        n_templates (int): Poses appended by with_template, the last conformers; they have
+            no mirror image.
     """
     coords: np.ndarray
     energies: np.ndarray
@@ -40,6 +43,8 @@ class ConformerLibrary:
     body: np.ndarray
     mirrored: bool = False
     stretched: Optional[np.ndarray] = None
+    reference_energy: float = 0.0
+    n_templates: int = 0
 
     def __post_init__(self):
         if self.stretched is None:
@@ -54,7 +59,27 @@ class ConformerLibrary:
         The conformer, or the one it mirrors: on a mirror-symmetric surface the two make
         the same attempt.
         """
-        return conformer % (self.n_conformers // 2) if self.mirrored else conformer
+        n_base = self.n_conformers - self.n_templates
+        if conformer >= n_base or not self.mirrored:
+            return conformer
+        return conformer % (n_base // 2)
+
+    def with_template(self, mol: Chem.Mol, groups: List[List[int]], x: np.ndarray,
+                      energy: float, stretched: bool = True) -> "ConformerLibrary":
+        """
+        This library plus the pose `x` as one more conformer with relative UFF energy
+        `energy`: a pose that had to be rescued at a real site, its chains stood up unless
+        `stretched` is False, which the next sites of the same geometry then fit at once.
+        """
+        anchors, directions = _anchor_geometry(mol, groups, x[None])
+        return ConformerLibrary(coords=np.concatenate([self.coords, x[None]]),
+                                energies=np.append(self.energies, energy),
+                                anchors=np.concatenate([self.anchors, anchors]),
+                                directions=np.concatenate([self.directions, directions]),
+                                body=self.body, mirrored=self.mirrored,
+                                stretched=np.append(self.stretched, stretched),
+                                reference_energy=self.reference_energy,
+                                n_templates=self.n_templates + 1)
 
     @classmethod
     def build(
@@ -66,7 +91,7 @@ class ConformerLibrary:
         mirror: Optional[bool] = None,
         random_seed: int = 42,
         n_threads: int = 0,
-        n_stretched: int = 12,
+        n_stretched: int = 0,
     ) -> ConformerLibrary:
         """
         Embed conformers with ETKDG and, optionally, minimize them with UFF.
@@ -91,9 +116,10 @@ class ConformerLibrary:
             n_stretched (int): For a multi-motif ligand with dangling chains, add this many
                 conformers with those chains straightened and standing up from a flat
                 surface through the anchors, then relaxed with UFF (see _stretched).
-                Embedded conformers are coils that mostly lie on the surface; without
-                these, about half of the constellations of a lecithin shell had no rigid
-                fit clear of the core and needed a refinement during site selection.
+                Embedded conformers are coils that mostly lie on the surface, but site
+                selection now keeps each pose it had to rescue as a template for the sites
+                of the same geometry (ConstellationSampler._learn), which does this at a
+                real site and costs a placement nothing; these 12 cost a lecithin 6 s.
         """
         if ligand.mol is None:
             raise ValueError("ConformerLibrary needs the ligand's RDKit mol")
@@ -131,7 +157,8 @@ class ConformerLibrary:
         if len(extra):
             coords = np.concatenate([coords, extra])
             energies = np.concatenate([energies, extra_e if optimize else np.zeros(len(extra))])
-        energies = energies - energies.min()
+        reference = float(energies.min())
+        energies = energies - reference
         if mirror is None:
             mirror = all(a.GetChiralTag() == Chem.ChiralType.CHI_UNSPECIFIED for a in mol.GetAtoms())
         if mirror:
@@ -145,7 +172,7 @@ class ConformerLibrary:
         if not body.any():
             body[:] = True
         return cls(coords=coords, energies=energies, anchors=anchors, directions=directions,
-                   body=body, mirrored=bool(mirror), stretched=stretched)
+                   body=body, mirrored=bool(mirror), stretched=stretched, reference_energy=reference)
 
     def pair_distances(self) -> np.ndarray:
         """
@@ -211,6 +238,15 @@ def _uff_polish(mol: Chem.Mol, x: np.ndarray, fixed: List[int], max_displ: float
     ff.Minimize(maxIts=iters)
     y = np.array(m.GetConformer().GetPositions())
     return y, AllChem.UFFGetMoleculeForceField(m).CalcEnergy()
+
+
+def _uff_energy(mol: Chem.Mol, x: np.ndarray) -> float:
+    """UFF energy (kcal/mol) of `mol` at positions `x`."""
+    m = Chem.Mol(mol)
+    conf = m.GetConformer()
+    for a, p in enumerate(x):
+        conf.SetAtomPosition(a, Point3D(*map(float, p)))
+    return AllChem.UFFGetMoleculeForceField(m).CalcEnergy()
 
 
 def _stretched(ligand: Ligand, mol: Chem.Mol, coords: np.ndarray, n_pick: int, uff: bool = True,

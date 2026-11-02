@@ -532,7 +532,7 @@ def select_constellations(
                 print(f"[Warning] Binding site group {group} is not available for ligand "
                       f"{lig.name}. Skipped.")
                 continue
-            cand, reason = sampler.fit_sites(lib, sites, offset, replace, model, groups)
+            cand, reason = sampler.fit_sites(lib, sites, offset, replace, model, groups, lig.mol)
             if cand is None:
                 print(f"[Warning] Binding site group {group} rejected for ligand {lig.name}: {reason}.")
                 continue
@@ -548,7 +548,8 @@ def select_constellations(
                 print(f"[Warning] Requested {n_target} ligands {lig.name}, but the free sites "
                       f"host at most {capacity}.")
                 n_target = capacity
-        chosen, failures = sampler.sample(lib, pools, n_target, offset, replace, model, groups)
+        chosen, failures = sampler.sample(lib, pools, n_target, offset, replace, model, groups,
+                                          lig.mol)
         if len(sampler.occupancy) > 1:
             occ = list(sampler.occupancy.values())
             log(f"[Log] {lig.name} occupancy per face: {min(occ):.2f}-{max(occ):.2f} "
