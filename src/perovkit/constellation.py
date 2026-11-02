@@ -13,6 +13,7 @@ import math
 import random
 from typing import Callable, Dict, Iterator, List, Optional, Sequence, Tuple
 
+import numba
 import numpy as np
 
 from scipy.spatial import cKDTree
@@ -195,6 +196,68 @@ def fit_conformers(
                 fit=fit, cost=fit + orient)
 
 
+@numba.njit(cache=True)
+def _grid_clearance(x, n_poses, lo, h, shape, table, points, labels, blocked, bound, out):
+    m = x.shape[0] // n_poses
+    for s in range(n_poses):
+        best = np.inf
+        for p in range(s * m, (s + 1) * m):
+            c0 = int(np.floor((x[p, 0] - lo[0]) / h))
+            c1 = int(np.floor((x[p, 1] - lo[1]) / h))
+            c2 = int(np.floor((x[p, 2] - lo[2]) / h))
+            if c0 < 0 or c1 < 0 or c2 < 0 or c0 >= shape[0] or c1 >= shape[1] or c2 >= shape[2]:
+                continue
+            row = (c0 * shape[1] + c1) * shape[2] + c2
+            for k in range(table.shape[1]):
+                a = table[row, k]
+                if a < 0:
+                    break
+                if blocked[labels[a]]:
+                    continue
+                dx = x[p, 0] - points[a, 0]
+                dy = x[p, 1] - points[a, 1]
+                dz = x[p, 2] - points[a, 2]
+                d = np.sqrt(dx * dx + dy * dy + dz * dz)
+                if d < bound and d < best:
+                    best = d
+        out[s] = best
+
+
+class CoreGrid:
+    """
+    Cells `h` Å wide over the core, each listing the core atoms (periodic images included)
+    within `bound` of some point of the cell, so that the nearest core atom within `bound`
+    of a point is among a handful of candidates. The spin scan asks this for every atom of
+    36 spins of every fitted conformer; a tree query per atom was a quarter of the site
+    selection on a large nanocrystal.
+    """
+
+    def __init__(self, points: np.ndarray, labels: np.ndarray, bound: float, h: float = 1.0):
+        self.points = np.ascontiguousarray(points, dtype=float)
+        self.labels = np.asarray(labels, dtype=np.int64)
+        self.bound, self.h = float(bound), float(h)
+        self.lo = self.points.min(axis=0) - bound
+        self.shape = (np.ceil((self.points.max(axis=0) + bound - self.lo) / h).astype(np.int64) + 1)
+        centers = self.lo + (np.indices(self.shape).reshape(3, -1).T + 0.5) * h
+        lists = cKDTree(self.points).query_ball_point(centers, r=bound + h * math.sqrt(3.0) / 2.0)
+        lens = np.fromiter(map(len, lists), dtype=np.int64, count=len(lists))
+        self.table = np.full((len(lists), max(1, int(lens.max()))), -1, dtype=np.int64)
+        rows = np.repeat(np.arange(len(lists)), lens)
+        cols = np.arange(len(rows)) - np.repeat(np.cumsum(lens) - lens, lens)
+        self.table[rows, cols] = np.concatenate([np.asarray(l, dtype=np.int64) for l in lists if l])
+
+    def clearance(self, coords: np.ndarray, blocked: np.ndarray) -> np.ndarray:
+        """
+        Per-pose distance to the nearest core atom whose label is not `blocked`: (S,) for
+        (S, m, 3), inf where none is within `bound`.
+        """
+        out = np.empty(coords.shape[0])
+        _grid_clearance(np.ascontiguousarray(coords, dtype=float).reshape(-1, 3), coords.shape[0],
+                        self.lo, self.h, self.shape, self.table, self.points, self.labels,
+                        blocked, self.bound, out)
+        return out
+
+
 class ConstellationSampler:
     """
     Picks constellations for the multi-motif ligands of one structure, one ligand at a time.
@@ -260,6 +323,7 @@ class ConstellationSampler:
         self.n_refine = n_refine
         self.placed: List[np.ndarray] = []
         self._lig_tree = None
+        self._core_grid: Optional[CoreGrid] = None
         self.occupancy: Dict[tuple, float] = {}
 
 
@@ -670,7 +734,7 @@ class ConstellationSampler:
         return cKDTree(tree.data[idx]) if len(idx) else None
 
 
-    def _core_clearance(self, coords: np.ndarray, excluded: np.ndarray, k: int = 8) -> np.ndarray:
+    def _core_clearance(self, coords: np.ndarray, excluded: np.ndarray) -> np.ndarray:
         """
         Per-pose distance to the nearest core atom not in `excluded`: (S,) for (S, m, 3).
 
@@ -678,18 +742,11 @@ class ConstellationSampler:
         the result looks at contacts below the cutoff, and bounding the search is what
         makes the scan over spins and fits affordable.
         """
-        S, m, _ = coords.shape
-        n = self.core_tree.n
-        dist, idx = self.core_tree.query(coords.reshape(-1, 3), k=min(k, n),
-                                         distance_upper_bound=self.overlap_cutoff + 0.5)
-        dist = dist.reshape(S * m, -1)
-        idx = idx.reshape(S * m, -1)
-        valid = idx < n
-        blocked = np.zeros(self._n_core + 1, dtype=bool)   # last slot: no neighbor found
+        if self._core_grid is None:
+            self._core_grid = CoreGrid(self.core_tree.data, self.core_map, self.overlap_cutoff + 0.5)
+        blocked = np.zeros(self._n_core, dtype=bool)
         blocked[np.asarray(excluded, dtype=int)] = True
-        atom = np.where(valid, self.core_map[np.minimum(idx, n - 1)], self._n_core)
-        dist = np.where(valid & ~blocked[atom], dist, np.inf)
-        return dist.min(axis=1).reshape(S, m).min(axis=1)
+        return self._core_grid.clearance(coords, blocked)
 
 
     def _ligand_clearance(self, coords: np.ndarray) -> np.ndarray:
