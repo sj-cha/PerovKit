@@ -10,6 +10,7 @@ from __future__ import annotations
 from collections import Counter
 import dataclasses
 from dataclasses import dataclass
+import itertools
 import math
 import random
 from typing import Callable, Dict, Iterator, List, Optional, Sequence, Tuple
@@ -19,7 +20,7 @@ import numpy as np
 
 from scipy.spatial import cKDTree
 
-from .conformers import ConformerLibrary, _uff_energy, _uff_polish
+from .conformers import ConformerLibrary, _uff_energy, _uff_polish, embed_at
 from .core import BindingSite
 from .refine import TorsionModel, refine, stretch
 
@@ -286,11 +287,13 @@ class CoreGrid:
         return out
 
 
-# Rescued poses kept per ligand type as templates for the next sites (see _learn), and the
-# strain (kcal/mol over the lowest conformer) above which a pose is not kept, as for the
-# library's own stretched conformers.
+# Rescued poses kept per ligand type as templates for the next sites (see _learn).
 MAX_TEMPLATES = 16
-MAX_STRAIN = 40.0
+# Seeds where no conformer of the library comes near: the most compact constellations tried
+# per seed, the conformers embedded at each, and the embeddings per placement (see _embed).
+EMBED_CONSTELLATIONS = 2
+EMBED_CONFORMERS = 8
+MAX_EMBEDDINGS = 12
 
 
 class ConstellationSampler:
@@ -369,6 +372,7 @@ class ConstellationSampler:
         self._site_tree = self.tree_builder(self._site_positions) if self.sites else None
         self.n_shadowed = 0
         self._radii: Optional[np.ndarray] = None   # of the ligand type being placed
+        self._n_embedded = 0
         self._libraries: Dict[int, ConformerLibrary] = {}   # with templates, by id of the original
         self.occupancy: Dict[tuple, float] = {}
 
@@ -462,7 +466,7 @@ class ConstellationSampler:
             tried[i] = True
 
             cand, reason = self._best_candidate(lib, pools, seeds[i], anchor_offset, replace,
-                                                model, groups)
+                                                model, groups, mol)
             if cand is None:
                 failures[reason] += 1
                 continue
@@ -595,11 +599,14 @@ class ConstellationSampler:
     ) -> Iterator[Tuple[List[BindingSite], np.ndarray]]:
         """
         Constellations starting at `seed` whose site distances all fall within the
-        library's anchor-anchor range widened by 2 * max_rmsd, nearest to typical first.
+        library's anchor-anchor range widened by 2 * max_rmsd, nearest to typical first:
+        the median distances of the templates when there are any, else of the library.
         """
         n = len(pools)
         bounds = lib.distance_bounds()
-        typical = np.median(lib.pair_distances(), axis=0)
+        d = lib.pair_distances()
+        # constellations shaped like the templates (poses proven at real sites) come first
+        typical = np.median(d[lib.n_conformers - lib.n_templates:] if lib.n_templates else d, axis=0)
         tol = 2.0 * self.max_rmsd
         rel_pools = [self.mic(np.array([s.position for s in p], dtype=float) - seed.position)
                      if p else np.zeros((0, 3)) for p in pools]
@@ -637,21 +644,29 @@ class ConstellationSampler:
         replace: bool,
         model: Optional[TorsionModel],
         groups: Optional[List[List[int]]],
+        mol=None,
     ) -> Tuple[Optional[Candidate], str]:
         found: List[Tuple[float, Candidate]] = []
         reasons: Counter = Counter()
         stuck: List[tuple] = []
+        tried: List[tuple] = []
         for sites, rel in self._constellations(pools, seed, lib):
             cand, reason, starts = self._evaluate(lib, sites, seed.position + rel, anchor_offset, replace)
             if cand is None:
                 reasons[reason] += 1
                 stuck += starts
+                if not starts:
+                    tried.append((sites, seed.position + rel))
                 continue
             found.append((cand.fits[0].cost, cand))
             if len(found) >= self.n_constellations:
                 break
         if not found and stuck and model is not None:
             cand = self._rescue(stuck, model, groups)
+            if cand is not None:
+                return cand, ""
+        if not found and not stuck and tried and model is not None and mol is not None:
+            cand = self._embed(lib, tried, anchor_offset, replace, model, groups, mol)
             if cand is not None:
                 return cand, ""
         if not found:
@@ -798,6 +813,60 @@ class ConstellationSampler:
         return None
 
 
+    def _embed(self, lib: ConformerLibrary, constellations: List[tuple], anchor_offset: float,
+               replace: bool, model: TorsionModel, groups: List[List[int]],
+               mol) -> Optional[Candidate]:
+        """
+        Fit the ligand to sites that no conformer of the library comes near, as with binding
+        groups at the ends of long flexible arms (a tetrapodal cavitand): for the most
+        compact constellations tried, embed fresh conformers with every binding atom and the
+        heavy atoms bonded to it pinned where the best-fitting conformer, each motif moved
+        onto its target, puts them, then rescue those like clashing fits (stretch, refine).
+        A rescued pose becomes a template (_learn) for the other sites of the same geometry.
+        """
+        def spread(c):
+            P = c[1]
+            return max(float(np.linalg.norm(P[i] - P[j]))
+                       for i, j in itertools.combinations(range(len(P)), 2))
+
+        for sites, positions in sorted(constellations, key=spread)[:EMBED_CONSTELLATIONS]:
+            if self._n_embedded >= MAX_EMBEDDINGS:
+                return None
+            self._n_embedded += 1
+            normals = np.array([np.asarray(s.plane, dtype=float) / np.linalg.norm(s.plane)
+                                for s in sites])
+            targets = positions + anchor_offset * normals
+            res = fit_conformers(lib, targets, normals, w_align=self.w_align,
+                                 w_foot=self.w_foot, foot_scale=self.foot_scale)
+            c = int(np.argmin(res["cost"]))
+            x = (lib.coords[c] - res["center"][c]) @ res["rotation"][c].T + res["pivot"]
+            pins = {}
+            for g, t in zip(groups, targets):
+                shift = t - x[list(g)].mean(axis=0)
+                for a in set(g) | {n.GetIdx() for i in g for n in mol.GetAtomWithIdx(int(i)).GetNeighbors()
+                                   if n.GetAtomicNum() > 1}:
+                    pins[a] = x[a] + shift
+            ys = embed_at(mol, pins, n_conformers=EMBED_CONFORMERS, random_seed=1000 + self._n_embedded)
+            excluded = set(self.displaced)
+            if replace:
+                excluded.update(i for s in sites for i in s.atom_indices)
+            excluded = np.fromiter(excluded, dtype=int, count=len(excluded))
+            starts = []
+            for k, y in enumerate(ys):
+                rmsd = float(np.sqrt(np.mean([np.sum((y[list(g)].mean(axis=0) - t) ** 2)
+                                              for g, t in zip(groups, targets)])))
+                base = Fit(conformer=-1, rotation=np.eye(3), center=np.zeros(3),
+                           pivot=targets.mean(axis=0), axis=None, theta=0.0, rmsd=rmsd,
+                           alignment=0.0, footprint=0.0, energy=0.0, cost=float(k), xyz=y,
+                           origin="embedded")
+                starts.append((float(k), ("embedded", self._n_embedded, k), base, y, list(sites),
+                               targets, excluded))
+            cand = self._rescue(starts, model, groups) if starts else None
+            if cand is not None:
+                return cand
+        return None
+
+
     def _learn(self, lib: ConformerLibrary, cand: Candidate, model: TorsionModel,
                groups: List[List[int]], mol, replace: bool) -> Tuple[ConformerLibrary, Candidate]:
         """
@@ -835,13 +904,9 @@ class ConstellationSampler:
                 cand = Candidate(sites=cand.sites, targets=cand.targets,
                                  fits=[dataclasses.replace(fit, xyz=y, origin="stretched",
                                                            energy=energy)])
-                if energy <= MAX_STRAIN:
-                    lib = lib.with_template(mol, groups, y, energy)
-                return lib, cand
+                return lib.with_template(mol, groups, y, energy), cand
         energy = _uff_energy(mol, x) - lib.reference_energy
-        if energy <= MAX_STRAIN:
-            lib = lib.with_template(mol, groups, x, energy, stretched=False)
-        return lib, cand
+        return lib.with_template(mol, groups, x, energy, stretched=False), cand
 
 
     def _surroundings(self, start: np.ndarray, pivot: np.ndarray, excluded: np.ndarray) -> list:

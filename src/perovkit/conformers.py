@@ -240,6 +240,39 @@ def _uff_polish(mol: Chem.Mol, x: np.ndarray, fixed: List[int], max_displ: float
     return y, AllChem.UFFGetMoleculeForceField(m).CalcEnergy()
 
 
+def embed_at(mol: Chem.Mol, pins: dict, n_conformers: int = 8, random_seed: int = 42,
+             n_threads: int = 0, uff_iters: int = 500) -> np.ndarray:
+    """
+    Conformers of `mol` with the atoms of `pins` (index -> position) where given: ETKDG
+    with a coordinate map, relaxed with UFF with those atoms held, superposed on the pins.
+    Returns (k, n_atoms, 3), k <= n_conformers (0 if nothing embeds).
+    """
+    m = Chem.Mol(mol)
+    m.RemoveAllConformers()
+    pinned = [int(a) for a in pins]
+    target = np.array([pins[a] for a in pinned], dtype=float)
+    cmap = {a: Point3D(*map(float, p)) for a, p in zip(pinned, target)}
+    cids = list(AllChem.EmbedMultipleConfs(m, numConfs=n_conformers, coordMap=cmap,
+                                           randomSeed=random_seed, numThreads=n_threads,
+                                           useRandomCoords=True))
+    uff = AllChem.UFFHasAllMoleculeParams(m)
+    out = []
+    for cid in cids:
+        if uff:
+            ff = AllChem.UFFGetMoleculeForceField(m, confId=cid)
+            for a in pinned:
+                ff.UFFAddPositionConstraint(a, 0.0, 1.0e4)
+            ff.Minimize(maxIts=uff_iters)
+        x = np.array(m.GetConformer(cid).GetPositions())
+        # the embedding keeps the pins' distances, not their frame
+        P, Q = x[pinned], target
+        p0, q0 = P.mean(axis=0), Q.mean(axis=0)
+        U, _, Vt = np.linalg.svd((P - p0).T @ (Q - q0))
+        D = np.diag([1.0, 1.0, np.sign(np.linalg.det(U @ Vt))])
+        out.append((x - p0) @ (U @ D @ Vt) + q0)
+    return np.array(out).reshape((-1, m.GetNumAtoms(), 3))
+
+
 def _uff_energy(mol: Chem.Mol, x: np.ndarray) -> float:
     """UFF energy (kcal/mol) of `mol` at positions `x`."""
     m = Chem.Mol(mol)
