@@ -23,7 +23,7 @@ from .refine import INTRA_SCALE
 from .placement import (SingleMotifPose, MultiMotifPose, bounding_spheres, optimize_pose,
                         place_about_normal, motif_pools, refine_clusters, refine_pose,
                         select_constellations, stretch_poses, tree_min_distance,
-                        intramolecular_contacts)
+                        intramolecular_contacts, DENSE_PAIRS)
 from .utils.geometry import farthest_point_sampling, per_face_farthest_point_sampling, compute_bounding_spheres, build_neighbor_map
 
 
@@ -539,7 +539,11 @@ class NanoCrystal:
         
         # Distance to neighboring ligands
         neighbors = np.vstack(neighbors_coords)
-        diff = coords_i[None, :, :] - neighbors[:, None, :]
+        if len(coords_i) * len(neighbors) > DENSE_PAIRS:
+            _, a = cKDTree(coords_i).query(neighbors)
+            diff = coords_i[a] - neighbors
+        else:
+            diff = coords_i[None, :, :] - neighbors[:, None, :]
         d2 = np.sum(diff * diff, axis=-1)
         d_lig = float(np.sqrt(d2.min()))
 
