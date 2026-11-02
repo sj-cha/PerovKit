@@ -9,6 +9,7 @@ anchors leave it free, and are otherwise rigid.
 from __future__ import annotations
 from concurrent.futures import ProcessPoolExecutor
 import math
+import os
 import random
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
@@ -170,13 +171,21 @@ def _stretch_job(job: tuple) -> Optional[np.ndarray]:
     return None if res is None else res.coords
 
 
+def available_cpus() -> int:
+    """CPUs this process may run on (a Slurm allocation or taskset included)."""
+    if hasattr(os, "sched_getaffinity"):
+        return len(os.sched_getaffinity(0))
+    return os.cpu_count() or 1
+
+
 def stretch_poses(poses: Sequence, core_tree, cutoff: float, n_workers: int = 1) -> int:
     """
     Put a stretched copy of each multi-motif pose's best variant first: its dangling
     chains anti and raised along the mean normal of its sites, its anchors untouched.
 
     Stretching sees only the core, so the ligands are independent and, with `n_workers`
-    above 1, go to that many processes; each builds the core tree once.
+    above 1, go to that many processes (no more than the CPUs available); each builds the
+    core tree once. The result does not depend on `n_workers`.
 
     Returns:
         How many poses now start stretched: they had chains to stretch and the result
@@ -188,8 +197,9 @@ def stretch_poses(poses: Sequence, core_tree, cutoff: float, n_workers: int = 1)
             if p.origins[p.variant] != "stretched" and p.ligand.torsion_model().tails.any()]
     jobs = [(p.ligand.torsion_model(), p.variants[0], p.ligand.binding_groups,
              p.candidate.targets, _site_normal(p), cutoff + 0.2) for p in todo]
-    if n_workers > 1 and len(jobs) > 1:
-        with ProcessPoolExecutor(max_workers=min(n_workers, len(jobs)),
+    n_workers = min(n_workers, available_cpus(), len(jobs))
+    if n_workers > 1:
+        with ProcessPoolExecutor(max_workers=n_workers,
                                  initializer=_init_stretch_worker,
                                  initargs=(core_tree.data,)) as pool:
             results = list(pool.map(_stretch_job, jobs,
