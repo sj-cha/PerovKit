@@ -26,7 +26,8 @@ from .utils.geometry import farthest_point_sampling, per_face_farthest_point_sam
 class Assembly:
     """
     A Core with ligands on its surface: a nanocrystal, or a slab when the Core is periodic
-    (Core.build_slab). Periodic cores get minimum-image distances and keep their cell.
+    (Core.build_core(..., pbc=(True, True, False))). KD-tree searches follow the core's pbc:
+    minimum-image distances along its periodic axes. A slab keeps its cell.
     Made by Core.place_ligands and Core.place_ligands_manually, or read back with
     from_file and from_ase.
     """

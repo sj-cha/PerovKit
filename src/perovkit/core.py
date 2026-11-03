@@ -82,7 +82,49 @@ class Core:
 
 
     @classmethod
-    def build_nanocrystal(
+    def build_core(
+        cls,
+        A: str | Ligand,
+        B: str,
+        X: str,
+        a: float,
+        supercell: Sequence[int],
+        pbc: bool | Sequence[bool],
+        vacuum: float = 15.0,
+        charge_neutral: bool = True,
+        random_seed: Optional[int] = None,
+    ) -> Core:
+        """
+        Build an ABX3 core periodic along the axes given by `pbc` (as in ASE, one bool for
+        all three or one per axis): an AX-terminated nanocrystal for False, a slab periodic in
+        x, y with vacuum along z for (True, True, False).
+
+        Args:
+            A (str | Ligand): A-site species. A chemical symbol for an inorganic cation, 
+                              or a Ligand instance for an organic cation.
+            B, X (str): Chemical symbols for B- and X-site species.
+            a (float): Cubic lattice constant (Å).
+            supercell (Sequence[int]): Number of repeating unit cells along x, y, z.
+            pbc (bool | Sequence[bool]): Periodicity along x, y, z: False or (True, True, False).
+            vacuum (float): Vacuum thickness (Å) along z (slab only).
+            charge_neutral (bool): Remove surface A cations to ensure charge neutrality, corners
+                                   first, then others at random (nanocrystal only).
+            random_seed (Optional[int]): Seed for choosing which surface A cations to remove
+                                         (nanocrystal only).
+
+        Returns:
+            A Core instance.
+        """
+        periodic = tuple(bool(p) for p in np.broadcast_to(np.asarray(pbc, dtype=bool), 3))
+        if periodic == (True, True, False):
+            return cls._build_slab(A, B, X, a, supercell, vacuum=vacuum)
+        if not any(periodic):
+            return cls._build_nanocrystal(A, B, X, a, supercell, charge_neutral=charge_neutral,
+                                          random_seed=random_seed)
+        raise ValueError(f"pbc must be False (nanocrystal) or (True, True, False) (slab); got {pbc}")
+
+    @classmethod
+    def _build_nanocrystal(
         cls,
         A: str | Ligand,
         B: str,
@@ -180,7 +222,7 @@ class Core:
         return core
 
     @classmethod
-    def build_slab(
+    def _build_slab(
         cls,
         A: str | Ligand,
         B: str,
