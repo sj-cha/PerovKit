@@ -25,7 +25,7 @@ class Core:
         atoms (ASE Atoms): ASE Atoms object of Core
         a (float): Cubic lattice constant (Å).
         supercell (Tuple[int, int, int]): Number of repeating unit cells along x, y, z (nx, ny, nz).
-        vacuum (float): Vacuum thickness (Å) along a z-direction (used for Slab).
+        vacuum (float): Vacuum thickness (Å) along a z-direction (used for slabs).
         octahedra (Dict[int, Dict[str, List[int]]]): Map B-atom index -> {"X": [...], "Ligand": [...]}.
         B_ijk (Dict[int, Tuple[int, int, int]]): Map B-atom index -> integer lattice coordinates.
         build_surface (bool): Whether to compute Core metadata (surface atoms, binding sites, octahedra) on initialization. 

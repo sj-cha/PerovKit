@@ -104,7 +104,7 @@ class Ligand:
         volume (float): Molecular volume (Å^3).
         binding_atoms (List[int]): Local indices of atoms used as anchors.
         plane (Tuple[int, int, int]): Miller index of the surface the ligand is bound to.
-        indices (np.ndarray): Global atom indices when placed in a parent NanoCrystal/Slab.
+        indices (np.ndarray): Global atom indices when placed in a parent Assembly.
         _anchor_offset (float): Offset (Å) applied along the axis perpendicular to the plane.
     """
     atoms: Atoms
