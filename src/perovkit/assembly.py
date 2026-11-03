@@ -8,7 +8,6 @@ from pathlib import Path
 import random
 import math
 import numpy as np
-from tqdm.auto import tqdm
 
 from ase import Atoms
 from ase.io import read, write
@@ -20,11 +19,9 @@ from .core import Core, BindingSite
 from .ligand import Ligand, LigandSpec, BindingMotif
 from .constellation import ConstellationSampler
 from .refine import INTRA_SCALE
-from .placement import (SingleMotifPose, MultiMotifPose, bounding_spheres, optimize_pose,
-                        place_about_normal, motif_pools, refine_clusters, refine_pose,
-                        select_constellations, stretch_poses, tree_min_distance,
-                        intramolecular_contacts, DENSE_PAIRS)
-from .utils.geometry import farthest_point_sampling, per_face_farthest_point_sampling, compute_bounding_spheres, build_neighbor_map
+from .placement import (SingleMotifPose, MultiMotifPose, Contacts, pack, place_about_normal, motif_pools,
+                        select_constellations, intramolecular_contacts)
+from .utils.geometry import farthest_point_sampling, per_face_farthest_point_sampling, build_neighbor_map
 
 
 @dataclass
@@ -119,10 +116,6 @@ class Assembly:
 
         self._rng = random.Random(random_seed)
         self.overlap_cutoff = overlap_cutoff
-        self.coarse_step_deg = coarse_step_deg
-        self.fine_step_deg = fine_step_deg
-        self.window_deg = window_deg
-        self.active_radius_factor = active_radius_factor
         
         self.ligands = []
         displaced_indices = []
@@ -214,9 +207,6 @@ class Assembly:
         n_lig = len(ligands)
         assert n_lig > 0, "No ligands to place."
 
-        # Where each ligand binds: its site, or the centroid of its sites
-        site_positions = np.array([p.center for p in poses])
-
         # Core atoms coordinates except displaced ones
         n_core = core_positions.shape[0]
         core_mask = np.ones(n_core, dtype=bool)
@@ -231,118 +221,16 @@ class Assembly:
             core_tree, _ = self._build_pbc_tree(core_coords)
         else:
             core_tree = None
-        self._core_tree = core_tree
 
-        # Straighten the dangling chains of multi-motif ligands and raise them off the
-        # surface before packing: a coiled library conformer tangles with its neighbors
-        n_stretched = 0
-        if stretch_tails:
-            n_stretched = stretch_poses(poses, self._core_tree, self.overlap_cutoff, n_workers)
-            if n_stretched:
-                n_multi = sum(isinstance(p, MultiMotifPose) for p in poses)
-                log(f"[Log] Stretched the tails of {n_stretched} of {n_multi} multi-motif ligands.")
-
-        # Initialize rotation angles and current coordinates; multi-motif ligands start
-        # from the spin their constellation fit chose
-        thetas = np.array([2.0 * math.pi * self._rng.random() if p.random_start else 0.0
-                           for p in poses], dtype=float)
-        ligand_coords_list: List[np.ndarray] = [p.coords(t, getattr(p, "variant", 0))
-                                                for p, t in zip(poses, thetas)]
-
-        # Stretched chains leave few, shallow contacts: relax them all together while the
-        # shell is still upright, before single ligands start turning
-        if n_stretched and refine_torsions:
-            # stop short of the cutoff: the last contacts are cheaper to clear one ligand at a time
-            refine_clusters(poses, ligand_coords_list, self._core_tree, *self._sampler_geometry(),
-                            self._exact_min_distance, self.overlap_cutoff, max_anchor_rmsd,
-                            stop_at=self.overlap_cutoff - 0.1)
-
-        # Rotation optimization loop
-        centers, radii = bounding_spheres(poses, ligand_coords_list)
-        neighbor_map = self._build_neighbor_map(centers, radii, self.overlap_cutoff)
-
-        global_min, conflict_ligs, dists = self._get_conflict_ligands(
-            ligand_coords_list,
-            neighbor_map,
+        contacts = Contacts(core_tree, *self._sampler_geometry(), self._wrap,
+                            self._build_neighbor_map, overlap_cutoff)
+        ligand_coords_list = pack(
+            poses, contacts, self._rng, max_iters=max_iters, coarse_step_deg=coarse_step_deg,
+            fine_step_deg=fine_step_deg, window_deg=window_deg,
+            active_radius=active_radius_factor * self.core.a + 1e-2, max_rmsd=max_anchor_rmsd,
+            refine_torsions=refine_torsions, stretch_tails=stretch_tails, n_workers=n_workers,
+            log=log, verbose=verbose,
         )
-        log(f"[Log] Initial global_min = {global_min:.3f} Å")
-
-        for iter in range(1, max_iters + 1):
-            if global_min >= self.overlap_cutoff:
-                log(
-                    f"[Log] Hard cutoff {self.overlap_cutoff:.3f} Å satisfied. Stopping optimization."
-                )
-                break
-
-            active_cluster = self._build_active_cluster(conflict_ligs, site_positions)
-
-            improved = False
-            self._rng.shuffle(active_cluster)
-
-            for i in tqdm(
-                active_cluster,
-                desc=f"Optimizing ligand (iter {iter})",
-                disable=not verbose,
-            ):
-                neighbor_idx = neighbor_map.get(i, [])
-                neighbors_coords = [ligand_coords_list[j] for j in neighbor_idx]
-
-                # A multi-motif ligand is judged by its closest contact of either kind:
-                # _min_distance stops at a core contact, which would let a long ligand
-                # trade a sliver of core distance for running its tail through a neighbor
-                multi = isinstance(poses[i], MultiMotifPose)
-                min_distance = self._exact_min_distance if multi else self._min_distance
-                d_old = min_distance(ligand_coords_list[i], neighbors_coords) if multi else dists[i]
-
-                best_theta, best_variant, best_coords = self._optimize_rotation(
-                    poses[i],
-                    neighbors_coords,
-                )
-                d_new = min_distance(best_coords, neighbors_coords)
-
-                # Multi-motif ligands that turning cannot clear may still bend out of the way.
-                # Bending can reach past the neighbor spheres, so every other ligand counts.
-                if refine_torsions and multi and d_new < self.overlap_cutoff:
-                    others = [c for j, c in enumerate(ligand_coords_list) if j != i]
-                    refined = refine_pose(poses[i], best_coords, others, self._core_tree,
-                                          self._sampler_geometry()[0], self.overlap_cutoff,
-                                          max_anchor_rmsd, min_distance)
-                    if refined is not None:
-                        d_ref = min_distance(refined, others)
-                        if d_ref > d_new:
-                            best_theta, best_variant = 0.0, poses[i].add_variant(refined)
-                            best_coords, d_new = refined, d_ref
-
-                if d_new > d_old + 1e-3:
-                    ligand_coords_list[i] = best_coords
-                    thetas[i] = best_theta
-                    poses[i].variant = best_variant
-                    improved = True
-                    if multi:
-                        # a refined variant may reach farther: let the ligands still to move see it
-                        centers, radii = bounding_spheres(poses, ligand_coords_list)
-                        neighbor_map = self._build_neighbor_map(centers, radii, self.overlap_cutoff)
-
-            if not improved and refine_torsions:
-                # nobody could move alone: let jammed multi-motif ligands give way together
-                improved = refine_clusters(
-                    poses, ligand_coords_list, self._core_tree, *self._sampler_geometry(),
-                    self._exact_min_distance, self.overlap_cutoff, max_anchor_rmsd,
-                )
-
-            if not improved:
-                raise RuntimeError("[Log] No improvement in active cluster. Stopping.")
-
-            centers, radii = bounding_spheres(poses, ligand_coords_list)
-            neighbor_map = self._build_neighbor_map(centers, radii, self.overlap_cutoff)
-            global_min, conflict_ligs, dists = self._get_conflict_ligands(
-                ligand_coords_list,
-                neighbor_map,
-            )
-            log(f"[Log] Iter {iter}  global_min = {global_min:.3f} Å")
-
-        if global_min < self.overlap_cutoff:
-            raise RuntimeError("[Log] Maximum iterations reached without satisfying overlap cutoff.")
 
         # Apply final coordinates to Ligand
         max_z = 0
@@ -784,104 +672,6 @@ class Assembly:
 
         return neighbor_map
 
-    def _min_distance(
-        self,
-        coords_i: np.ndarray,
-        neighbors_coords: Optional[List[np.ndarray]],
-    ) -> float:
-        
-        # Distance to core
-        core_tree = self._core_tree
-        if core_tree is not None:
-            dists, _ = core_tree.query(coords_i)
-            d_core = float(np.min(dists))
-        else:
-            d_core = float("inf")
-
-        if d_core < self.overlap_cutoff:
-            return d_core
-        
-        if not neighbors_coords:
-            return d_core
-        
-        # Distance to neighboring ligands
-        neighbors = np.vstack(neighbors_coords)  # (N,3)
-        if len(coords_i) * len(neighbors) > DENSE_PAIRS:
-            # wrapped into the box, periodic images one box away hold every minimum image
-            tree, image_of = self._build_pbc_tree(self._wrap(coords_i))
-            _, k = tree.query(self._wrap(neighbors))
-            diff = self._mic(coords_i[image_of[k]] - neighbors)
-        else:
-            diff = coords_i[:, None, :] - neighbors[None, :, :]  # (M,N,3)
-            diff = self._mic(diff)
-        d2 = np.sum(diff * diff, axis=-1)
-        d_lig = float(np.sqrt(d2.min()))
-
-        return min(d_core, d_lig)
-
-
-    def _get_conflict_ligands(
-        self,
-        ligand_coords_list: List[np.ndarray],
-        neighbor_map: Dict[int, List[int]],
-    ) -> Tuple[float, List[int], np.ndarray]:
-
-        n_lig = len(ligand_coords_list)
-        conflict_ligs = []
-        dists = np.empty(n_lig, dtype=float)
-        global_min = float("inf")
-
-        for i in range(n_lig):
-            coords_i = ligand_coords_list[i]
-            idxs = neighbor_map.get(i, [])
-
-            neighbors_coords = [ligand_coords_list[j] for j in idxs] if idxs else None
-
-            d_i = self._min_distance(
-                coords_i,
-                neighbors_coords=neighbors_coords,
-            )
-            dists[i] = d_i
-            global_min = min(global_min, d_i)
-
-            if d_i < self.overlap_cutoff:
-                conflict_ligs.append(i)
-
-        return global_min, conflict_ligs, dists
-
-    def _build_active_cluster(
-        self,
-        conflict_ligs: List[int],
-        site_positions: np.ndarray,
-    ) -> List[int]:
-
-        radius = self.active_radius_factor * self.core.a + 1e-2
-
-        if not conflict_ligs:
-            return []
-
-        site_tree = cKDTree(site_positions)
-
-        active = set(conflict_ligs)  # start from conflict ligands
-
-        # BFS-style cluster expansion
-        queue = list(conflict_ligs)
-        visited = set(conflict_ligs)
-
-        while queue:
-            i = queue.pop()
-            pos_i = site_positions[i]
-
-            neighbor_js = site_tree.query_ball_point(pos_i, r=radius)
-            for j in neighbor_js:
-                if j in visited:
-                    continue
-                visited.add(j)
-                active.add(j)
-                queue.append(j)
-
-        return sorted(list(active))
-
     def _place_one_ligand(
         self,
         ligand: Ligand,
@@ -919,35 +709,6 @@ class Assembly:
         if self.core.is_nanocrystal:
             return (lambda pts: (cKDTree(pts), np.arange(len(pts)))), (lambda d: d)
         return self._build_pbc_tree, self._mic
-
-
-    def _exact_min_distance(self, coords: np.ndarray, neighbors_coords: List[np.ndarray]) -> float:
-        """
-        Closest contact of `coords` with the core or any of `neighbors_coords`.
-        """
-        return tree_min_distance(self._core_tree, self._sampler_geometry()[0], self.overlap_cutoff,
-                                 neighbors_coords, early_core=False)(coords)
-
-
-    def _optimize_rotation(
-        self,
-        pose: SingleMotifPose | MultiMotifPose,
-        neighbors_coords: List[np.ndarray],
-    ) -> Tuple[float, int, np.ndarray]:
-        min_distance = self._min_distance
-        if isinstance(pose, MultiMotifPose):
-            min_distance = tree_min_distance(self._core_tree, self._sampler_geometry()[0],
-                                             self.overlap_cutoff, neighbors_coords, early_core=False)
-        return optimize_pose(
-            pose,
-            neighbors_coords,
-            min_distance,
-            self._rng,
-            self.overlap_cutoff,
-            self.coarse_step_deg,
-            self.fine_step_deg,
-            self.window_deg,
-        )
 
 
     def _assign_ligands_to_octahedra(self) -> None:
