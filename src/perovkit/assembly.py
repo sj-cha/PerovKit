@@ -27,6 +27,8 @@ class Assembly:
     """
     A Core with ligands on its surface: a nanocrystal, or a slab when the Core is periodic
     (Core.build_slab). Periodic cores get minimum-image distances and keep their cell.
+    Made by Core.place_ligands and Core.place_ligands_manually, or read back with
+    from_file and from_ase.
     """
     core: Core
     ligand_specs: List[LigandSpec]
@@ -83,7 +85,7 @@ class Assembly:
         return pool, label
 
 
-    def place_ligands(
+    def _place_ligands(
         self,
         max_iters: int = 10,
         overlap_cutoff: float = 1.8,   # Å
@@ -318,7 +320,7 @@ class Assembly:
         self._build_and_link_atoms()
 
 
-    def place_ligands_manually(
+    def _place_ligands_manually(
         self,
         cat_x_move: float = 0.0,
         cat_y_move: float = 0.0,

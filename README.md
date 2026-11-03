@@ -18,10 +18,10 @@ Dependencies: `numpy`, `scipy`, `ase`, `rdkit`, `tqdm`
 
 ## Key Concepts
 
-- **Core**: The inorganic ABX<sub>3</sub> perovskite structure. Built as either a finite nanocrystal (`build_nanocrystal`) or a periodic slab (`build_slab`).
+- **Core**: The inorganic ABX<sub>3</sub> perovskite structure. Built as either a finite nanocrystal (`build_nanocrystal`) or a periodic slab (`build_slab`). `place_ligands` puts ligands on a copy of it, choosing the sites and turning the ligands until they clear each other; `place_ligands_manually` places them with fixed shifts and turns instead, optionally only those given by `ligand_ids`. Both return an `Assembly` and leave the core as it is.
 - **Ligand**: An organic molecule that passivates surface sites. Created from SMILES (`from_smiles`) or an existing file (`from_file`). The `BindingMotif` specifies which atoms coordinate the surface. Cationic ligands take A-sites and anionic ligands take X-sites.
 - **LigandSpec**: Pairs a `Ligand` with placement parameters: `coverage` (fraction or absolute count of surface sites), optional `binding_sites` (explicit site indices), and `anchor_offset` (controls a vertical offset from the surface).
-- **Assembly**: Combines a `Core` with `Ligand`, for a nanocrystal and a slab alike (a periodic `Core` gets minimum-image distances). Handles site selection and ligand placement by rotation optimization; `place_ligands_manually` instead places the ligands with fixed shifts and turns, optionally only those given by `ligand_ids`. `NanoCrystal` and `Slab` remain as other names for it.
+- **Assembly**: A `Core` with its `Ligand`s, for a nanocrystal and a slab alike (a periodic `Core` gets minimum-image distances), as returned by `Core.place_ligands` or read with `Assembly.from_file`. `NanoCrystal` and `Slab` remain as other names for it.
 
 ## Quick Start
 
@@ -61,8 +61,7 @@ specs = [
     LigandSpec(ligand=anionic_lig, coverage=0.5),
 ]
 
-nc = Assembly(core=core, ligand_specs=specs)
-nc.place_ligands()
+nc = core.place_ligands(specs)
 ```
 
 ### Build a Slab with Ligands
@@ -80,8 +79,7 @@ specs = [
     LigandSpec(ligand=anionic_lig, coverage=0.5),
 ]
 
-slab = Assembly(core=core, ligand_specs=specs)
-slab.place_ligands()
+slab = core.place_ligands(specs)
 ```
 
 ### Serialization
