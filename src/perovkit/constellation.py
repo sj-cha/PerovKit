@@ -603,8 +603,8 @@ class ConstellationSampler:
         the median distances of the templates when there are any, else of the library.
         """
         n = len(pools)
-        bounds = lib.distance_bounds()
-        d = lib.pair_distances()
+        d = np.linalg.norm(lib.anchors[:, :, None, :] - lib.anchors[:, None, :, :], axis=-1)
+        bounds = np.stack([d.min(axis=0), d.max(axis=0)], axis=-1)
         # constellations shaped like the templates (poses proven at real sites) come first
         typical = np.median(d[lib.n_conformers - lib.n_templates:] if lib.n_templates else d, axis=0)
         tol = 2.0 * self.max_rmsd
