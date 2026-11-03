@@ -1,17 +1,6 @@
-"""
-Torsion-space refinement of a multi-motif ligand against fixed surroundings.
-
-The ligand moves by its rotatable torsions plus a small rigid-body adjustment, so bond
-lengths and angles stay those of its conformer. The objective keeps every anchor on its
-target and pushes atoms out of contact with the core, neighboring ligands and the ligand
-itself, with soft-sphere penalties; gradients are analytic and the problem goes to scipy's
-L-BFGS-B. This is a geometry generator, not a force field: it removes clashes that a rigid
-conformer cannot, and says nothing about binding energies.
-"""
 from __future__ import annotations
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 import math
-import os
 from typing import List, Optional, Sequence
 
 from ase.data import vdw_radii
@@ -23,15 +12,13 @@ from scipy.spatial import cKDTree
 
 _ROTATABLE = Chem.MolFromSmarts("[!$(*#*)&!D1]-&!@[!$(*#*)&!D1]")
 
-# Atoms of one ligand four or more bonds apart are kept INTRA_SCALE x the sum of their
-# van der Waals radii apart: 1.68 A for H...H, 2.03 for C...H, 2.38 for C...C. A single
-# 1.6 A radius let the two stretched acyl chains of lecithin settle 1.3-1.6 A apart (H...H),
-# hundreds of kcal/mol in UFF. 0.8 leaves cleaner chains but jams the densest packings
-# (zwitterions on a nanocrystal at 50%).
+# Atoms of one ligand four or more bonds apart are kept INTRA_SCALE x the sum of their van
+# der Waals radii apart (1.68 A for H...H, 2.38 for C...C); a larger scale jams the densest
+# packings.
 INTRA_SCALE = 0.7
 K_CONTACT = 40.0   # per Å^2, soft-sphere weight of a contact
-# Intramolecular overlaps weigh INTRA_WEIGHT x a contact. At 1x, pulling the anchors of a
-# lecithin onto their sites folded its head group to 1.38 A H...H across the phosphodiester.
+# Intramolecular overlaps weigh INTRA_WEIGHT x a contact, so that pulling the anchors onto
+# their sites does not fold a ligand onto itself.
 INTRA_WEIGHT = 10.0
 
 
@@ -55,11 +42,7 @@ def _intra_pairs(model, X, scale, skin=0.0):
     hit = (d < limit + skin) & (d > 1e-9)
     return pa[hit], pb[hit], d[hit], limit[hit]
 
-# The torsion loops are compiled with numba; PEROVKIT_NUMBA=0 runs the numpy code below
-# instead, the reference they are checked against.
-JIT = os.environ.get("PEROVKIT_NUMBA", "1") != "0"
-
-
+@numba.njit(cache=True)
 def _turn_torsions(X, phis, bonds, moving, starts):
     """
     Apply torsion changes `phis` (L, k) in place to poses X (L, n, 3), deepest first:
@@ -88,6 +71,7 @@ def _turn_torsions(X, phis, bonds, moving, starts):
                 X[l, a, 2] = r20 * vx + r21 * vy + r22 * vz + pz
 
 
+@numba.njit(cache=True)
 def _torsion_gradient(X, G, bonds, moving, starts, out):
     """
     dE/dphi of every torsion (L, k) into `out`: the torque of the forces G on the atoms
@@ -110,15 +94,9 @@ def _torsion_gradient(X, G, bonds, moving, starts, out):
             out[l, b] = (ux * tx + uy * ty + uz * tz) / r
 
 
-if JIT:
-    _turn_torsions = numba.njit(cache=True)(_turn_torsions)
-    _torsion_gradient = numba.njit(cache=True)(_torsion_gradient)
-
-
 def _rotation(u: np.ndarray, phi: float) -> np.ndarray:
     """
-    Rotation by `phi` about the unit axis `u` (Rodrigues), built from scalars: it runs once
-    per torsion per evaluation, where numpy's per-call overhead dominated the refinement.
+    Rotation by `phi` about the unit axis `u` (Rodrigues).
     """
     x, y, z = float(u[0]), float(u[1]), float(u[2])
     c, s = math.cos(phi), math.sin(phi)
@@ -126,20 +104,6 @@ def _rotation(u: np.ndarray, phi: float) -> np.ndarray:
     return np.array([[c + t * x * x, t * x * y - s * z, t * x * z + s * y],
                      [t * x * y + s * z, c + t * y * y, t * y * z - s * x],
                      [t * x * z - s * y, t * y * z + s * x, c + t * z * z]])
-
-
-def _rotations(u: np.ndarray, phi: np.ndarray) -> np.ndarray:
-    """
-    Rotations by `phi` (L,) about the unit axes `u` (L, 3): (L, 3, 3).
-    """
-    x, y, z = u[:, 0], u[:, 1], u[:, 2]
-    c, s = np.cos(phi), np.sin(phi)
-    t = 1.0 - c
-    return np.stack([
-        np.stack([c + t * x * x, t * x * y - s * z, t * x * z + s * y], axis=-1),
-        np.stack([t * x * y + s * z, c + t * y * y, t * y * z - s * x], axis=-1),
-        np.stack([t * x * z - s * y, t * y * z + s * x, c + t * z * z], axis=-1),
-    ], axis=1)
 
 
 def _euler_many(angles: np.ndarray):
@@ -150,16 +114,13 @@ def _euler_many(angles: np.ndarray):
     ca, sa = np.cos(angles[:, 0]), np.sin(angles[:, 0])
     cb, sb = np.cos(angles[:, 1]), np.sin(angles[:, 1])
     cc, sc = np.cos(angles[:, 2]), np.sin(angles[:, 2])
-    zero, one = np.zeros(L), np.ones(L)
-
-    def m(rows):
-        return np.stack([np.stack(r, axis=-1) for r in rows], axis=1)
-    Rx = m([[one, zero, zero], [zero, ca, -sa], [zero, sa, ca]])
-    Ry = m([[cb, zero, sb], [zero, one, zero], [-sb, zero, cb]])
-    Rz = m([[cc, -sc, zero], [sc, cc, zero], [zero, zero, one]])
-    dRx = m([[zero, zero, zero], [zero, -sa, -ca], [zero, ca, -sa]])
-    dRy = m([[-sb, zero, cb], [zero, zero, zero], [-cb, zero, -sb]])
-    dRz = m([[-sc, -cc, zero], [cc, -sc, zero], [zero, zero, zero]])
+    Rx, Ry, Rz, dRx, dRy, dRz = (np.zeros((L, 3, 3)) for _ in range(6))
+    Rx[:, 0, 0], Rx[:, 1, 1], Rx[:, 1, 2], Rx[:, 2, 1], Rx[:, 2, 2] = 1.0, ca, -sa, sa, ca
+    Ry[:, 0, 0], Ry[:, 0, 2], Ry[:, 1, 1], Ry[:, 2, 0], Ry[:, 2, 2] = cb, sb, 1.0, -sb, cb
+    Rz[:, 0, 0], Rz[:, 0, 1], Rz[:, 1, 0], Rz[:, 1, 1], Rz[:, 2, 2] = cc, -sc, sc, cc, 1.0
+    dRx[:, 1, 1], dRx[:, 1, 2], dRx[:, 2, 1], dRx[:, 2, 2] = -sa, -ca, ca, -sa
+    dRy[:, 0, 0], dRy[:, 0, 2], dRy[:, 2, 0], dRy[:, 2, 2] = -sb, cb, -cb, -sb
+    dRz[:, 0, 0], dRz[:, 0, 1], dRz[:, 1, 0], dRz[:, 1, 1] = -sc, -cc, cc, -sc
     return Rz @ Ry @ Rx, np.stack([Rz @ Ry @ dRx, Rz @ dRy @ Rx, dRz @ Ry @ Rx])
 
 
@@ -213,17 +174,13 @@ class TorsionModel:
     tails: np.ndarray
     heavy: np.ndarray
     radii: np.ndarray
-    _moving: list = field(init=False, repr=False)
-    _weights: np.ndarray = field(init=False, repr=False)
 
     def __post_init__(self):
-        # forward() and gradient() run thousands of times per refinement: index once
-        self._moving = [(int(i), int(j), np.flatnonzero(m)) for (i, j), m in zip(self.bonds, self.masks)]
-        self._weights = self.masks.astype(float)
-        # the same, flat, for the compiled loops
+        # the bonds and the atoms each torsion moves, flat, for the compiled loops
+        moving = [np.flatnonzero(m) for m in self.masks]
         self._bonds = np.ascontiguousarray(self.bonds, dtype=np.int64).reshape(-1, 2)
-        self._flat_moving = np.concatenate([m for *_, m in self._moving] + [np.zeros(0, dtype=np.int64)]).astype(np.int64)
-        self._starts = np.concatenate([[0], np.cumsum([len(m) for *_, m in self._moving])]).astype(np.int64)
+        self._flat_moving = np.concatenate(moving + [np.zeros(0, dtype=np.int64)]).astype(np.int64)
+        self._starts = np.concatenate([[0], np.cumsum([len(m) for m in moving])]).astype(np.int64)
 
     @property
     def frame(self) -> np.ndarray:
@@ -290,20 +247,10 @@ class TorsionModel:
         bonds included, rigidly, so the derivative of every torsion is a rotation about its
         bond as it lies in the final coordinates.
         """
-        if JIT:
-            x = np.array(x0, dtype=float)[None]
-            _turn_torsions(x, np.ascontiguousarray(params[None, 6:], dtype=float),
-                           self._bonds, self._flat_moving, self._starts)
-            x = x[0]
-        else:
-            x = x0.copy()
-            for (i, j, moving), phi in zip(self._moving, params[6:]):
-                if phi == 0.0:
-                    continue
-                xi = x[i]
-                u = x[j] - xi
-                R = _rotation(u / math.sqrt(u @ u), phi)
-                x[moving] = (x[moving] - xi) @ R.T + xi
+        x = np.array(x0, dtype=float)[None]
+        _turn_torsions(x, np.ascontiguousarray(params[None, 6:], dtype=float),
+                       self._bonds, self._flat_moving, self._starts)
+        x = x[0]
         R, dR = _euler(*params[3:6])
         xt = x - center
         return xt @ R.T + center + params[:3], xt, dR
@@ -316,40 +263,21 @@ class TorsionModel:
         g[:3] = G.sum(axis=0)
         for k in range(3):
             g[3 + k] = np.sum(G * (xt @ dR[k].T))
-        if self.n_torsions and JIT:
+        if self.n_torsions:
             out = np.empty((1, self.n_torsions))
             _torsion_gradient(np.ascontiguousarray(x[None]), np.ascontiguousarray(G[None]),
                               self._bonds, self._flat_moving, self._starts, out)
             g[6:] = out[0]
-        elif self.n_torsions:
-            i, j = self.bonds[:, 0], self.bonds[:, 1]
-            u = x[j] - x[i]
-            u /= np.linalg.norm(u, axis=1, keepdims=True)
-            M = self._weights
-            torque = M @ np.cross(x, G) - np.cross(x[i], M @ G)
-            g[6:] = np.einsum("ki,ki->k", u, torque)
         return g
 
     def forward_many(self, P: np.ndarray, X0: np.ndarray, C: np.ndarray):
         """
         forward() for L poses of this ligand at once: params P (L, 6 + k), starting
-        coordinates X0 (L, n, 3) and centers C (L, 3). Each torsion is applied to all L
-        poses in one array operation, so the Python loop runs over the torsions only.
+        coordinates X0 (L, n, 3) and centers C (L, 3).
         """
         X = np.array(X0, dtype=float)
-        if JIT:
-            _turn_torsions(X, np.ascontiguousarray(P[:, 6:], dtype=float),
-                           self._bonds, self._flat_moving, self._starts)
-        else:
-            for b, (i, j, moving) in enumerate(self._moving):
-                phi = P[:, 6 + b]
-                if not phi.any():
-                    continue
-                xi = X[:, i].copy()
-                u = X[:, j] - xi
-                u /= np.linalg.norm(u, axis=1, keepdims=True)
-                R = _rotations(u, phi)
-                X[:, moving] = np.matmul(X[:, moving] - xi[:, None], R.transpose(0, 2, 1)) + xi[:, None]
+        _turn_torsions(X, np.ascontiguousarray(P[:, 6:], dtype=float),
+                       self._bonds, self._flat_moving, self._starts)
         R, dR = _euler_many(P[:, 3:6])
         Xt = X - C[:, None]
         return np.matmul(Xt, R.transpose(0, 2, 1)) + C[:, None] + P[:, None, :3], Xt, dR
@@ -364,19 +292,11 @@ class TorsionModel:
         for k in range(3):
             Y = np.matmul(Xt, dR[k].transpose(0, 2, 1))
             g[:, 3 + k] = (G.reshape(len(P), 1, -1) @ Y.reshape(len(P), -1, 1))[:, 0, 0]
-        if self.n_torsions and JIT:
+        if self.n_torsions:
             out = np.empty((len(P), self.n_torsions))
             _torsion_gradient(np.ascontiguousarray(X), np.ascontiguousarray(G),
                               self._bonds, self._flat_moving, self._starts, out)
             g[:, 6:] = out
-        elif self.n_torsions:
-            i, j = self.bonds[:, 0], self.bonds[:, 1]
-            u = X[:, j] - X[:, i]
-            u /= np.linalg.norm(u, axis=2, keepdims=True)
-            M = self._weights
-            torque = (np.einsum("kn,lnd->lkd", M, np.cross(X, G))
-                      - np.cross(X[:, i], np.einsum("kn,lnd->lkd", M, G)))
-            g[:, 6:] = np.einsum("lkd,lkd->lk", u, torque)
         return g
 
 
@@ -384,13 +304,10 @@ class TorsionModel:
 class Refinement:
     coords: np.ndarray
     anchor_rmsd: float
-    converged: bool
 
 
 # Verlet lists: contacts are searched within their reach + SKIN, and searched again only for
-# the ligands that have moved far enough since that every pair within reach stays listed. A
-# tree search over every atom at every evaluation cost more than the rest of the objective;
-# a joint L-BFGS step moves only a few ligands by more than a few tenths of an Å.
+# the ligands that have moved far enough since that every pair within reach stays listed.
 SKIN = 1.0
 
 
@@ -611,7 +528,11 @@ def refine(
     stop_rmsd: float = float("inf"),
 ) -> Refinement:
     """
-    Refine one ligand pose.
+    Refine one ligand pose in torsion space: its rotatable torsions turn and the whole moves
+    a little as a rigid body, so bond lengths and angles stay those of the starting pose,
+    while soft-sphere penalties keep its anchors on their targets and its atoms out of
+    contact (L-BFGS-B with analytic gradients). A geometry generator, not a force field: it
+    clears clashes and says nothing about binding energies.
 
     Args:
         model (TorsionModel): Torsions and intramolecular pairs of the ligand.
@@ -662,8 +583,7 @@ def refine(
         bounds = [(0.0, 0.0) if f else (None, None) for f in frozen]
     res = _minimize(fun, 6 + model.n_torsions, bounds, max_iter, done)
     x, _, _ = model.forward(res.x, coords, center)
-    return Refinement(coords=x, anchor_rmsd=_anchor_rmsd(x, groups, targets),
-                      converged=bool(res.success))
+    return Refinement(coords=x, anchor_rmsd=_anchor_rmsd(x, groups, targets))
 
 
 def stretch(
@@ -682,11 +602,11 @@ def stretch(
     Straighten the dangling chains of a ligand and raise them along `normal`.
 
     Every tail torsion is set anti (180°), from the anchors outward, or gauche (±60°) where
-    anti would run the chain into the rest of the ligand or the fixed atoms; then only the tail torsions are
-    optimized, so no anchor moves, to lift the tail's heavy atoms along `normal` while
-    keeping clear of the fixed atoms in `trees` and of the ligand itself. With `stop_at` it stops as soon as
-    every contact with the fixed atoms is that far, when the point is only to unstick a
-    chain from the surface rather than to stand it up. Returns None for a ligand without
+    anti would run the chain into the rest of the ligand or the fixed atoms; then only the
+    tail torsions are optimized, so no anchor moves, to lift the tail's heavy atoms along
+    `normal` while keeping clear of the fixed atoms in `trees` and of the ligand itself.
+    With `stop_at` it stops as soon as every contact with the fixed atoms is that far, when
+    the point is only to unstick a chain from the surface. Returns None for a ligand without
     tails.
     """
     if not model.tails.any():
@@ -744,13 +664,10 @@ def refine_joint(
     stop_rmsd: float = float("inf"),
 ) -> List[Refinement]:
     """
-    Refine several ligands at once, so that ligands jammed against each other can all
-    give way. Each has the terms of `refine`; atoms of different ligands are also pushed
-    `contact` Å apart. Those contacts are listed through a tree from `tree_builder`
-    (periodic images included) and listed again whenever the ligands have moved (SKIN). `stop_at` and
-    `stop_rmsd` end it early as in `refine`, with every ligand meeting them. Ligands of one
-    type are computed together, so a shell of 40 lecithins costs about as many Python-level
-    steps per evaluation as a single one.
+    Refine several ligands at once, so that ligands jammed against each other can all give
+    way. Each has the terms of `refine`; atoms of different ligands are also pushed
+    `contact` Å apart, listed through a tree from `tree_builder` (periodic images included).
+    `stop_at` and `stop_rmsd` end it early as in `refine`, with every ligand meeting them.
     """
     sizes = [6 + m.n_torsions for m in models]
     offsets = np.concatenate([[0], np.cumsum(sizes)])
@@ -807,6 +724,5 @@ def refine_joint(
     out = []
     for l, model in enumerate(models):
         x, _, _ = model.forward(res.x[offsets[l]:offsets[l + 1]], coords[l], targets[l].mean(axis=0))
-        out.append(Refinement(coords=x, anchor_rmsd=_anchor_rmsd(x, groups[l], targets[l]),
-                              converged=bool(res.success)))
+        out.append(Refinement(coords=x, anchor_rmsd=_anchor_rmsd(x, groups[l], targets[l])))
     return out
