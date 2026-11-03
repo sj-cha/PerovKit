@@ -8,6 +8,7 @@ anchors leave it free, and are otherwise rigid. Packing (pack) turns the ligands
 clash, and bends multi-motif ones in torsion space, until every contact clears a cutoff.
 """
 from __future__ import annotations
+from collections import Counter
 from concurrent.futures import ProcessPoolExecutor
 import math
 import os
@@ -18,7 +19,7 @@ import numpy as np
 from scipy.spatial import cKDTree
 from tqdm.auto import tqdm
 
-from .constellation import Candidate, ConstellationSampler, rotations_about_axis
+from .constellation import Candidate, ConstellationSampler, mean_normal, rotations_about_axis
 from .core import BindingSite
 from .ligand import Ligand, LigandSpec
 from .refine import INTRA_SCALE, K_CONTACT, _intra_pairs, refine, refine_joint, stretch
@@ -127,12 +128,6 @@ class MultiMotifPose:
         return k
 
 
-def _site_normal(pose: MultiMotifPose) -> np.ndarray:
-    normal = np.mean([np.asarray(s.plane, dtype=float) / np.linalg.norm(s.plane)
-                      for s in pose.candidate.sites], axis=0)
-    return normal / np.linalg.norm(normal)
-
-
 _WORKER_CORE = None
 
 
@@ -198,7 +193,7 @@ def stretch_poses(poses: Sequence, core_tree, cutoff: float, n_workers: int = 1)
     todo = [p for p in multi_motif_poses
             if p.origins[p.variant] != "stretched" and p.ligand.torsion_model().tails.any()]
     jobs = [(p.ligand.torsion_model(), p.variants[0], p.ligand.binding_groups,
-             p.candidate.targets, _site_normal(p), cutoff + 0.2) for p in todo]
+             p.candidate.targets, mean_normal(p.candidate.sites), cutoff + 0.2) for p in todo]
     n_workers = min(n_workers, available_cpus(), len(jobs))
     if n_workers > 1:
         with ProcessPoolExecutor(max_workers=n_workers,
@@ -784,7 +779,9 @@ def select_constellations(
             sampler.accept(cand, lib, replace, radii)
             chosen.append(cand)
     else:
-        capacity = sampler.capacity([m.site for m in lig.binding_motifs], by_type)
+        # each site type hosts as many ligands as it has free sites per motif needing it
+        need = Counter(m.site for m in lig.binding_motifs)
+        capacity = min(sum(not s.passivated for s in by_type[t]) // k for t, k in need.items())
         if 0.0 < spec.coverage <= 1.0:
             n_target = int(math.ceil(spec.coverage * capacity))
         else:

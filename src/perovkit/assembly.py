@@ -108,6 +108,7 @@ class Assembly:
         refine_torsions: bool = True,
         stretch_tails: bool = True,
         n_workers: int = 32,   # at most the CPUs available
+        **sampler_options,
     ) -> None:
 
         assert not self.ligands, "Ligands have already been placed."
@@ -136,7 +137,7 @@ class Assembly:
                     sampler = ConstellationSampler(
                         core_positions, *self._sampler_geometry(), self._rng,
                         displaced=displaced_indices, overlap_cutoff=overlap_cutoff,
-                        max_rmsd=max_anchor_rmsd, sites=self.binding_sites,
+                        max_rmsd=max_anchor_rmsd, sites=self.binding_sites, **sampler_options,
                     )
                 pools, by_type = motif_pools(spec, self.binding_sites, self._symbol_map())
                 for lig_cloned, cand in select_constellations(spec, pools, by_type, sampler, log,
