@@ -165,7 +165,7 @@ def _mic_vectors(frames: list, i: np.ndarray, j: np.ndarray) -> np.ndarray:
     Minimum-image vectors r_j - r_i for index arrays `i`, `j` in every frame: (n_frames, n, 3).
     """
     idx, inv = np.unique(np.concatenate([i, j]), return_inverse=True)
-    atoms = [getattr(s, "atoms", s) for s in frames]       # Slab/NanoCrystal or ASE Atoms
+    atoms = [getattr(s, "atoms", s) for s in frames]       # Assembly or ASE Atoms
     pos = np.stack([a.positions[idx] for a in atoms])
     vecs = pos[:, inv[len(i):]] - pos[:, inv[:len(i)]]
 
@@ -191,7 +191,7 @@ def compute_distances(structure,
     Minimum-image distances between atom pairs.
 
     Args:
-        structure: Slab, NanoCrystal or ASE Atoms, or a list of them (a trajectory).
+        structure: Assembly or ASE Atoms, or a list of them (a trajectory).
         pairs: (n, 2) atom indices (i, j).
         vector (bool): Return the vectors r_j - r_i instead of their lengths.
 
@@ -213,7 +213,7 @@ def compute_angles(structure,
     Angles (deg) at the middle atom j of (i, j, k) triplets, minimum image.
 
     Args:
-        structure: Slab, NanoCrystal or ASE Atoms, or a list of them (a trajectory).
+        structure: Assembly or ASE Atoms, or a list of them (a trajectory).
         triplets: (n, 3) atom indices (i, j, k).
 
     Returns:

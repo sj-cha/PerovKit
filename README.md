@@ -21,15 +21,15 @@ Dependencies: `numpy`, `scipy`, `ase`, `rdkit`, `tqdm`
 - **Core**: The inorganic ABX<sub>3</sub> perovskite structure. Built as either a finite nanocrystal (`build_nanocrystal`) or a periodic slab (`build_slab`).
 - **Ligand**: An organic molecule that passivates surface sites. Created from SMILES (`from_smiles`) or an existing file (`from_file`). The `BindingMotif` specifies which atoms coordinate the surface. Cationic ligands take A-sites and anionic ligands take X-sites.
 - **LigandSpec**: Pairs a `Ligand` with placement parameters: `coverage` (fraction or absolute count of surface sites), optional `binding_sites` (explicit site indices), and `anchor_offset` (controls a vertical offset from the surface).
-- **NanoCrystal / Slab**: Combines a `Core` with `Ligand`. Handles site selection and ligand placement by rotation optimization.
+- **Assembly**: Combines a `Core` with `Ligand`, for a nanocrystal and a slab alike (a periodic `Core` gets minimum-image distances). Handles site selection and ligand placement by rotation optimization; `place_ligands_manually` instead places the ligands with fixed shifts and turns, optionally only those given by `ligand_ids`. `NanoCrystal` and `Slab` remain as other names for it.
 
 ## Quick Start
 
 ```python
-from perovkit import Core, Ligand, LigandSpec, BindingMotif, NanoCrystal, Slab
+from perovkit import Core, Ligand, LigandSpec, BindingMotif, Assembly
 ```
 
-### Build a `Nanocrystal` with Ligands
+### Build a Nanocrystal with Ligands
 
 ```python
 # 1. Build a 3x3x3 CsPbBr3 core
@@ -61,11 +61,11 @@ specs = [
     LigandSpec(ligand=anionic_lig, coverage=0.5),
 ]
 
-nc = NanoCrystal(core=core, ligand_specs=specs)
+nc = Assembly(core=core, ligand_specs=specs)
 nc.place_ligands()
 ```
 
-### Build a `Slab` with Ligands
+### Build a Slab with Ligands
 
 ```python
 # Build a 2x2x3 CsPbBr3 slab
@@ -80,18 +80,18 @@ specs = [
     LigandSpec(ligand=anionic_lig, coverage=0.5),
 ]
 
-slab = Slab(core=core, ligand_specs=specs)
+slab = Assembly(core=core, ligand_specs=specs)
 slab.place_ligands()
 ```
 
 ### Serialization
 
-Both `NanoCrystal` and `Slab` can be exported as a JSON file, alongside the structure file. 
+An `Assembly` can be exported as a JSON file, alongside the structure file. 
 
 ```python
 # Save
 nc.to(fmt="xyz", filename="structure.xyz", write_json=True)
 
 # Load
-nc = NanoCrystal.from_file("structure.xyz", "structure.xyz.json")
+nc = Assembly.from_file("structure.xyz", "structure.xyz.json")
 ```

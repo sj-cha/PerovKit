@@ -148,7 +148,7 @@ class Ligand:
             (see ``binding_groups`` for the split).
         planes (List[Tuple[int, int, int]]): Miller index of the surface each motif is bound
             to; ``plane`` is the first one.
-        indices (np.ndarray): Global atom indices when placed in a parent NanoCrystal/Slab.
+        indices (np.ndarray): Global atom indices when placed in a parent Assembly.
         _anchor_offset (float): Offset (Å) applied along the axis perpendicular to the plane.
     """
     atoms: Atoms
