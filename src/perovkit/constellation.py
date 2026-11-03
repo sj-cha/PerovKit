@@ -91,7 +91,7 @@ class Fit:
 
     def coords(self, lib: ConformerLibrary) -> np.ndarray:
         if self.xyz is not None:
-            return self.xyz - self.pivot + self.pivot
+            return self.xyz.copy()
         x = (lib.coords[self.conformer] - self.center) @ self.rotation.T
         if self.axis is not None and self.theta != 0.0:
             x = x @ rotations_about_axis(self.axis, np.array([self.theta]))[0].T
@@ -152,7 +152,7 @@ def fit_conformers(
     D[:, 2, 2] = np.where(d == 0, 1.0, d)
     R = V @ D @ np.transpose(U, (0, 2, 1))
 
-    mapped = np.einsum("cij,cnj->cni", R, Pc)
+    mapped = Pc @ R.transpose(0, 2, 1)
     rmsd = np.sqrt(np.mean(np.sum((mapped - Tc) ** 2, axis=-1), axis=1))
 
     sv = np.linalg.svd(Tc, compute_uv=False)
@@ -163,14 +163,14 @@ def fit_conformers(
 
     has_dir = np.linalg.norm(lib.directions, axis=-1) > 0          # (C, n)
     n_dir = np.maximum(has_dir.sum(axis=1), 1)
-    dirs = np.einsum("cij,cnj->cni", R, lib.directions)
+    dirs = lib.directions @ R.transpose(0, 2, 1)
 
     # lateral spread across the mean normal n: trace(cov) - n.cov.n of the body atoms
     nbar = normals.mean(axis=0)
     nbar = nbar / np.linalg.norm(nbar)
-    body = np.einsum("cij,cmj->cmi", R, lib.coords[:, lib.body] - center[:, None])
+    body = (lib.coords[:, lib.body] - center[:, None]) @ R.transpose(0, 2, 1)
     body -= body.mean(axis=1, keepdims=True)
-    cov = np.einsum("cmi,cmj->cij", body, body) / body.shape[1]
+    cov = (body.transpose(0, 2, 1) @ body) / body.shape[1]
     spread = np.trace(cov, axis1=1, axis2=2)
 
     if axis is not None:
@@ -701,7 +701,7 @@ class ConstellationSampler:
                        cost=float(res["cost"][c]),
                        origin="stretched" if lib.stretched[c] else "fit")
             x0 = base.coords(lib) - base.pivot
-            coords = np.einsum("sij,mj->smi", spins, x0) + base.pivot          # (S, m, 3)
+            coords = x0 @ spins.transpose(0, 2, 1) + base.pivot          # (S, m, 3)
             return base, coords, self._core_clearance(coords, excluded)
 
         def start(base, coords, d_core):
@@ -725,11 +725,11 @@ class ConstellationSampler:
                 starts.append(start(base, coords, d_core))
                 continue
 
-            dirs = np.einsum("sij,nj->sni", spins @ base.rotation, lib.directions[c])
+            dirs = lib.directions[c] @ (spins @ base.rotation).transpose(0, 2, 1)
             cos = np.einsum("sni,ni->sn", dirs, normals)
             align = (cos * has_dir[c]).sum(axis=1) / max(has_dir[c].sum(), 1)
             body = coords[:, lib.body]
-            perp = body - np.einsum("smi,i->sm", body, nbar)[..., None] * nbar
+            perp = body - (body @ nbar)[..., None] * nbar
             lat2 = np.mean(np.sum((perp - perp.mean(axis=1, keepdims=True)) ** 2, axis=-1), axis=1)
             d_lig = np.full(len(coords), np.inf)   # spins that clash with the core score inf anyway
             d_lig[feasible] = self._ligand_clearance(coords[feasible])
