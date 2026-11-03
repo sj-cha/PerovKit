@@ -362,7 +362,8 @@ class TorsionModel:
         g = np.empty_like(P)
         g[:, :3] = G.sum(axis=1)
         for k in range(3):
-            g[:, 3 + k] = np.einsum("lnd,lnd->l", G, np.matmul(Xt, dR[k].transpose(0, 2, 1)))
+            Y = np.matmul(Xt, dR[k].transpose(0, 2, 1))
+            g[:, 3 + k] = (G.reshape(len(P), 1, -1) @ Y.reshape(len(P), -1, 1))[:, 0, 0]
         if self.n_torsions and JIT:
             out = np.empty((len(P), self.n_torsions))
             _torsion_gradient(np.ascontiguousarray(X), np.ascontiguousarray(G),
