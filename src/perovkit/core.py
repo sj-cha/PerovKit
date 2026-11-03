@@ -590,7 +590,7 @@ class Core:
 
         Args:
             ligand_specs: The ligands with their coverages or sites.
-            **kwargs: Options of the placement: max_iters (10), overlap_cutoff (1.8 Å),
+            **kwargs: Options of the placement: max_iters (10), overlap_cutoff (1.6 Å),
                 coarse_step_deg (18), fine_step_deg (2), window_deg (12),
                 active_radius_factor (sqrt(2)/2), random_seed (42), verbose (True); for
                 multi-motif ligands also max_anchor_rmsd (0.5 Å), refine_torsions (True),

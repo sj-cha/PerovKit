@@ -97,7 +97,7 @@ class Assembly:
     def _place_ligands(
         self,
         max_iters: int = 10,
-        overlap_cutoff: float = 1.8,   # Å
+        overlap_cutoff: float = 1.6,   # Å
         coarse_step_deg: int = 18,
         fine_step_deg: int = 2,
         window_deg: int = 12,
