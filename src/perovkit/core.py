@@ -12,7 +12,7 @@ from ase.io.vasp import write_vasp
 from scipy.spatial import cKDTree
 from ase.data import covalent_radii, atomic_numbers
 
-from .ligand import Ligand, BindingMotif
+from .ligand import Ligand, BindingMotif, LigandSpec
 
 @dataclass
 class Core:
@@ -538,6 +538,52 @@ class Core:
         """
         from .strain import apply_strain
         apply_strain(structure=self, strain=strain, strain_ligands=False)
+
+
+    def place_ligands(self, ligand_specs: Sequence[LigandSpec], **kwargs) -> Assembly:
+        """
+        Place ligands on a copy of this core, which is left as it is: sites by coverage
+        (or as given), then turns about the surface normals until no atoms of different
+        ligands, or of a ligand and the core, are within `overlap_cutoff`.
+
+        Args:
+            ligand_specs: The ligands with their coverages or sites.
+            **kwargs: Options of the placement: max_iters (10), overlap_cutoff (1.8 Å),
+                coarse_step_deg (18), fine_step_deg (2), window_deg (12),
+                active_radius_factor (sqrt(2)/2), random_seed (42), verbose (True); for
+                multi-motif ligands also max_anchor_rmsd (0.5 Å), refine_torsions (True),
+                stretch_tails (True), n_workers (32, at most the CPUs available).
+
+        Returns:
+            Assembly: the core with its ligands.
+        """
+        from .assembly import Assembly
+        assembly = Assembly(core=self, ligand_specs=list(ligand_specs))
+        assembly._place_ligands(**kwargs)
+        return assembly
+
+
+    def place_ligands_manually(self, ligand_specs: Sequence[LigandSpec], **kwargs) -> Assembly:
+        """
+        Place ligands on a copy of this core, which is left as it is, without the
+        rotation search: cations shifted by cat_x/y/z_move (Å) and turned by cat_z_rotate
+        (degrees) about the surface normal, anions by the an_* values. Single-motif
+        ligands only.
+
+        Args:
+            ligand_specs: The ligands with their coverages or sites.
+            **kwargs: cat_x_move, cat_y_move, cat_z_move, cat_z_rotate, an_x_move,
+                an_y_move, an_z_move, an_z_rotate (all 0), ligand_ids (None: every
+                ligand; else only those ids, counted from 0 in placement order, are
+                shifted and turned), random_seed (42), verbose (True).
+
+        Returns:
+            Assembly: the core with its ligands.
+        """
+        from .assembly import Assembly
+        assembly = Assembly(core=self, ligand_specs=list(ligand_specs))
+        assembly._place_ligands_manually(**kwargs)
+        return assembly
 
 
     def to(
