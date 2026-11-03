@@ -325,7 +325,7 @@ class ConstellationSampler:
         rng: random.Random,
         sites: Sequence[BindingSite],
         displaced: Sequence[int] = (),
-        overlap_cutoff: float = 1.8,
+        overlap_cutoff: float = 1.6,
         max_rmsd: float = 0.5,
         n_fits: int = 4,
         n_constellations: int = 4,
