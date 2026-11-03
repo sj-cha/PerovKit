@@ -1,4 +1,5 @@
 from __future__ import annotations
+import dataclasses
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
@@ -6,7 +7,6 @@ import numpy as np
 from rdkit import Chem
 from rdkit.Chem import AllChem
 from rdkit.Geometry import Point3D
-from scipy.spatial import cKDTree
 
 if TYPE_CHECKING:
     from .ligand import Ligand
@@ -15,23 +15,20 @@ if TYPE_CHECKING:
 @dataclass
 class ConformerLibrary:
     """
-    Conformers of one ligand with the anchor and binding direction of every motif.
-
-    Built once per ligand type and reused for every placement of it: matching a ligand to
-    a set of surface sites then reduces to rigid fits against these conformers.
+    Conformers of one ligand with the anchor and binding direction of every motif, built
+    once per ligand type: matching the ligand to surface sites is then a rigid fit.
 
     Attributes:
         coords (np.ndarray): (n_conf, n_atoms, 3) positions, in the atom order of Ligand.atoms.
-        energies (np.ndarray): (n_conf,) UFF energies (kcal/mol) relative to the lowest
-            conformer; all zero when the conformers were not minimized.
+        energies (np.ndarray): (n_conf,) UFF energies (kcal/mol) relative to reference_energy;
+            all zero when the conformers were not minimized.
         anchors (np.ndarray): (n_conf, n_motifs, 3) centroid of each motif's binding atoms.
-        directions (np.ndarray): (n_conf, n_motifs, 3) unit vector from each anchor into
-            the ligand, which should point away from the surface; zero where undefined.
+        directions (np.ndarray): (n_conf, n_motifs, 3) unit vector from each anchor into the
+            ligand, which should point away from the surface; zero where undefined.
         body (np.ndarray): (n_atoms,) mask of the heavy atoms outside the binding groups,
             whose spread over the surface measures a conformer's footprint.
-        mirrored (bool): Whether the second half of the conformers mirrors the first.
-        stretched (np.ndarray): (n_conf,) conformers whose dangling chains were straightened
-            and stood up (see build); placement does not stretch them again.
+        stretched (np.ndarray): (n_conf,) templates whose chains were stood up (with_template).
+        mirrored (bool): Whether the second half of the embedded conformers mirrors the first.
         reference_energy (float): Absolute UFF energy (kcal/mol) the energies are relative to.
         n_templates (int): Poses appended by with_template, the last conformers; they have
             no mirror image.
@@ -41,14 +38,10 @@ class ConformerLibrary:
     anchors: np.ndarray
     directions: np.ndarray
     body: np.ndarray
+    stretched: np.ndarray
     mirrored: bool = False
-    stretched: Optional[np.ndarray] = None
     reference_energy: float = 0.0
     n_templates: int = 0
-
-    def __post_init__(self):
-        if self.stretched is None:
-            self.stretched = np.zeros(len(self.coords), dtype=bool)
 
     @property
     def n_conformers(self) -> int:
@@ -67,19 +60,18 @@ class ConformerLibrary:
     def with_template(self, mol: Chem.Mol, groups: List[List[int]], x: np.ndarray,
                       energy: float, stretched: bool = True) -> "ConformerLibrary":
         """
-        This library plus the pose `x` as one more conformer with relative UFF energy
-        `energy`: a pose that had to be rescued at a real site, its chains stood up unless
-        `stretched` is False, which the next sites of the same geometry then fit at once.
+        This library plus the pose `x` (relative UFF energy `energy`) as a template: a pose
+        rescued at a real site, which the next sites of the same geometry fit at once.
+        `stretched` says whether its chains were stood up.
         """
         anchors, directions = _anchor_geometry(mol, groups, x[None])
-        return ConformerLibrary(coords=np.concatenate([self.coords, x[None]]),
-                                energies=np.append(self.energies, energy),
-                                anchors=np.concatenate([self.anchors, anchors]),
-                                directions=np.concatenate([self.directions, directions]),
-                                body=self.body, mirrored=self.mirrored,
-                                stretched=np.append(self.stretched, stretched),
-                                reference_energy=self.reference_energy,
-                                n_templates=self.n_templates + 1)
+        return dataclasses.replace(self,
+                                   coords=np.concatenate([self.coords, x[None]]),
+                                   energies=np.append(self.energies, energy),
+                                   anchors=np.concatenate([self.anchors, anchors]),
+                                   directions=np.concatenate([self.directions, directions]),
+                                   stretched=np.append(self.stretched, stretched),
+                                   n_templates=self.n_templates + 1)
 
     @classmethod
     def build(
@@ -91,7 +83,6 @@ class ConformerLibrary:
         mirror: Optional[bool] = None,
         random_seed: int = 42,
         n_threads: int = 0,
-        n_stretched: int = 0,
     ) -> ConformerLibrary:
         """
         Embed conformers with ETKDG and, optionally, minimize them with UFF.
@@ -113,13 +104,6 @@ class ConformerLibrary:
                 when no atom carries a chiral tag, since mirroring would invert it.
             random_seed (int): Seed for ETKDG embedding.
             n_threads (int): Threads for embedding and minimization; 0 uses all.
-            n_stretched (int): For a multi-motif ligand with dangling chains, add this many
-                conformers with those chains straightened and standing up from a flat
-                surface through the anchors, then relaxed with UFF (see _stretched).
-                Embedded conformers are coils that mostly lie on the surface, but site
-                selection now keeps each pose it had to rescue as a template for the sites
-                of the same geometry (ConstellationSampler._learn), which does this at a
-                real site and costs a placement nothing; these 12 cost a lecithin 6 s.
         """
         if ligand.mol is None:
             raise ValueError("ConformerLibrary needs the ligand's RDKit mol")
@@ -150,13 +134,6 @@ class ConformerLibrary:
         # one non-finite energy would otherwise poison every relative energy below
         finite = np.isfinite(energies) & np.isfinite(coords).all(axis=(1, 2))
         coords, energies = coords[finite], energies[finite]
-        extra, extra_e = _stretched(ligand, mol, coords, n_stretched,
-                                    uff=optimize and AllChem.UFFHasAllMoleculeParams(mol),
-                                    base_energy=float(energies.min()))
-        stretched = np.concatenate([np.zeros(len(coords), dtype=bool), np.ones(len(extra), dtype=bool)])
-        if len(extra):
-            coords = np.concatenate([coords, extra])
-            energies = np.concatenate([energies, extra_e if optimize else np.zeros(len(extra))])
         reference = float(energies.min())
         energies = energies - reference
         if mirror is None:
@@ -164,7 +141,6 @@ class ConformerLibrary:
         if mirror:
             coords = np.concatenate([coords, coords * np.array([-1.0, 1.0, 1.0])])
             energies = np.concatenate([energies, energies])
-            stretched = np.concatenate([stretched, stretched])
         anchors, directions = _anchor_geometry(mol, ligand.binding_groups, coords)
 
         body = np.array([a.GetAtomicNum() > 1 for a in mol.GetAtoms()])
@@ -172,62 +148,19 @@ class ConformerLibrary:
         if not body.any():
             body[:] = True
         return cls(coords=coords, energies=energies, anchors=anchors, directions=directions,
-                   body=body, mirrored=bool(mirror), stretched=stretched, reference_energy=reference)
-
-    def pair_distances(self) -> np.ndarray:
-        """
-        Distance between every pair of anchors in every conformer: (n_conf, n_motifs, n_motifs).
-        """
-        diff = self.anchors[:, :, None, :] - self.anchors[:, None, :, :]
-        return np.linalg.norm(diff, axis=-1)
-
-    def distance_bounds(self) -> np.ndarray:
-        """
-        Smallest and largest anchor-anchor distance over the conformers: (n_motifs, n_motifs, 2).
-        """
-        d = self.pair_distances()
-        return np.stack([d.min(axis=0), d.max(axis=0)], axis=-1)
-
-
-def _surface_normal(x: np.ndarray, anchors: np.ndarray, directions: np.ndarray,
-                    body: np.ndarray, n_spin: int = 72) -> np.ndarray:
-    """
-    The outward normal of a flat surface carrying a conformer by its anchors, chosen as
-    the site fits are (constellation.fit_conformers): with two anchors (or anchors on a
-    line) the normal turns about the anchor axis to point the motif directions outward and
-    stand the body up; otherwise it is the normal of the anchor plane, on the body's side.
-    """
-    A = anchors - anchors.mean(axis=0)
-    has = np.linalg.norm(directions, axis=1) > 0
-    sv, vt = np.linalg.svd(A)[1:]
-    if len(A) > 2 and sv[1] > 0.05 * sv[0]:
-        n = vt[2]
-        return n if (directions[has] @ n).mean() >= 0 else -n
-    e1 = vt[0]
-    e2 = np.cross(e1, [1.0, 0.0, 0.0] if abs(e1[0]) < 0.9 else [0.0, 1.0, 0.0])
-    e2 /= np.linalg.norm(e2)
-    e3 = np.cross(e1, e2)
-    t = np.linspace(0.0, 2.0 * np.pi, n_spin, endpoint=False)
-    normals = np.cos(t)[:, None] * e2 + np.sin(t)[:, None] * e3          # (S, 3)
-    align = (normals @ directions[has].T).mean(axis=1) if has.any() else np.zeros(n_spin)
-    b = x[body] - x[body].mean(axis=0)
-    cov = b.T @ b / len(b)
-    lat2 = np.trace(cov) - np.einsum("si,ij,sj->s", normals, cov, normals)
-    return normals[int(np.argmin(2.0 * (1.0 - align) + lat2 / 4.0))]
+                   body=body, stretched=np.zeros(len(coords), dtype=bool), mirrored=bool(mirror),
+                   reference_energy=reference)
 
 
 def _uff_polish(mol: Chem.Mol, x: np.ndarray, fixed: List[int], max_displ: float = 0.3,
                 iters: int = 300) -> Tuple[np.ndarray, float]:
     """
-    Relax a pose with UFF, `fixed` atoms held in place and other heavy atoms within
-    `max_displ` Å of where they are: removes the close contacts torsion moves leave
-    (stretched lecithin 160-300 -> ~60 kcal/mol) without changing the shape. Returns the
-    coordinates and their UFF energy.
+    Relax a pose with UFF, `fixed` atoms held in place and other heavy atoms kept within
+    `max_displ` Å: removes the close contacts torsion moves leave without changing the
+    shape. Returns the coordinates and their UFF energy.
     """
     m = Chem.Mol(mol)
-    conf = m.GetConformer()
-    for a, p in enumerate(x):
-        conf.SetAtomPosition(a, Point3D(*map(float, p)))
+    m.GetConformer().SetPositions(np.asarray(x, dtype=float))
     ff = AllChem.UFFGetMoleculeForceField(m)
     fixed = set(fixed)
     for a in range(len(x)):
@@ -276,67 +209,8 @@ def embed_at(mol: Chem.Mol, pins: dict, n_conformers: int = 8, random_seed: int 
 def _uff_energy(mol: Chem.Mol, x: np.ndarray) -> float:
     """UFF energy (kcal/mol) of `mol` at positions `x`."""
     m = Chem.Mol(mol)
-    conf = m.GetConformer()
-    for a, p in enumerate(x):
-        conf.SetAtomPosition(a, Point3D(*map(float, p)))
+    m.GetConformer().SetPositions(np.asarray(x, dtype=float))
     return AllChem.UFFGetMoleculeForceField(m).CalcEnergy()
-
-
-def _stretched(ligand: Ligand, mol: Chem.Mol, coords: np.ndarray, n_pick: int, uff: bool = True,
-               base_energy: float = 0.0, max_strain: float = 40.0, cutoff: float = 1.8,
-               spacing: float = 3.0, hole: float = 2.5):
-    """
-    Copies of `n_pick` conformers, spread over the anchor-anchor distance, with their
-    dangling chains stretched (refine.stretch) against a flat surface through the anchors:
-    a square grid of points `spacing` Å apart, open within `hole` Å of each anchor where
-    its own site would be. With `uff` each copy is then relaxed (_uff_polish), and copies
-    more than `max_strain` kcal/mol above the lowest embedded conformer are dropped. Clashes
-    with the surface are left to site selection, which fits the copies to real sites like
-    any other conformer: the grid only stands in for a surface to lift the chains from.
-
-    Returns:
-        The copies (k, n_atoms, 3) and their UFF energies (k,), zero without `uff`.
-    """
-    empty = np.zeros((0,) + coords.shape[1:]), np.zeros(0)
-    if n_pick <= 0 or ligand.n_motifs < 2:
-        return empty
-    model = ligand.torsion_model()
-    if not model.tails.any():
-        return empty
-    from .refine import stretch          # refine is only needed for chains to stretch
-
-    groups = ligand.binding_groups
-    anchors, directions = _anchor_geometry(mol, groups, coords)
-    body = np.array([a.GetAtomicNum() > 1 for a in mol.GetAtoms()])
-    body[[i for g in groups for i in g]] = False
-    d = np.linalg.norm(anchors[:, 1] - anchors[:, 0], axis=1)
-    order = np.argsort(d, kind="stable")
-    picks = order[np.unique(np.linspace(0, len(order) - 1, min(n_pick, len(order))).round().astype(int))]
-
-    fixed = [i for g in groups for i in g]
-    out, energies = [], []
-    for c in picks:
-        x, A = coords[c], anchors[c]
-        n = _surface_normal(x, A, directions[c], body)
-        center = A.mean(axis=0)
-        e1 = np.cross(n, [1.0, 0.0, 0.0] if abs(n[0]) < 0.9 else [0.0, 1.0, 0.0])
-        e1 /= np.linalg.norm(e1)
-        e2 = np.cross(n, e1)
-        radius = float(np.linalg.norm(x - center, axis=1).max()) + 2.0 * spacing
-        g = np.arange(-radius, radius + spacing, spacing)
-        uu, vv = np.meshgrid(g, g)
-        grid = center + uu.ravel()[:, None] * e1 + vv.ravel()[:, None] * e2
-        flat = A - center - np.outer((A - center) @ n, n)
-        gap = np.linalg.norm((grid - center)[:, None] - flat[None], axis=-1).min(axis=1)
-        tree = cKDTree(grid[gap > hole])
-        res = stretch(model, x, groups, A, n, [tree], cutoff + 0.2)
-        if res is None:
-            continue
-        y, e = _uff_polish(mol, res.coords, fixed) if uff else (res.coords, base_energy)
-        if e - base_energy <= max_strain:
-            out.append(y)
-            energies.append(e)
-    return np.array(out).reshape((-1,) + coords.shape[1:]), np.array(energies)
 
 
 def _anchor_geometry(mol: Chem.Mol, groups: List[List[int]], coords: np.ndarray):
