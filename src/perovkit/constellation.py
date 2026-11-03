@@ -176,7 +176,9 @@ def fit_conformers(
     if axis is not None:
         thetas = np.linspace(0.0, 2.0 * np.pi, n_spin, endpoint=False)
         spins = rotations_about_axis(axis, thetas)                    # (S, 3, 3)
-        cos = np.einsum("sij,cnj,nj->csn", spins, dirs, normals)      # (C, S, n)
+        # cos[c, s, n] = normal_n . (spin_s @ dir_cn), with the normals turned back instead
+        back = normals @ spins                                        # (S, n, 3)
+        cos = (dirs.transpose(1, 0, 2) @ back.transpose(1, 2, 0)).transpose(1, 2, 0)   # (C, S, n)
         align = cos.sum(axis=-1) / n_dir[:, None]
         u = np.einsum("sji,j->si", spins, nbar)                       # spin^T n
         lat2 = spread[:, None] - np.einsum("si,cij,sj->cs", u, cov, u)
