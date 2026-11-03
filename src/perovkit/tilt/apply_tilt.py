@@ -8,7 +8,7 @@ from scipy.sparse import coo_matrix
 from scipy.sparse.linalg import splu
 
 from .glazer_pattern import build_octahedra_rotmat
-from perovkit import Core, NanoCrystal, Slab
+from perovkit import Core, Assembly
 
 """
 Some features have beem adapted from Terumasa Tadano's codes and modified.   
@@ -113,7 +113,7 @@ def _adjust_network(
 
 
 def apply_tilt(
-    structure: Core | NanoCrystal | Slab,
+    structure: Core | Assembly,
     glazer: str,
     angles: Tuple[float, float, float],
     *,
@@ -127,11 +127,11 @@ def apply_tilt(
     pos0 = np.array(structure.atoms.positions, dtype=float, copy=True)
     pos_new = np.array(pos0, copy=True)
 
-    # Ligand maps (NanoCrystal / Slab only)
+    # Ligand maps (Assembly only)
     lig_to_b = {}
     lig_global_indices = {}
 
-    if isinstance(structure, (NanoCrystal, Slab)) and move_ligands:
+    if isinstance(structure, Assembly) and move_ligands:
         for b in b_keys:
             for lig_id in octahedra[int(b)].get("Ligand", []):
                 lig_id = int(lig_id)
@@ -186,7 +186,7 @@ def apply_tilt(
         pos_new[int(x)] = np.mean(preds, axis=0)
 
     # 3) Ligands: rigidly follow assigned B (row-vector update)
-    if isinstance(structure, (NanoCrystal, Slab)) and move_ligands:
+    if isinstance(structure, Assembly) and move_ligands:
         for lig_id, b in lig_to_b.items():
             b = int(b)
             R = R_b.get(b, np.eye(3))

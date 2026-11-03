@@ -1,5 +1,5 @@
 """
-Ligand poses and the rotation search shared by NanoCrystal and Slab placement.
+Ligand poses and the rotation search of Assembly placement, on nanocrystals and slabs.
 
 A pose maps a spin angle (and, for multi-motif ligands, a choice among alternative
 conformer fits) to ligand coordinates. Single-motif ligands spin about the normal of

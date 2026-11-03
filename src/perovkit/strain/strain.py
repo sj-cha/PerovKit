@@ -4,7 +4,7 @@ from typing import Sequence
 
 import numpy as np
 
-from perovkit import Core, NanoCrystal, Slab
+from perovkit import Core, Assembly
 
 
 def _a_cation_groups(core) -> list:
@@ -25,7 +25,7 @@ def _rigidify_groups(pos0, pos_new, groups, affine):
 
 
 def apply_strain(
-    structure: Core | NanoCrystal | Slab,
+    structure: Core | Assembly,
     strain: Sequence[float],          # (ex, ey, ez)
     strain_ligands: bool = True,
 ):
@@ -39,13 +39,10 @@ def apply_strain(
     F[1, 1] += strain[1]
     F[2, 2] += strain[2]
 
-    is_periodic = isinstance(structure, Slab) or (
-        isinstance(structure, Core) and structure.is_slab
-    )
+    core = structure if isinstance(structure, Core) else structure.core
+    is_periodic = core.is_slab
 
     pos0 = np.asarray(structure.atoms.get_positions(), dtype=float)
-
-    core = structure if isinstance(structure, Core) else structure.core
     a_cation_groups = _a_cation_groups(core)
 
     if isinstance(structure, Core):
@@ -62,7 +59,7 @@ def apply_strain(
         structure.atoms.positions[:] = pos_new
 
     else:
-        # NanoCrystal or Slab
+        # Assembly
         n_core = len(structure.core.atoms)
 
         if is_periodic:

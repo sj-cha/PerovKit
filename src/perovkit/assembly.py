@@ -24,11 +24,15 @@ from .placement import (SitePose, FitPose, bounding_spheres, optimize_pose,
                         place_about_normal, motif_pools, refine_clusters, refine_pose,
                         select_constellations, stretch_poses, tree_min_distance,
                         intramolecular_contacts, DENSE_PAIRS)
-from .utils.geometry import farthest_point_sampling, compute_bounding_spheres, build_neighbor_map
+from .utils.geometry import farthest_point_sampling, per_face_farthest_point_sampling, compute_bounding_spheres, build_neighbor_map
 
 
 @dataclass
-class Slab:
+class Assembly:
+    """
+    A Core with ligands on its surface: a nanocrystal, or a slab when the Core is periodic
+    (Core.build_slab). Periodic cores get minimum-image distances and keep their cell.
+    """
     core: Core
     ligand_specs: List[LigandSpec]
     ligands: List[Ligand] = field(default_factory=list)
@@ -44,11 +48,6 @@ class Slab:
 
     def __post_init__(self):
         self.core = deepcopy(self.core)
-
-        if getattr(self.core, "is_nanocrystal", False):
-            raise ValueError(
-                "Slab got a nanocrystal-mode Core. Use NanoCrystal class instead."
-            )
 
         if getattr(self.core, "binding_sites", None):
             self.binding_sites = deepcopy(self.core.binding_sites)
@@ -184,7 +183,12 @@ class Slab:
                         n_target = len(available)
 
                 coords = np.array([s.position for s in available])
-                chosen_indices = farthest_point_sampling(coords, n_target, self._rng)
+                sc = self.core.supercell
+                if self.core.is_nanocrystal and sc is not None and len(set(sc)) > 1:
+                    planes = [s.plane for s in available]
+                    chosen_indices = per_face_farthest_point_sampling(coords, planes, n_target, self._rng)
+                else:
+                    chosen_indices = farthest_point_sampling(coords, n_target, self._rng)
                 chosen_sites = [available[i] for i in chosen_indices]
 
             for site in chosen_sites:
@@ -368,11 +372,12 @@ class Slab:
         stripped_atoms = Atoms(
             symbols=stripped_symbols,
             positions=stripped_positions,
-            pbc=[True, True, True],
-            cell=old.atoms.get_cell(),
+            pbc=False,
         )
-
-        stripped_atoms.cell[2, 2] = max_z + old.vacuum
+        if old.is_slab:
+            stripped_atoms.set_pbc(True)
+            stripped_atoms.set_cell(old.atoms.get_cell())
+            stripped_atoms.cell[2, 2] = max_z + old.vacuum
 
         # Rebuild the A-site. For an organic A-site, replacing a surface cation
         # removes its molecule, so re-derive the surviving cations from the
@@ -413,9 +418,16 @@ class Slab:
         an_y_move: float = 0.0,
         an_z_move: float = 0.0,
         an_z_rotate: float = 0.0,
+        ligand_ids: Optional[Sequence[int]] = None,
         random_seed: int = 42,
         verbose: bool = True,
     ):
+        """
+        Place every ligand at its site without the rotation search, cations shifted by
+        cat_x/y/z_move (Å) and turned by cat_z_rotate (degrees), anions by the an_* values.
+        With `ligand_ids`, only those ligands (ids count from 0 in placement order) are
+        shifted and turned; the rest sit at their sites unmoved.
+        """
         assert not self.ligands, "Ligands have already been placed."
         if any(spec.ligand.n_motifs > 1 for spec in self.ligand_specs):
             raise NotImplementedError("Manual placement supports single-motif ligands only.")
@@ -493,9 +505,16 @@ class Slab:
             if 0 <= idx < n_core:
                 core_mask[idx] = False
 
+        moved = set(range(n_lig)) if ligand_ids is None else {int(i) for i in ligand_ids}
+        if moved - set(range(n_lig)):
+            print(f"[Warning] No ligands with ids {sorted(moved - set(range(n_lig)))}; "
+                  f"ids run from 0 to {n_lig - 1}.")
+
         ligand_coords_list: List[np.ndarray] = []
         for i in range(n_lig):
-            if ligands[i].charge > 0:
+            if i not in moved:
+                x_move = y_move = z_move = z_rotate = 0.0
+            elif ligands[i].charge > 0:
                 x_move = cat_x_move
                 y_move = cat_y_move
                 z_move = cat_z_move
@@ -535,11 +554,12 @@ class Slab:
         stripped_atoms = Atoms(
             symbols=stripped_symbols,
             positions=stripped_positions,
-            pbc=[True, True, True],
-            cell=old.atoms.get_cell(),
+            pbc=False,
         )
-
-        stripped_atoms.cell[2, 2] = max_z + old.vacuum
+        if old.is_slab:
+            stripped_atoms.set_pbc(True)
+            stripped_atoms.set_cell(old.atoms.get_cell())
+            stripped_atoms.cell[2, 2] = max_z + old.vacuum
 
         # Rebuild the A-site. For an organic A-site, replacing a surface cation
         # removes its molecule, so re-derive the surviving cations from the
@@ -890,8 +910,11 @@ class Slab:
 
     def _sampler_geometry(self):
         """
-        Periodic tree builder and minimum-image convention for the constellation sampler.
+        Tree builder and minimum-image convention for the constellation sampler: periodic
+        for a slab, plain (identity) for a nanocrystal.
         """
+        if self.core.is_nanocrystal:
+            return (lambda pts: (cKDTree(pts), np.arange(len(pts)))), (lambda d: d)
         return self._build_pbc_tree, self._mic
 
 
@@ -936,11 +959,13 @@ class Slab:
         syms = np.array(at.get_chemical_symbols())
         b_idx = np.where(syms == self.core.B)[0]
 
-        cell = at.get_cell()
-        Lx, Ly, Lz = cell.lengths()
-
-        scaled = at.get_scaled_positions(wrap=True)
-        pos = scaled @ cell.array
+        if self.core.is_slab:
+            cell = at.get_cell()
+            boxsize = tuple(cell.lengths())
+            pos = at.get_scaled_positions(wrap=True) @ cell.array
+        else:
+            boxsize = None
+            pos = at.get_positions()
         B_pos = pos[b_idx]
 
         anchor_positions = []
@@ -960,7 +985,7 @@ class Slab:
         if anchor_positions:
             anchor_positions = np.vstack(anchor_positions)
 
-            b_tree = cKDTree(B_pos, boxsize=(Lx, Ly, Lz))
+            b_tree = cKDTree(B_pos, boxsize=boxsize)
             _, b_loc = b_tree.query(anchor_positions, k=1)
 
             for j, b_loc_j in enumerate(b_loc):
@@ -983,13 +1008,21 @@ class Slab:
 
     def to(
         self, 
-        fmt='vasp', 
+        fmt: Optional[str] = None, 
         filename: Optional[str] = None, 
         write_json: bool = True,
+        vacuum: float = 15.0,
         **kwargs
     ) -> None:      
+        """
+        Write the structure and, with `write_json`, its metadata to `filename`.json.
+        `fmt` defaults to "vasp" for a slab and "xyz" for a nanocrystal; a nanocrystal
+        written as vasp is boxed with `vacuum` Å around it.
+        """
         at = self.atoms
         formula = at.get_chemical_formula()
+        if fmt is None:
+            fmt = "vasp" if self.core.is_slab else "xyz"
 
         if filename is None:
             filename = f"{formula}.{fmt}"
@@ -998,7 +1031,18 @@ class Slab:
         path.parent.mkdir(parents=True, exist_ok=True)  
         if fmt == 'vasp':
             ase_kwargs = {**kwargs, "sort": True}
-            write_vasp(str(path), self.atoms, **ase_kwargs)
+            vasp_atoms = at
+            if self.core.is_nanocrystal:
+                pos = at.get_positions()
+                center = pos.mean(axis=0)
+                extent = pos.max(axis=0) - pos.min(axis=0)
+                cell_diag = extent + vacuum
+
+                vasp_atoms = at.copy()
+                vasp_atoms.set_cell(np.diag(cell_diag))
+                vasp_atoms.positions += (cell_diag / 2 - center)
+                vasp_atoms.pbc = True
+            write_vasp(str(path), vasp_atoms, **ase_kwargs)
             if write_json:
                 self.to_json(str(path) + ".json", sort = True)
         else:
@@ -1018,11 +1062,12 @@ class Slab:
             "X": self.core.X,
             "a": self.core.a,
             "supercell": list(self.core.supercell),
-            "cell": self.core.atoms.get_cell().array.tolist(),
-            "pbc": [bool(x) for x in self.core.atoms.pbc],
-            "vacuum": float(self.core.vacuum),
-            "n_core_atoms": len(self.core.atoms),
         }
+        if self.core.is_slab:
+            core_meta["cell"] = self.core.atoms.get_cell().array.tolist()
+            core_meta["pbc"] = [bool(x) for x in self.core.atoms.pbc]
+            core_meta["vacuum"] = float(self.core.vacuum)
+        core_meta["n_core_atoms"] = len(self.core.atoms)
 
         ligand_types_meta = []
         type_key_to_id: Dict[tuple, int] = {}
@@ -1075,7 +1120,7 @@ class Slab:
 
         topo = {
             "schema_version": 1,
-            "type": "slab",
+            "type": "slab" if self.core.is_slab else "nanocrystal",
             "n_total_atoms": n_total_atoms,
             "core": core_meta,
             "ligand_types": ligand_types_meta,
@@ -1091,7 +1136,7 @@ class Slab:
 
 
     @classmethod
-    def from_file(cls, filename: str, json_filename: str) -> Slab:
+    def from_file(cls, filename: str, json_filename: str) -> Assembly:
 
         atoms = read(filename)
 
@@ -1103,10 +1148,9 @@ class Slab:
             raise ValueError(f"Unsupported schema_version: {schema_version!r}")
 
         file_type = topo.get("type")
-        if file_type is not None and file_type != "slab":
+        if file_type not in (None, "nanocrystal", "slab"):
             raise ValueError(
-                f"JSON type is '{file_type}', expected 'slab'. "
-                f"Use NanoCrystal.from_file() for nanocrystal data."
+                f"JSON type is '{file_type}', expected 'nanocrystal' or 'slab'."
             )
 
         sort_idx = topo.get("sort_idx", None)
@@ -1128,8 +1172,11 @@ class Slab:
             )
 
         core_atoms = atoms[:n_core_atoms]
-        core_atoms.set_cell(np.array(core_meta["cell"], dtype=float))
-        core_atoms.set_pbc(np.array(core_meta["pbc"], dtype=bool))
+        if "cell" in core_meta:
+            core_atoms.set_cell(np.array(core_meta["cell"], dtype=float))
+            core_atoms.set_pbc(np.array(core_meta["pbc"], dtype=bool))
+        else:
+            core_atoms.pbc = False
 
         core_indices_meta = topo["core_indices"]
 
@@ -1153,7 +1200,7 @@ class Slab:
             atoms=core_atoms,
             a=core_meta["a"],
             supercell=tuple(core_meta["supercell"]),
-            vacuum=core_meta["vacuum"],
+            vacuum=core_meta.get("vacuum"),
             build_surface=False,
         )
 
@@ -1199,24 +1246,24 @@ class Slab:
 
             ligands.append(lig)
 
-        slab = cls(
+        assembly = cls(
             core=core,
             ligand_specs=[],
         )
-        slab.ligands = ligands
-        slab.ligand_coverage = {t["name"]: t["coverage"] for t in ligand_types_meta}
-        slab.core.octahedra = octahedra
-        slab.core.B_ijk = B_ijk
-        slab._build_index_map()
-        slab._build_and_link_atoms()
+        assembly.ligands = ligands
+        assembly.ligand_coverage = {t["name"]: t["coverage"] for t in ligand_types_meta}
+        assembly.core.octahedra = octahedra
+        assembly.core.B_ijk = B_ijk
+        assembly._build_index_map()
+        assembly._build_and_link_atoms()
 
-        return slab
+        return assembly
 
     @classmethod
     def from_ase(cls,
                  atoms: Atoms | List[Atoms],
                  json_filename: str
-                 ) -> Slab | List[Slab]:
+                 ) -> Assembly | List[Assembly]:
 
         with open(json_filename) as f:
             topo = json.load(f)
@@ -1226,10 +1273,9 @@ class Slab:
             raise ValueError(f"Unsupported schema_version: {schema_version!r}")
 
         file_type = topo.get("type")
-        if file_type is not None and file_type != "slab":
+        if file_type not in (None, "nanocrystal", "slab"):
             raise ValueError(
-                f"JSON type is '{file_type}', expected 'slab'. "
-                f"Use NanoCrystal.from_file() for nanocrystal data."
+                f"JSON type is '{file_type}', expected 'nanocrystal' or 'slab'."
             )
 
         single_input = isinstance(atoms, Atoms)
@@ -1240,8 +1286,10 @@ class Slab:
 
         core_meta = topo["core"]
         n_core_atoms = core_meta["n_core_atoms"]
-        core_cell = np.array(core_meta["cell"], dtype=float)
-        core_pbc = np.array(core_meta["pbc"], dtype=bool)
+        periodic = "cell" in core_meta
+        if periodic:
+            core_cell = np.array(core_meta["cell"], dtype=float)
+            core_pbc = np.array(core_meta["pbc"], dtype=bool)
 
         core_indices_meta = topo["core_indices"]
 
@@ -1284,7 +1332,7 @@ class Slab:
             lig_slices.append(slice(cursor, cursor + n_atoms))
             cursor += n_atoms
 
-        slabs: List[Slab] = []
+        assemblies: List[Assembly] = []
         for atoms_i in atoms_list:
             if n_total_atoms_json != len(atoms_i):
                 raise ValueError(
@@ -1302,8 +1350,8 @@ class Slab:
             core_atoms = Atoms(
                 numbers=numbers[:n_core_atoms],
                 positions=positions[:n_core_atoms],
-                pbc=core_pbc,
-                cell=core_cell,
+                pbc=core_pbc if periodic else False,
+                cell=core_cell if periodic else atoms_i.cell,
             )
 
             core = Core(
@@ -1313,7 +1361,7 @@ class Slab:
                 atoms=core_atoms,
                 a=core_meta["a"],
                 supercell=tuple(core_meta["supercell"]),
-                vacuum=core_meta["vacuum"],
+                vacuum=core_meta.get("vacuum"),
                 build_surface=False,
             )
 
@@ -1347,34 +1395,34 @@ class Slab:
 
                 ligands.append(lig)
 
-            slab = cls._from_data(core=core)
-            slab.ligands = ligands
-            slab.ligand_coverage = {t["name"]: t["coverage"] for t in ligand_types_meta}
-            slab.core.octahedra = octahedra
-            slab.core.B_ijk = B_ijk
-            slab._build_index_map()
-            slab._build_and_link_atoms()
+            assembly = cls._from_data(core=core)
+            assembly.ligands = ligands
+            assembly.ligand_coverage = {t["name"]: t["coverage"] for t in ligand_types_meta}
+            assembly.core.octahedra = octahedra
+            assembly.core.B_ijk = B_ijk
+            assembly._build_index_map()
+            assembly._build_and_link_atoms()
 
-            slabs.append(slab)
+            assemblies.append(assembly)
 
-        return slabs[0] if single_input else slabs
+        return assemblies[0] if single_input else assemblies
 
 
     @classmethod
-    def _from_data(cls, core: Core) -> Slab:
+    def _from_data(cls, core: Core) -> Assembly:
         """
-        Construct a Slab around `core` bypassing __post_init__, which deep-copies it.
+        Construct an Assembly around `core` bypassing __post_init__, which deep-copies it.
         Used when deserializing from the metadata, where the core is already private.
         """
-        slab = object.__new__(cls)
-        slab.core = core
-        slab.ligand_specs = []
-        slab.ligands = []
-        slab.ligand_coverage = {}
-        slab.binding_sites = []
-        slab._atoms = None
-        slab._setup_pbc()
-        return slab
+        assembly = object.__new__(cls)
+        assembly.core = core
+        assembly.ligand_specs = []
+        assembly.ligands = []
+        assembly.ligand_coverage = {}
+        assembly.binding_sites = []
+        assembly._atoms = None
+        assembly._setup_pbc()
+        return assembly
 
 
     def _build_and_link_atoms(self) -> None:
