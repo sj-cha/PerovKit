@@ -18,7 +18,7 @@ Dependencies: `numpy`, `scipy`, `ase`, `rdkit`, `tqdm`
 
 ## Key Concepts
 
-- **Core**: The inorganic ABX<sub>3</sub> perovskite structure. Built as either a finite nanocrystal (`build_nanocrystal`) or a periodic slab (`build_slab`). `place_ligands` puts ligands on a copy of it, choosing the sites and turning the ligands until they clear each other; `place_ligands_manually` places them with fixed shifts and turns instead, optionally only those given by `ligand_ids`. Both return an `Assembly` and leave the core as it is.
+- **Core**: The inorganic ABX<sub>3</sub> perovskite structure. Built with `build_core`, whose required `pbc` sets the periodicity: `False` for a finite nanocrystal, `(True, True, False)` for a slab periodic in x and y. `place_ligands` puts ligands on a copy of it, choosing the sites and turning the ligands until they clear each other; `place_ligands_manually` places them with fixed shifts and turns instead, optionally only those given by `ligand_ids`. Both return an `Assembly` and leave the core as it is.
 - **Ligand**: An organic molecule that passivates surface sites. Created from SMILES (`from_smiles`) or an existing file (`from_file`). The `BindingMotif` specifies which atoms coordinate the surface. Cationic ligands take A-sites and anionic ligands take X-sites.
 - **LigandSpec**: Pairs a `Ligand` with placement parameters: `coverage` (fraction or absolute count of surface sites), optional `binding_sites` (explicit site indices), and `anchor_offset` (controls a vertical offset from the surface).
 - **Assembly**: A `Core` with its `Ligand`s, for a nanocrystal and a slab alike (a periodic `Core` gets minimum-image distances), as returned by `Core.place_ligands` or read with `Assembly.from_file`. `NanoCrystal` and `Slab` remain as other names for it.
@@ -33,10 +33,11 @@ from perovkit import Core, Ligand, LigandSpec, BindingMotif, Assembly
 
 ```python
 # 1. Build a 3x3x3 CsPbBr3 core
-core = Core.build_nanocrystal(
+core = Core.build_core(
     A="Cs", B="Pb", X="Br",
     a=5.95,
     supercell=(3,3,3),
+    pbc=False,
     charge_neutral=True,
     random_seed=42,
 )
@@ -68,10 +69,11 @@ nc = core.place_ligands(specs)
 
 ```python
 # Build a 2x2x3 CsPbBr3 slab
-core = Core.build_slab(
+core = Core.build_core(
     A="Cs", B="Pb", X="Br",
     a=5.95,
     supercell=(2,2,3),
+    pbc=(True, True, False),
 )
 
 specs = [
