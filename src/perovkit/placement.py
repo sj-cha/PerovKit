@@ -1,12 +1,3 @@
-"""
-Ligand poses and their packing in Assembly placement, on nanocrystals and slabs.
-
-A pose maps a spin angle (and, for multi-motif ligands, a choice among alternative
-conformer fits) to ligand coordinates. Single-motif ligands spin about the normal of
-their site; multi-motif ligands spin about the axis through their anchors when two
-anchors leave it free, and are otherwise rigid. Packing (pack) turns the ligands that
-clash, and bends multi-motif ones in torsion space, until every contact clears a cutoff.
-"""
 from __future__ import annotations
 from collections import Counter
 from concurrent.futures import ProcessPoolExecutor
@@ -38,22 +29,10 @@ def place_about_normal(
     Turn an oriented single-motif ligand (body along +z) onto a site normal, spin it by
     `theta` about that normal and put its anchor on the site, `anchor_offset` above it.
     """
-    # Rotate to surface normal
-    R_align = rotation_from_u_to_v(
-        np.array([0.0, 0.0, 1.0], dtype=float),
-        plane,
-    )
-    coords_aligned = coords_loc @ R_align.T
-
-    # Rotate around surface normal
+    R_align = rotation_from_u_to_v(np.array([0.0, 0.0, 1.0]), plane)
     R_rot = rotation_about_axis(plane, theta)
-    coords_rot = coords_aligned @ R_rot.T
-
-    anchor_offset = plane / np.linalg.norm(plane) * float(anchor_offset)
-    anchor_pos = site_pos + anchor_offset
-
-    # Translate to binding site position
-    return coords_rot + anchor_pos
+    anchor_pos = site_pos + plane / np.linalg.norm(plane) * float(anchor_offset)
+    return (coords_loc @ R_align.T) @ R_rot.T + anchor_pos
 
 
 class SingleMotifPose:
@@ -63,6 +42,7 @@ class SingleMotifPose:
     random_start = True
     spins = True
     n_variants = 1
+    variant = 0
 
     def __init__(self, ligand: Ligand, plane: np.ndarray, site_pos: np.ndarray):
         self.ligand = ligand
@@ -84,8 +64,8 @@ class MultiMotifPose:
     Multi-motif ligand fitted to a constellation. Variants are coordinates of the
     candidate's alternative conformer fits, best first, followed by any refined ones;
     a stretched variant goes first. `origins` says where each came from ("fit",
-    "refined", "unstuck", "stretched"); theta is the spin about the anchor axis relative
-    to each.
+    "stretched", "refined", "unstuck", "embedded"); theta is the spin about the anchor axis
+    relative to each.
     """
     random_start = False
 
@@ -133,11 +113,9 @@ _WORKER_CORE = None
 
 def _single_threaded_blas() -> None:
     """
-    Run the OpenBLAS that scipy uses on one thread (Linux; silently nothing elsewhere).
-    Every L-BFGS step calls into it, which wakes all its threads (64 here); in a pool of
-    workers those threads starved each other, and adding workers made stretching slower.
-    The copy bundled with numpy wheels is left alone: the refinement barely uses it, and
-    resetting it in a forked worker cost more than it saved.
+    Run the OpenBLAS that scipy uses on one thread (Linux; silently nothing elsewhere):
+    every L-BFGS step wakes all its threads, which starve each other in a pool of workers.
+    The copy bundled with numpy wheels, which refinement barely uses, is left alone.
     """
     import ctypes
     try:
@@ -162,9 +140,10 @@ def _init_stretch_worker(core_points: np.ndarray) -> None:
     _WORKER_CORE = cKDTree(core_points)
 
 
-def _stretch_job(job: tuple) -> Optional[np.ndarray]:
+def _stretch_job(job: tuple, core=None) -> Optional[np.ndarray]:
     model, coords, groups, targets, normal, contact = job
-    res = stretch(model, coords, groups, targets, normal, [_WORKER_CORE], contact)
+    res = stretch(model, coords, groups, targets, normal,
+                  [_WORKER_CORE if core is None else core], contact)
     return None if res is None else res.coords
 
 
@@ -202,8 +181,7 @@ def stretch_poses(poses: Sequence, core_tree, cutoff: float, n_workers: int = 1)
             results = list(pool.map(_stretch_job, jobs,
                                     chunksize=max(1, len(jobs) // (4 * n_workers))))
     else:
-        results = [None if (r := stretch(*job[:4], job[4], [core_tree], job[5])) is None else r.coords
-                   for job in jobs]
+        results = [_stretch_job(job, core_tree) for job in jobs]
     for pose, coords in zip(todo, results):
         if coords is not None and float(core_tree.query(coords)[0].min()) >= cutoff:
             pose.variant = pose.add_variant(coords, origin="stretched", first=True)
@@ -211,13 +189,12 @@ def stretch_poses(poses: Sequence, core_tree, cutoff: float, n_workers: int = 1)
     return done
 
 
-# Soft-sphere radii (cutoff + margin) tried in turn. A wide margin clears contacts with
-# room to spare, but in a dense shell it also pushes on every contact that is already
-# fine, and can leave a real one below the cutoff; the narrow one then acts on those alone.
+# Soft-sphere radii (cutoff + margin) tried in turn: a wide margin clears contacts with room
+# to spare but in a dense shell also pushes on contacts already fine; the narrow one acts
+# on the real ones alone.
 MARGINS = (0.2, 0.05)
 # Contact weights, as multiples of refine's default, that refine_clusters tries in turn when
-# the margins fail: a ligand whose anchor springs hold it against the core sits where the
-# two balance, which can be a hair below the cutoff (SB3-8 at 1.798 A, anchors 0.45 A off).
+# the margins fail: anchor springs can hold a ligand a hair below the cutoff against the core.
 STIFFNESS = (1.0, 2.0, 4.0)
 
 
@@ -286,31 +263,22 @@ def bounding_spheres(poses: Sequence, coords_list: List[np.ndarray]) -> Tuple[np
     return centers, radii
 
 
-# Above this many atom pairs, _min_distance finds each neighbor atom's nearest atom in a tree
-# and measures those pairs alone, with the same arithmetic: a long multi-motif ligand has
-# nearly every other ligand within its sweep sphere, ~10^6 pairs on a large nanocrystal.
+# Above this many atom pairs, Contacts.closest finds each neighbor atom's nearest atom in a
+# tree and measures those pairs alone, with the same arithmetic.
 DENSE_PAIRS = 20000
 
 
-def tree_min_distance(
-    core_tree,
-    tree_builder: Callable,
-    cutoff: float,
-    neighbors_coords: List[np.ndarray],
-    early_core: bool = True,
-) -> Callable:
+def tree_min_distance(core_tree, tree_builder: Callable, neighbors_coords: List[np.ndarray]) -> Callable:
     """
-    The structures' _min_distance against one fixed set of neighbors, from a tree built
-    once: a long multi-motif ligand has nearly every other ligand as a neighbor, and the
-    rotation search evaluates it at every spin and variant. With `early_core`, like
-    _min_distance, a core contact below `cutoff` is returned without looking at the
-    ligands; without it, the result is the closest contact of either kind.
+    Closest contact with the core or any of `neighbors_coords`, as a function of the
+    coordinates, from a tree built once: the rotation search evaluates it at every spin and
+    variant of a long ligand that has nearly every other ligand as a neighbor.
     """
     tree = tree_builder(np.vstack(neighbors_coords))[0] if neighbors_coords else None
 
     def min_distance(coords: np.ndarray, _neighbors=None) -> float:
         d_core = float(core_tree.query(coords)[0].min()) if core_tree is not None else float("inf")
-        if (early_core and d_core < cutoff) or tree is None:
+        if tree is None:
             return d_core
         return min(d_core, float(tree.query(coords, k=1)[0].min()))
 
@@ -326,7 +294,7 @@ def optimize_pose(
     coarse_step_deg: float,
     fine_step_deg: float,
     window_deg: float,
-) -> Tuple[float, int, np.ndarray]:
+) -> Tuple[int, np.ndarray]:
     """
     Search the spin (and the fit variant) that maximizes the minimum distance to the core
     and to neighboring ligands.
@@ -336,7 +304,7 @@ def optimize_pose(
     fine scan refines the best angle of the best variant.
 
     Returns:
-        (theta, variant, coords) of the best pose found.
+        (variant, coords) of the best pose found.
     """
     best_theta = None
     best_variant = 0
@@ -359,10 +327,10 @@ def optimize_pose(
                 best_theta, best_variant, best_min_d, best_coords = theta, v, min_d, coords
 
         if best_min_d >= cutoff:
-            return best_theta, best_variant, best_coords
+            return best_variant, best_coords
 
     if not pose.spins:
-        return best_theta, best_variant, best_coords
+        return best_variant, best_coords
 
     # Fine search
     window_rad = math.radians(window_deg)
@@ -380,7 +348,7 @@ def optimize_pose(
         if min_d > best_min_d:
             best_theta, best_min_d, best_coords = theta, min_d, coords
 
-    return best_theta, best_variant, best_coords
+    return best_variant, best_coords
 
 
 def refine_clusters(
@@ -392,47 +360,39 @@ def refine_clusters(
     min_distance: Callable,
     cutoff: float,
     max_rmsd: float,
-    margin: float = 2.0,
     stop_at: Optional[float] = None,
 ) -> bool:
     """
     Refine jammed multi-motif ligands together, for when no ligand can clear its contacts
     alone.
 
-    Ligands closer than `cutoff` form a contact graph; in every connected component with a
+    Ligands closer than `cutoff` form a contact graph. In every connected component with a
     contact below the cutoff (a single ligand touching the core included), the multi-motif
-    members are refined jointly against the core and all other ligands, and pushed apart
-    from each other wherever they come within `cutoff` + margin (see MARGINS, then with
-    stiffer contacts, STIFFNESS). Members whose
-    anchors end farther than `max_rmsd` from their sites keep their poses (one in a shell
-    of 89 lecithins would otherwise throw the whole shell away); the others take theirs if
-    the closest contact of the component improves. Each refinement stops once every contact
-    is `stop_at` Å (by default halfway into the margin). Updates `coords_list` and the poses
-    in place.
+    members are refined jointly against the core and all other ligands and pushed apart
+    from each other, with the margins of MARGINS and then stiffer contacts (STIFFNESS).
+    Members whose anchors end farther than `max_rmsd` from their sites keep their poses;
+    the others take theirs if the closest contact of the component improves. Each
+    refinement stops once every contact is `stop_at` Å (by default halfway into the
+    margin). Updates `coords_list` and the poses in place.
 
     Returns:
         Whether any component improved.
     """
     n = len(poses)
-    centers, radii = compute_bounding_spheres(coords_list)
-    close: Dict[Tuple[int, int], float] = {}
-    for a in range(n):
-        for b in range(a + 1, n):
-            if np.linalg.norm(mic(centers[a] - centers[b])) > radii[a] + radii[b] + cutoff + margin:
-                continue
-            d = np.linalg.norm(mic(coords_list[a][:, None] - coords_list[b][None]), axis=-1).min()
-            if d < cutoff + margin:
-                close[(a, b)] = float(d)
-
     parent = list(range(n))
     def root(i):
         while parent[i] != i:
             parent[i] = parent[parent[i]]
             i = parent[i]
         return i
-    for (a, b), d in close.items():
-        if d < cutoff:
-            parent[root(a)] = root(b)
+    # ligands whose bounding spheres are more than the cutoff apart cannot touch
+    centers, radii = compute_bounding_spheres(coords_list)
+    for a in range(n):
+        for b in range(a + 1, n):
+            if np.linalg.norm(mic(centers[a] - centers[b])) > radii[a] + radii[b] + cutoff:
+                continue
+            if np.linalg.norm(mic(coords_list[a][:, None] - coords_list[b][None]), axis=-1).min() < cutoff:
+                parent[root(a)] = root(b)
     components: Dict[int, List[int]] = {}
     for i in range(n):
         components.setdefault(root(i), []).append(i)
@@ -521,8 +481,7 @@ class Contacts:
         """
         Closest contact of `coords` with the core or any of `neighbors_coords`.
         """
-        return tree_min_distance(self.core_tree, self.tree_builder, self.cutoff,
-                                 neighbors_coords, early_core=False)(coords)
+        return tree_min_distance(self.core_tree, self.tree_builder, neighbors_coords)(coords)
 
     def neighbors(self, poses: Sequence, coords_list: List[np.ndarray]) -> Dict[int, List[int]]:
         """
@@ -631,8 +590,7 @@ def pack(
     # starting poses; multi-motif ligands keep the spin of their fit
     thetas = np.array([2.0 * math.pi * rng.random() if p.random_start else 0.0
                        for p in poses], dtype=float)
-    coords_list: List[np.ndarray] = [p.coords(t, getattr(p, "variant", 0))
-                                     for p, t in zip(poses, thetas)]
+    coords_list: List[np.ndarray] = [p.coords(t, p.variant) for p, t in zip(poses, thetas)]
 
     # relax the stretched shell together, short of the cutoff; single turns clear the rest
     if n_stretched and refine_torsions:
@@ -665,9 +623,8 @@ def pack(
 
             search = contacts.closest
             if multi:
-                search = tree_min_distance(contacts.core_tree, contacts.tree_builder, cutoff,
-                                           neighbors_coords, early_core=False)
-            best_theta, best_variant, best_coords = optimize_pose(
+                search = tree_min_distance(contacts.core_tree, contacts.tree_builder, neighbors_coords)
+            best_variant, best_coords = optimize_pose(
                 poses[i], neighbors_coords, search, rng, cutoff,
                 coarse_step_deg, fine_step_deg, window_deg,
             )
@@ -681,12 +638,10 @@ def pack(
                 if refined is not None:
                     d_ref = min_distance(refined, others)
                     if d_ref > d_new:
-                        best_theta, best_variant = 0.0, poses[i].add_variant(refined)
-                        best_coords, d_new = refined, d_ref
+                        best_variant, best_coords, d_new = poses[i].add_variant(refined), refined, d_ref
 
             if d_new > d_old + 1e-3:
                 coords_list[i] = best_coords
-                thetas[i] = best_theta
                 poses[i].variant = best_variant
                 improved = True
                 if multi:
@@ -742,17 +697,17 @@ def select_constellations(
     fraction of its sites (see ConstellationSampler.sample), and seeds are tried until it
     is met or the surface is exhausted; a shortfall is reported with the reasons seeds were
     rejected. The first motif's sites set the per-face balance, so it is best given the
-    scarcer site type. With `refine`,
-    constellations whose fits all clash with the core get a torsion-space refinement first.
+    scarcer site type. With `refine`, constellations whose fits all clash with the core get
+    a torsion-space refinement first.
     """
     lig = spec.ligand
     lib = lig.conformers()
     replace = not spec.adsorb
     offset = float(spec.anchor_offset)
-    model = lig.torsion_model() if refine else None
+    tm = lig.torsion_model()
+    model = tm if refine else None
     # the frame's van der Waals radii shadow the sites under it (ConstellationSampler.accept);
     # chains and rings that torsions turn can still get out of a neighbor's way
-    tm = lig.torsion_model()
     radii = np.where(tm.frame, tm.radii, 0.0)
     groups = lig.binding_groups
     shadowed = sampler.n_shadowed
