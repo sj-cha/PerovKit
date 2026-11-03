@@ -1,11 +1,3 @@
-"""
-Site selection for ligands with several binding motifs.
-
-A constellation is one surface site per motif. Candidates grow from a seed site of the
-first motif, keeping partner sites whose distances fall inside the anchor-anchor range of
-the ligand's conformer library; every conformer is then fitted rigidly (Kabsch) to the
-constellation, and the best fits are checked against the core and the ligands placed so far.
-"""
 from __future__ import annotations
 from collections import Counter
 import dataclasses
@@ -34,6 +26,17 @@ def rotations_about_axis(axis: np.ndarray, thetas: np.ndarray) -> np.ndarray:
     s = np.sin(thetas)[:, None, None]
     c = np.cos(thetas)[:, None, None]
     return np.eye(3) + s * K + (1.0 - c) * (K @ K)
+
+
+def site_normals(sites: Sequence[BindingSite]) -> np.ndarray:
+    """Unit normal of every site's plane: (n_sites, 3)."""
+    return np.array([np.asarray(s.plane, dtype=float) / np.linalg.norm(s.plane) for s in sites])
+
+
+def mean_normal(sites: Sequence[BindingSite]) -> np.ndarray:
+    """Unit mean of the sites' normals."""
+    n = site_normals(sites).mean(axis=0)
+    return n / np.linalg.norm(n)
 
 
 def assign_faces(sites: Sequence[BindingSite]) -> List[tuple]:
@@ -68,10 +71,9 @@ class Fit:
 
     Coordinates are ``(x - center) @ rotation.T + pivot``, then turned by ``theta`` about
     ``axis`` through ``pivot`` when the fit leaves that spin free (two anchors, or anchors
-    on one line). A refined or stretched fit stores its coordinates at ``theta`` in ``xyz``
-    instead, and says which in ``origin``: "fit", "stretched" (a library conformer with
-    its chains already stood up), "refined", or "unstuck" (chains stretched just until
-    they clear the core).
+    on one line). Other poses keep their coordinates in ``xyz``. ``origin`` says where a
+    fit came from: "fit", "stretched" (a template with its chains stood up), "refined",
+    "unstuck" (chains stretched just until they clear the core) or "embedded".
     """
     conformer: int
     rotation: np.ndarray
@@ -87,16 +89,12 @@ class Fit:
     xyz: Optional[np.ndarray] = None
     origin: str = "fit"
 
-    def coords(self, lib: ConformerLibrary, theta: Optional[float] = None) -> np.ndarray:
-        theta = self.theta if theta is None else theta
+    def coords(self, lib: ConformerLibrary) -> np.ndarray:
         if self.xyz is not None:
-            x = self.xyz - self.pivot
-            if self.axis is not None and theta != self.theta:
-                x = x @ rotations_about_axis(self.axis, np.array([theta - self.theta]))[0].T
-            return x + self.pivot
+            return self.xyz - self.pivot + self.pivot
         x = (lib.coords[self.conformer] - self.center) @ self.rotation.T
-        if self.axis is not None and theta != 0.0:
-            x = x @ rotations_about_axis(self.axis, np.array([theta]))[0].T
+        if self.axis is not None and self.theta != 0.0:
+            x = x @ rotations_about_axis(self.axis, np.array([self.theta]))[0].T
         return x + self.pivot
 
 
@@ -256,9 +254,7 @@ class CoreGrid:
     """
     Cells `h` Å wide over the core, each listing the core atoms (periodic images included)
     within `bound` of some point of the cell, so that the nearest core atom within `bound`
-    of a point is among a handful of candidates. The spin scan asks this for every atom of
-    36 spins of every fitted conformer; a tree query per atom was a quarter of the site
-    selection on a large nanocrystal.
+    of a point is among a handful of candidates.
     """
 
     def __init__(self, points: np.ndarray, labels: np.ndarray, bound: float, h: float = 1.0):
@@ -287,15 +283,6 @@ class CoreGrid:
         return out
 
 
-# Rescued poses kept per ligand type as templates for the next sites (see _learn).
-MAX_TEMPLATES = 16
-# Seeds where no conformer of the library comes near: the most compact constellations tried
-# per seed, the conformers embedded at each, and the embeddings per placement (see _embed).
-EMBED_CONSTELLATIONS = 2
-EMBED_CONFORMERS = 8
-MAX_EMBEDDINGS = 12
-
-
 class ConstellationSampler:
     """
     Picks constellations for the multi-motif ligands of one structure, one ligand at a time.
@@ -307,6 +294,8 @@ class ConstellationSampler:
         tree_builder (Callable): Points -> (cKDTree, index map), with periodic images for slabs.
         mic (Callable): Minimum-image convention for difference vectors (identity if not periodic).
         rng (random.Random): Random generator of the placement.
+        sites (Sequence[BindingSite]): Every surface site; a ligand takes the free ones under
+            it out of use (accept), and a fit may not lie over one already taken.
         displaced (Sequence[int]): Core atoms already removed by earlier placements.
         overlap_cutoff (float): Minimum distance (Å) a fitted ligand must keep from the core.
         max_rmsd (float): Largest anchor RMSD (Å) at which a conformer still fits.
@@ -317,10 +306,13 @@ class ConstellationSampler:
         w_align, w_foot, foot_scale (float): Orientation terms of the cost, see fit_conformers.
         w_crowd (float): Weight of the squared shortfall (Å^2) below overlap_cutoff to
             already placed ligands.
-        n_refine (int): When no constellation of a seed has a fit clear of the core, this
-            many distinct conformers are refined in torsion space before the seed is given
-            up (0 disables). Starting points include conformers up to 2 * max_rmsd off,
-            since refinement also pulls the anchors in; the result must meet max_rmsd.
+        n_refine (int): Distinct conformers refined in torsion space before a seed whose fits
+            all clash with the core is given up (0 disables); they may start up to
+            2 * max_rmsd off, since refinement also pulls the anchors in.
+        max_templates (int): Rescued poses kept per ligand type as templates (_learn).
+        embed_constellations, embed_conformers, max_embeddings (int): Where no conformer comes
+            near the sites (_embed): the most compact constellations tried per seed, the
+            conformers embedded at each, and the embeddings per placement.
     """
 
     def __init__(
@@ -329,6 +321,7 @@ class ConstellationSampler:
         tree_builder: Callable,
         mic: Callable[[np.ndarray], np.ndarray],
         rng: random.Random,
+        sites: Sequence[BindingSite],
         displaced: Sequence[int] = (),
         overlap_cutoff: float = 1.8,
         max_rmsd: float = 0.5,
@@ -341,7 +334,10 @@ class ConstellationSampler:
         foot_scale: float = 2.0,
         w_crowd: float = 1.0,
         n_refine: int = 8,
-        sites: Sequence[BindingSite] = (),
+        max_templates: int = 16,
+        embed_constellations: int = 2,
+        embed_conformers: int = 8,
+        max_embeddings: int = 12,
     ):
         self.core_tree, self.core_map = tree_builder(np.asarray(core_positions, dtype=float))
         self._n_core = len(core_positions)
@@ -360,16 +356,18 @@ class ConstellationSampler:
         self.foot_scale = foot_scale
         self.w_crowd = w_crowd
         self.n_refine = n_refine
+        self.max_templates = max_templates
+        self.embed_constellations = embed_constellations
+        self.embed_conformers = embed_conformers
+        self.max_embeddings = max_embeddings
         self.placed: List[np.ndarray] = []
         self._lig_tree = None
         self._core_grid: Optional[CoreGrid] = None
-        # every surface site: a ligand takes the free ones under it out of use (accept), and
-        # a fit may not lie over one already taken (_covers_taken)
         self.sites = list(sites)
         self._site_positions = np.array([s.position for s in self.sites], dtype=float).reshape(-1, 3)
         planes = np.array([s.plane for s in self.sites], dtype=float).reshape(-1, 3)
         self._site_normals = planes / np.maximum(np.linalg.norm(planes, axis=1, keepdims=True), 1e-12)
-        self._site_tree = self.tree_builder(self._site_positions) if self.sites else None
+        self._site_tree = self.tree_builder(self._site_positions)
         self.n_shadowed = 0
         self._radii: Optional[np.ndarray] = None   # of the ligand type being placed
         self._n_embedded = 0
@@ -377,39 +375,26 @@ class ConstellationSampler:
         self.occupancy: Dict[tuple, float] = {}
 
 
-    @staticmethod
-    def capacity(motif_sites: Sequence[str], pools: Dict[str, List[BindingSite]]) -> int:
-        """
-        Most ligands the free sites can host: each site type serves as many ligands as it
-        has free sites divided by the motifs that need it.
-        """
-        need = Counter(motif_sites)
-        return min(sum(not s.passivated for s in pools[t]) // k for t, k in need.items())
-
-
     def sample(
         self,
         lib: ConformerLibrary,
         pools: List[List[BindingSite]],
         n_target: int,
-        anchor_offset: float = 0.0,
-        replace: bool = True,
-        model: Optional[TorsionModel] = None,
-        groups: Optional[List[List[int]]] = None,
-        mol=None,
-        radii: Optional[np.ndarray] = None,
+        anchor_offset: float,
+        replace: bool,
+        model: Optional[TorsionModel],
+        groups: List[List[int]],
+        mol,
+        radii: np.ndarray,
     ) -> Tuple[List[Candidate], Counter]:
         """
         Accept up to `n_target` constellations, spread evenly over the faces of the surface.
 
-        Seeds are the first motif's sites, grouped by face (see assign_faces: edge and
-        corner sites are shared out among their faces; a slab surface is one face). The next
-        seed comes from the face whose occupancy, ligands accepted over its capacity, is
-        lowest; the capacity of a face is its free sites of the first motif's type divided
-        by the motifs needing that type, so occupancy evens out per site, as coverage is
-        defined, even where faces lost different numbers of sites. Within the face the seed
-        is the one farthest from every occupied site, recomputed after each acceptance. A
-        face whose seeds fail simply stays behind, and the other faces take up the shortfall.
+        Seeds are the first motif's sites, grouped by face (assign_faces; a slab surface is
+        one face). The next seed comes from the face of lowest occupancy, ligands accepted
+        over its free sites of the first motif's type per ligand, and within it is the one
+        farthest from every occupied site. A face whose seeds fail stays behind, and the
+        other faces take up the shortfall.
 
         Args:
             lib (ConformerLibrary): Conformers of the ligand.
@@ -417,12 +402,11 @@ class ConstellationSampler:
             n_target (int): Number of ligands wanted.
             anchor_offset (float): Offset (Å) of every anchor along its site normal.
             replace (bool): Whether the ligand replaces its site atoms (else it adsorbs).
-            model, groups: Torsion model and binding groups of the ligand, to refine fits
-                that clash with the core; without them such constellations are rejected.
-            mol: RDKit mol of the ligand; with it, rescued poses become templates (_learn).
-            radii: Radii of its atoms for their projection on the surface (zero for atoms
-                that cast none); with them, a surface site lies under one ligand at most
-                (accept, _covers_taken).
+            model, groups: Torsion model (None: fits that clash with the core are rejected,
+                not refined) and binding groups of the ligand.
+            mol: RDKit mol of the ligand, for templates (_learn) and embedding (_embed).
+            radii: Radii of its atoms projected on the surface (zero for atoms that cast
+                none): a surface site lies under one ligand at most (accept, _covers_taken).
 
         Returns:
             The accepted candidates and a count of the reasons seeds were rejected.
@@ -487,12 +471,12 @@ class ConstellationSampler:
         self,
         lib: ConformerLibrary,
         sites: List[BindingSite],
-        anchor_offset: float = 0.0,
-        replace: bool = True,
-        model: Optional[TorsionModel] = None,
-        groups: Optional[List[List[int]]] = None,
-        mol=None,
-        radii: Optional[np.ndarray] = None,
+        anchor_offset: float,
+        replace: bool,
+        model: Optional[TorsionModel],
+        groups: List[List[int]],
+        mol,
+        radii: np.ndarray,
     ) -> Tuple[Optional[Candidate], str]:
         """
         Evaluate one given constellation; returns (candidate or None, rejection reason).
@@ -511,14 +495,12 @@ class ConstellationSampler:
         return cand, ("" if cand is not None else reason)
 
 
-    def accept(self, cand: Candidate, lib: ConformerLibrary, replace: bool,
-               radii: Optional[np.ndarray] = None) -> None:
+    def accept(self, cand: Candidate, lib: ConformerLibrary, replace: bool, radii: np.ndarray) -> None:
         """
-        Take the candidate's sites, and with `radii` the free surface sites under the ligand,
-        out of use. A site is under it when an atom on its outer side, projected along the
-        site normal, covers it with its radius (zero for atoms that cast no shadow): a broad
-        multipodal ligand lying on the surface would otherwise let its neighbors start inside
-        it.
+        Take the candidate's sites, and the free surface sites under the ligand, out of use.
+        A site is under it when an atom on its outer side, projected along the site normal,
+        covers it with its radius: a broad multipodal ligand lying on the surface would
+        otherwise let its neighbors start inside it.
         """
         for s in cand.sites:
             s.passivated = True
@@ -527,8 +509,7 @@ class ConstellationSampler:
         x = cand.fits[0].coords(lib)
         self.placed.append(x)
         self._lig_tree = self.tree_builder(np.vstack(self.placed))
-        if radii is not None:
-            self.n_shadowed += self._shadow(x, radii)
+        self.n_shadowed += self._shadow(x, radii)
 
 
     def _nearby_sites(self, center: np.ndarray, reach: float, taken: bool) -> np.ndarray:
@@ -556,16 +537,12 @@ class ConstellationSampler:
         Per pose (S, m, 3): whether it lies over a site already taken, as an anchor site or
         under another ligand; a surface site lies under one ligand at most.
         """
-        if self._site_tree is None or self._radii is None:
-            return np.zeros(len(coords), dtype=bool)
         reach = float(np.linalg.norm(coords[0] - pivot, axis=1).max()) + float(self._radii.max())
         return self._over(coords, pivot, self._radii, self._nearby_sites(pivot, reach, taken=True))
 
 
     def _shadow(self, x: np.ndarray, radii: np.ndarray) -> int:
         """Mark the free sites under pose `x` passivated; returns how many."""
-        if self._site_tree is None:
-            return 0
         center = x.mean(axis=0)
         reach = float(np.linalg.norm(x - center, axis=1).max()) + float(radii.max())
         free = self._nearby_sites(center, reach, taken=False)
@@ -643,8 +620,8 @@ class ConstellationSampler:
         anchor_offset: float,
         replace: bool,
         model: Optional[TorsionModel],
-        groups: Optional[List[List[int]]],
-        mol=None,
+        groups: List[List[int]],
+        mol,
     ) -> Tuple[Optional[Candidate], str]:
         found: List[Tuple[float, Candidate]] = []
         reasons: Counter = Counter()
@@ -665,7 +642,7 @@ class ConstellationSampler:
             cand = self._rescue(stuck, model, groups)
             if cand is not None:
                 return cand, ""
-        if not found and not stuck and tried and model is not None and mol is not None:
+        if not found and not stuck and tried and model is not None:
             cand = self._embed(lib, tried, anchor_offset, replace, model, groups, mol)
             if cand is not None:
                 return cand, ""
@@ -682,7 +659,7 @@ class ConstellationSampler:
         positions: np.ndarray,
         anchor_offset: float,
         replace: bool,
-    ) -> Tuple[Optional[Candidate], str, Optional[tuple]]:
+    ) -> Tuple[Optional[Candidate], str, List[tuple]]:
         """
         Fit every conformer to the constellation and keep the fits clear of the core.
 
@@ -690,13 +667,14 @@ class ConstellationSampler:
         starting points for _rescue when no fit is clear: (cost, conformer id, fit, coords,
         sites, targets, excluded), from the clashing fits and the near-miss conformers.
         """
-        normals = np.array([np.asarray(s.plane, dtype=float) / np.linalg.norm(s.plane)
-                            for s in sites])
+        normals = site_normals(sites)
         targets = positions + anchor_offset * normals
         res = fit_conformers(lib, targets, normals, w_align=self.w_align,
                              w_foot=self.w_foot, foot_scale=self.foot_scale)
 
         near = np.flatnonzero(res["rmsd"] <= 2.0 * self.max_rmsd)
+        if len(near) == 0:
+            return None, "no conformer fits the site distances", []
         near = near[np.argsort(res["cost"][near], kind="stable")]
         ok = near[res["rmsd"][near] <= self.max_rmsd][: self.n_fits]
         if lib.n_templates:
@@ -704,13 +682,8 @@ class ConstellationSampler:
             learned = near[(near >= lib.n_conformers - lib.n_templates)
                            & (res["rmsd"][near] <= self.max_rmsd)]
             ok = np.concatenate([ok, learned[~np.isin(learned, ok)]])
-        if len(near) == 0:
-            return None, "no conformer fits the site distances", []
 
-        excluded = set(self.displaced)
-        if replace:
-            excluded.update(i for s in sites for i in s.atom_indices)
-        excluded = np.fromiter(excluded, dtype=int, count=len(excluded))
+        excluded = self._excluded(sites, replace)
 
         axis = res["axis"]
         thetas = (np.linspace(0.0, 2.0 * np.pi, self.n_spin, endpoint=False)
@@ -731,22 +704,25 @@ class ConstellationSampler:
             coords = np.einsum("sij,mj->smi", spins, x0) + base.pivot          # (S, m, 3)
             return base, coords, self._core_clearance(coords, excluded)
 
+        def start(base, coords, d_core):
+            # refinement starts from the spin farthest from the core
+            return (base.cost, lib.unique_id(base.conformer), base, coords[int(np.argmax(d_core))],
+                    list(sites), targets, excluded)
+
         fits: List[Fit] = []
         starts: List[tuple] = []
         n_covering = 0
         for c in ok:
             base, coords, d_core = spun(c)
             feasible = d_core >= self.overlap_cutoff
-            if feasible.any() and self._radii is not None:
+            if feasible.any():
                 free = ~self._covers_taken(coords, base.pivot)
                 if not (feasible & free).any():
                     n_covering += 1
                     continue   # no rescue: bending would not lift it off others' sites
                 feasible &= free
             if not feasible.any():
-                s = int(np.argmax(d_core))
-                starts.append((base.cost, lib.unique_id(base.conformer), base, coords[s],
-                               list(sites), targets, excluded))
+                starts.append(start(base, coords, d_core))
                 continue
 
             dirs = np.einsum("sij,nj->sni", spins @ base.rotation, lib.directions[c])
@@ -755,7 +731,8 @@ class ConstellationSampler:
             body = coords[:, lib.body]
             perp = body - np.einsum("smi,i->sm", body, nbar)[..., None] * nbar
             lat2 = np.mean(np.sum((perp - perp.mean(axis=1, keepdims=True)) ** 2, axis=-1), axis=1)
-            d_lig = self._ligand_clearance(coords)
+            d_lig = np.full(len(coords), np.inf)   # spins that clash with the core score inf anyway
+            d_lig[feasible] = self._ligand_clearance(coords[feasible])
             short = np.maximum(0.0, self.overlap_cutoff - np.minimum(d_core, d_lig))
             score = (self.w_align * (1.0 - align) + self.w_foot * lat2 / self.foot_scale ** 2
                      + self.w_crowd * short ** 2)
@@ -776,10 +753,7 @@ class ConstellationSampler:
 
         if self.n_refine > 0:
             for c in near[res["rmsd"][near] > self.max_rmsd][: self.n_refine]:
-                base, coords, d_core = spun(c)
-                s = int(np.argmax(d_core))
-                starts.append((base.cost, lib.unique_id(base.conformer), base, coords[s],
-                               list(sites), targets, excluded))
+                starts.append(start(*spun(c)))
         reason = ("no conformer fits the site distances" if not len(ok) else
                   "every fit clashes with the core" if not n_covering else
                   "every fit clashes with the core or lies over another ligand's sites")
@@ -817,24 +791,22 @@ class ConstellationSampler:
                replace: bool, model: TorsionModel, groups: List[List[int]],
                mol) -> Optional[Candidate]:
         """
-        Fit the ligand to sites that no conformer of the library comes near, as with binding
-        groups at the ends of long flexible arms (a tetrapodal cavitand): for the most
-        compact constellations tried, embed fresh conformers with every binding atom and the
-        heavy atoms bonded to it pinned where the best-fitting conformer, each motif moved
-        onto its target, puts them, then rescue those like clashing fits (stretch, refine).
-        A rescued pose becomes a template (_learn) for the other sites of the same geometry.
+        Fit the ligand to sites that no conformer of the library comes near (binding groups
+        at the ends of long flexible arms, as in a tetrapodal cavitand): at the most compact
+        constellations tried, embed fresh conformers with each binding atom and its heavy
+        neighbors pinned where the best-fitting conformer, each motif moved onto its target,
+        puts them, and rescue those like clashing fits.
         """
         def spread(c):
             P = c[1]
             return max(float(np.linalg.norm(P[i] - P[j]))
                        for i, j in itertools.combinations(range(len(P)), 2))
 
-        for sites, positions in sorted(constellations, key=spread)[:EMBED_CONSTELLATIONS]:
-            if self._n_embedded >= MAX_EMBEDDINGS:
+        for sites, positions in sorted(constellations, key=spread)[:self.embed_constellations]:
+            if self._n_embedded >= self.max_embeddings:
                 return None
             self._n_embedded += 1
-            normals = np.array([np.asarray(s.plane, dtype=float) / np.linalg.norm(s.plane)
-                                for s in sites])
+            normals = site_normals(sites)
             targets = positions + anchor_offset * normals
             res = fit_conformers(lib, targets, normals, w_align=self.w_align,
                                  w_foot=self.w_foot, foot_scale=self.foot_scale)
@@ -846,11 +818,8 @@ class ConstellationSampler:
                 for a in set(g) | {n.GetIdx() for i in g for n in mol.GetAtomWithIdx(int(i)).GetNeighbors()
                                    if n.GetAtomicNum() > 1}:
                     pins[a] = x[a] + shift
-            ys = embed_at(mol, pins, n_conformers=EMBED_CONFORMERS, random_seed=1000 + self._n_embedded)
-            excluded = set(self.displaced)
-            if replace:
-                excluded.update(i for s in sites for i in s.atom_indices)
-            excluded = np.fromiter(excluded, dtype=int, count=len(excluded))
+            ys = embed_at(mol, pins, n_conformers=self.embed_conformers, random_seed=1000 + self._n_embedded)
+            excluded = self._excluded(sites, replace)
             starts = []
             for k, y in enumerate(ys):
                 rmsd = float(np.sqrt(np.mean([np.sum((y[list(g)].mean(axis=0) - t) ** 2)
@@ -871,26 +840,19 @@ class ConstellationSampler:
                groups: List[List[int]], mol, replace: bool) -> Tuple[ConformerLibrary, Candidate]:
         """
         Make a rescued pose a template, as a monodentate ligand is placed from one stretched
-        geometry: its chains stood up against the core (as they would be before packing) and
-        relaxed with UFF (_uff_polish, atoms near the core held, as UFF does not see it), it
-        becomes the candidate's pose and joins `lib`, so that constellations of the same
-        geometry (on a facet, most of them) fit it rigidly instead of being rescued again.
-        Clashes with neighbors are left to the packing loop. If the relaxed pose, then the
-        unrelaxed one, would touch the core, the rescued pose itself is the template, to be
-        stretched before packing like the candidate. Returns (library, candidate).
+        geometry: its chains stood up against the core and relaxed with UFF (atoms near the
+        core held, as UFF does not see it), it becomes the candidate's pose and joins `lib`,
+        so that constellations of the same geometry fit it rigidly instead of being rescued
+        again. If the relaxed pose, then the unrelaxed one, would touch the core, the
+        rescued pose itself is the template. Returns (library, candidate).
         """
-        if mol is None or lib.n_templates >= MAX_TEMPLATES or not model.tails.any():
+        if lib.n_templates >= self.max_templates or not model.tails.any():
             return lib, cand
         fit = cand.fits[0]
         x = fit.coords(lib)
-        excluded = set(self.displaced)
-        if replace:
-            excluded.update(cand.atom_indices)
-        excluded = np.fromiter(excluded, dtype=int, count=len(excluded))
-        normal = np.mean([np.asarray(s.plane, dtype=float) / np.linalg.norm(s.plane)
-                          for s in cand.sites], axis=0)
+        excluded = self._excluded(cand.sites, replace)
         core = self._local_tree(self.core_tree, self.core_map, fit.pivot, np.inf, excluded)
-        res = stretch(model, x, groups, cand.targets, normal / np.linalg.norm(normal), [core],
+        res = stretch(model, x, groups, cand.targets, mean_normal(cand.sites), [core],
                       self.overlap_cutoff + 0.2)
         poses = []
         if res is not None:
@@ -907,6 +869,17 @@ class ConstellationSampler:
                 return lib.with_template(mol, groups, y, energy), cand
         energy = _uff_energy(mol, x) - lib.reference_energy
         return lib.with_template(mol, groups, x, energy, stretched=False), cand
+
+
+    def _excluded(self, sites: List[BindingSite], replace: bool) -> np.ndarray:
+        """
+        Core atoms a pose at `sites` may overlap: those already displaced, and its own sites'
+        atoms when it replaces them.
+        """
+        excluded = set(self.displaced)
+        if replace:
+            excluded.update(i for s in sites for i in s.atom_indices)
+        return np.fromiter(excluded, dtype=int, count=len(excluded))
 
 
     def _surroundings(self, start: np.ndarray, pivot: np.ndarray, excluded: np.ndarray) -> list:
@@ -935,16 +908,12 @@ class ConstellationSampler:
         clear it; returns it as a fit with explicit coordinates ("unstuck": the stretch
         before packing still stands it up fully) if that works, else None.
         """
-        normal = np.mean([np.asarray(s.plane, dtype=float) / np.linalg.norm(s.plane) for s in sites], axis=0)
-        res = stretch(model, start, groups, targets, normal / np.linalg.norm(normal),
+        res = stretch(model, start, groups, targets, mean_normal(sites),
                       self._surroundings(start, base.pivot, excluded), self.overlap_cutoff + 0.2,
                       stop_at=self.overlap_cutoff + 0.1)
         if res is None or self._core_clearance(res.coords[None], excluded)[0] < self.overlap_cutoff:
             return None
-        return Fit(conformer=base.conformer, rotation=base.rotation, center=base.center,
-                   pivot=base.pivot, axis=base.axis, theta=0.0, rmsd=base.rmsd,
-                   alignment=base.alignment, footprint=base.footprint, energy=base.energy,
-                   cost=base.cost, xyz=res.coords, origin="unstuck")
+        return dataclasses.replace(base, theta=0.0, xyz=res.coords, origin="unstuck")
 
 
     def _refine_fit(
@@ -967,10 +936,8 @@ class ConstellationSampler:
             return None
         if self._core_clearance(res.coords[None], excluded)[0] < self.overlap_cutoff:
             return None
-        return Fit(conformer=base.conformer, rotation=base.rotation, center=base.center,
-                   pivot=base.pivot, axis=base.axis, theta=0.0, rmsd=res.anchor_rmsd,
-                   alignment=base.alignment, footprint=base.footprint, energy=base.energy,
-                   cost=base.cost, xyz=res.coords, origin="refined")
+        return dataclasses.replace(base, theta=0.0, rmsd=res.anchor_rmsd, xyz=res.coords,
+                                   origin="refined")
 
 
     @staticmethod

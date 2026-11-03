@@ -594,7 +594,8 @@ class Core:
                 coarse_step_deg (18), fine_step_deg (2), window_deg (12),
                 active_radius_factor (sqrt(2)/2), random_seed (42), verbose (True); for
                 multi-motif ligands also max_anchor_rmsd (0.5 Å), refine_torsions (True),
-                stretch_tails (True), n_workers (32, at most the CPUs available).
+                stretch_tails (True), n_workers (32, at most the CPUs available), and any
+                option of ConstellationSampler (e.g. n_refine, max_templates).
 
         Returns:
             Assembly: the core with its ligands.
