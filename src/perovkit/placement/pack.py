@@ -16,22 +16,20 @@ def bend_pose(
     pose: FitPose,
     coords: np.ndarray,
     neighbors_coords: List[np.ndarray],
-    core_tree,
-    box: Box,
-    cutoff: float,
+    contacts: Contacts,
     max_rmsd: float,
-    min_distance: Callable,
-) -> Optional[np.ndarray]:
+) -> Tuple[Optional[np.ndarray], float]:
     """
-    Refine a multi-motif ligand in torsion space against the core and its neighbors.
+    Refine a multi-motif ligand in torsion space against the core and `neighbors_coords`.
 
-    Returns the refined coordinates with the largest `min_distance(coords, neighbors)`,
-    stopping at the first margin that clears `cutoff`, or None when every attempt leaves
-    the anchors farther than `max_rmsd` (RMS, Å) from their sites.
+    Returns the refined coordinates whose closest contact is farthest, and that contact,
+    stopping at the first margin that clears the cutoff; (None, -inf) when every attempt
+    leaves the anchors farther than `max_rmsd` (RMS, Å) from their sites.
     """
-    trees = [core_tree]
+    cutoff = contacts.cutoff
+    trees = [contacts.core_tree]
     if neighbors_coords:
-        trees.append(box.tree(np.vstack(neighbors_coords))[0])
+        trees.append(contacts.box.tree(np.vstack(neighbors_coords))[0])
     best, best_d = None, -float("inf")
     for margin in CONTACT_MARGINS:
         res = refine(pose.ligand.torsion_model(), coords, pose.ligand.binding_groups,
@@ -39,12 +37,12 @@ def bend_pose(
                      stop_at=cutoff + margin / 2, stop_rmsd=max_rmsd)
         if res.anchor_rmsd > max_rmsd:
             continue
-        d = min_distance(res.coords, neighbors_coords)
+        d = min(float(tree.query(res.coords)[0].min()) for tree in trees)
         if d > best_d:
             best, best_d = res.coords, d
         if best_d >= cutoff:
             break
-    return best
+    return best, best_d
 
 
 def intramolecular_contacts(poses: Sequence, coords_list: List[np.ndarray]) -> Tuple[float, int]:
@@ -63,19 +61,11 @@ def intramolecular_contacts(poses: Sequence, coords_list: List[np.ndarray]) -> T
     return closest, n
 
 
-def compute_bounding_spheres(
-        coords_list: List[np.ndarray],
-    ) -> Tuple[np.ndarray, np.ndarray]:
-
-    n_lig = len(coords_list)
-    centers = np.zeros((n_lig, 3), dtype=float)
-    radii = np.zeros(n_lig, dtype=float)
-
-    for i, coords in enumerate(coords_list):
-        c = coords.mean(axis=0)
-        centers[i] = c
-        radii[i] = np.linalg.norm(coords - c, axis=1).max()
-
+def compute_bounding_spheres(coords_list: List[np.ndarray]) -> Tuple[np.ndarray, np.ndarray]:
+    """Center (mean) and radius of the atoms of every ligand."""
+    centers = np.array([c.mean(axis=0) for c in coords_list], dtype=float).reshape(-1, 3)
+    radii = np.array([np.linalg.norm(c - m, axis=1).max() for c, m in zip(coords_list, centers)],
+                     dtype=float)
     return centers, radii
 
 
@@ -101,7 +91,7 @@ def tree_min_distance(core_tree, box: Box, neighbors_coords: List[np.ndarray]) -
     """
     tree = box.tree(np.vstack(neighbors_coords))[0] if neighbors_coords else None
 
-    def min_distance(coords: np.ndarray, _neighbors=None) -> float:
+    def min_distance(coords: np.ndarray) -> float:
         d_core = float(core_tree.query(coords)[0].min())
         if tree is None:
             return d_core
@@ -112,8 +102,7 @@ def tree_min_distance(core_tree, box: Box, neighbors_coords: List[np.ndarray]) -
 
 def turn_pose(
     pose,
-    neighbors_coords: List[np.ndarray],
-    min_distance: Callable,
+    clearance: Callable,
     rng: random.Random,
     cutoff: float,
     coarse_step_deg: float,
@@ -121,8 +110,8 @@ def turn_pose(
     window_deg: float,
 ) -> Tuple[int, np.ndarray]:
     """
-    Search the spin (and the fit variant) that maximizes the minimum distance to the core
-    and to neighboring ligands.
+    Search the spin (and the fit variant) that maximizes `clearance`, the closest contact
+    of the coordinates with the core and the neighboring ligands.
 
     Variants are scanned in order and the search stops at the first one whose coarse scan
     clears `cutoff`, so better-fitting conformers win whenever they are clash-free. The
@@ -146,7 +135,7 @@ def turn_pose(
             theta = theta % (2.0 * math.pi)
 
             coords = pose.coords(theta, v)
-            min_d = min_distance(coords, neighbors_coords)
+            min_d = clearance(coords)
 
             if min_d > best_min_d:
                 best_theta, best_variant, best_min_d, best_coords = theta, v, min_d, coords
@@ -161,14 +150,14 @@ def turn_pose(
     window_rad = math.radians(window_deg)
     fine_step_rad = math.radians(fine_step_deg)
 
-    # the window follows best_theta as it improves, as the original search did
+    # the window follows best_theta as it improves
     n_fine = int(round(2.0 * window_rad / fine_step_rad)) + 1
     for k in range(n_fine):
         delta = -window_rad + k * (2.0 * window_rad / (n_fine - 1))
         theta = (best_theta + delta) % (2.0 * math.pi)
 
         coords = pose.coords(theta, best_variant)
-        min_d = min_distance(coords, neighbors_coords)
+        min_d = clearance(coords)
 
         if min_d > best_min_d:
             best_theta, best_min_d, best_coords = theta, min_d, coords
@@ -179,10 +168,7 @@ def turn_pose(
 def bend_clusters(
     poses: Sequence,
     coords_list: List[np.ndarray],
-    core_tree,
-    box: Box,
-    min_distance: Callable,
-    cutoff: float,
+    contacts: Contacts,
     max_rmsd: float,
     stop_at: Optional[float] = None,
 ) -> bool:
@@ -190,7 +176,7 @@ def bend_clusters(
     Refine jammed multi-motif ligands together, for when no ligand can clear its contacts
     alone.
 
-    Ligands closer than `cutoff` form a contact graph. In every connected component with a
+    Ligands closer than the cutoff form a contact graph. In every connected component with a
     contact below the cutoff (a single ligand touching the core included), the multi-motif
     members are refined jointly against the core and all other ligands and pushed apart
     from each other, with the margins of CONTACT_MARGINS and then stiffer contacts (2x and 4x).
@@ -202,6 +188,7 @@ def bend_clusters(
     Returns:
         Whether any component improved.
     """
+    cutoff, box = contacts.cutoff, contacts.box
     n = len(poses)
     parent = list(range(n))
     def root(i):
@@ -215,14 +202,15 @@ def bend_clusters(
         for b in range(a + 1, n):
             if np.linalg.norm(box.mic(centers[a] - centers[b])) > radii[a] + radii[b] + cutoff:
                 continue
-            if np.linalg.norm(box.mic(coords_list[a][:, None] - coords_list[b][None]), axis=-1).min() < cutoff:
+            gaps = np.linalg.norm(box.mic(coords_list[a][:, None] - coords_list[b][None]), axis=-1)
+            if gaps.min() < cutoff:
                 parent[root(a)] = root(b)
     components: Dict[int, List[int]] = {}
     for i in range(n):
         components.setdefault(root(i), []).append(i)
 
     def closest(coords, i):
-        return min_distance(coords[i], [c for j, c in enumerate(coords) if j != i])
+        return contacts.exact(coords[i], [c for j, c in enumerate(coords) if j != i])
 
     improved = False
     for comp in components.values():
@@ -233,7 +221,7 @@ def bend_clusters(
         if before >= cutoff:
             continue  # nothing to clear: a lone ligand with no contact below the cutoff
         others = [c for j, c in enumerate(coords_list) if j not in members]
-        trees = [core_tree, box.tree(np.vstack(others))[0] if others else None]
+        trees = [contacts.core_tree, box.tree(np.vstack(others))[0] if others else None]
         for stiff, margin in [(k, m) for k in (1.0, 2.0, 4.0) for m in CONTACT_MARGINS]:
             results = refine_joint(
                 [poses[i].ligand.torsion_model() for i in members],
@@ -329,7 +317,8 @@ class Contacts:
         return global_min, conflict_ligs, dists
 
 
-def active_cluster(conflict_ligs: List[int], site_positions: np.ndarray, radius: float, box: Box) -> List[int]:
+def active_cluster(conflict_ligs: List[int], site_positions: np.ndarray, radius: float,
+                   box: Box) -> List[int]:
     """
     The ligands in conflict and every ligand whose site lies within `radius` of a site
     already in the cluster (minimum images along the periodic axes of `box`), grown until
@@ -405,8 +394,7 @@ def pack(
 
     # relax the stretched shell together, short of the cutoff; single turns clear the rest
     if n_stretched and refine_torsions:
-        bend_clusters(poses, coords_list, contacts.core_tree, contacts.box,
-                        contacts.exact, cutoff, max_rmsd, stop_at=cutoff - 0.1)
+        bend_clusters(poses, coords_list, contacts, max_rmsd, stop_at=cutoff - 0.1)
 
     # Rotation optimization loop
     neighbor_map = contacts.neighbors(poses, coords_list)
@@ -424,32 +412,27 @@ def pack(
         rng.shuffle(active)
 
         for i in tqdm(active, desc=f"Optimizing ligand (iter {iter})", disable=not verbose):
-            neighbor_idx = neighbor_map.get(i, [])
-            neighbors_coords = [coords_list[j] for j in neighbor_idx]
+            neighbors_coords = [coords_list[j] for j in neighbor_map.get(i, [])]
 
             # multi-motif ligands need exact contacts, neighbors included even near the core
             multi = isinstance(poses[i], FitPose)
-            min_distance = contacts.exact if multi else contacts.closest
-            d_old = min_distance(coords_list[i], neighbors_coords) if multi else dists[i]
-
-            search = contacts.closest
             if multi:
-                search = tree_min_distance(contacts.core_tree, contacts.box, neighbors_coords)
+                clearance = tree_min_distance(contacts.core_tree, contacts.box, neighbors_coords)
+                d_old = clearance(coords_list[i])
+            else:
+                clearance = lambda x: contacts.closest(x, neighbors_coords)
+                d_old = dists[i]
             best_variant, best_coords = turn_pose(
-                poses[i], neighbors_coords, search, rng, cutoff,
-                coarse_step_deg, fine_step_deg, window_deg,
+                poses[i], clearance, rng, cutoff, coarse_step_deg, fine_step_deg, window_deg,
             )
-            d_new = min_distance(best_coords, neighbors_coords)
+            d_new = clearance(best_coords)
 
             # if turning fails, a multi-motif ligand may bend, against every other ligand
             if refine_torsions and multi and d_new < cutoff:
                 others = [c for j, c in enumerate(coords_list) if j != i]
-                refined = bend_pose(poses[i], best_coords, others, contacts.core_tree,
-                                      contacts.box, cutoff, max_rmsd, min_distance)
-                if refined is not None:
-                    d_ref = min_distance(refined, others)
-                    if d_ref > d_new:
-                        best_variant, best_coords, d_new = poses[i].add_variant(refined), refined, d_ref
+                refined, d_ref = bend_pose(poses[i], best_coords, others, contacts, max_rmsd)
+                if refined is not None and d_ref > d_new:
+                    best_variant, best_coords, d_new = poses[i].add_variant(refined), refined, d_ref
 
             if d_new > d_old + 1e-3:
                 coords_list[i] = best_coords
@@ -461,10 +444,7 @@ def pack(
 
         if not improved and refine_torsions:
             # nobody could move alone: let jammed multi-motif ligands give way together
-            improved = bend_clusters(
-                poses, coords_list, contacts.core_tree, contacts.box,
-                contacts.exact, cutoff, max_rmsd,
-            )
+            improved = bend_clusters(poses, coords_list, contacts, max_rmsd)
 
         if not improved:
             raise RuntimeError("[Log] No improvement in active cluster. Stopping.")

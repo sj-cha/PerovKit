@@ -123,7 +123,7 @@ class _Neighbors:
 
     def update(self, X):
         L, n, _ = X.shape
-        if self.ref is None or self.ref.shape != X.shape:
+        if self.ref is None:
             self.ref = X.copy()
             self.starts = np.arange(L + 1, dtype=np.int64) * n
             stale = np.ones(L, dtype=bool)
@@ -199,7 +199,7 @@ class _Mutual:
         self.limit = np.full(len(self.p), self.contact)
 
 
-def _terms(model, X, groups, T, nb, k_anchor, k_contact):
+def _terms(X, groups, T, nb, k_anchor, k_contact):
     """
     Anchor, contact and intramolecular penalties of L poses of one ligand type, X (L, n, 3)
     with anchor targets T (L, m, 3), and their Cartesian gradient, from the lists of `nb`
@@ -207,7 +207,7 @@ def _terms(model, X, groups, T, nb, k_anchor, k_contact):
     contact with the fixed atoms (inf if none within `contact`), whether any intramolecular
     pair is within its limit, and the anchor RMSD of each pose.
     """
-    L, n, _ = X.shape
+    L = len(X)
     G = np.zeros_like(X)
     E = 0.0
     sq = np.zeros(L)
@@ -295,7 +295,7 @@ def refine(
 
     def fun(params):
         x, xt, dR = model.forward(params, coords, center)
-        E, G, closest, tangled, rmsd = _terms(model, x[None], groups, targets[None], nb,
+        E, G, closest, tangled, rmsd = _terms(x[None], groups, targets[None], nb,
                                               k_anchor, k_contact)
         G = G[0]
         done["x"] = params.copy()
@@ -348,13 +348,13 @@ def stretch(
     fixed = [t for t in trees if t is not None and t.n > 0]
     # tail torsions, anchors outward: anti, or gauche where anti hits the ligand or fixed atoms
     order = [b for b in range(model.n_torsions - 1, -1, -1) if model.tails[b]]
+    reach = 2.0 * INTRA_SCALE * float(model.radii.max())
     for b in order:
         (i, j), mask, quad = model.bonds[b], model.masks[b], model.quads[b]
         u = x[j] - x[i]
         phi = _dihedral(x[quad])
         moved, rest = np.flatnonzero(mask), np.flatnonzero(~mask)
         rest_tree = cKDTree(x[rest])
-        reach = 2.0 * INTRA_SCALE * float(model.radii.max())
         best, best_overlap = None, np.inf
         for target in (np.pi, np.pi / 3, -np.pi / 3):
             R = rotation_about_axis(u, target - phi)
@@ -431,7 +431,7 @@ def refine_joint(
         for b in batches:
             Pb = P[b["params"]]
             Xb, Xt, dR = b["model"].forward_many(Pb, b["X0"], b["C"])
-            e, G, c, t, rmsd = _terms(b["model"], Xb, b["groups"], b["T"], b["nb"],
+            e, G, c, t, rmsd = _terms(Xb, b["groups"], b["T"], b["nb"],
                                       k_anchor, k_contact)
             closest, tangled, worst = min(closest, c), tangled or t, max(worst, float(rmsd.max()))
             E += e + w_torsion * float(np.sum(1.0 - np.cos(Pb[:, 6:])))

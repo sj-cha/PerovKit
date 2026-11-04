@@ -15,6 +15,11 @@ if TYPE_CHECKING:
     from .sampler import ConstellationSampler
 
 
+def _n_target(coverage: float, capacity: int) -> int:
+    """Ligands a coverage asks for: up to 1, a fraction of `capacity`; above, a number."""
+    return int(math.ceil(coverage * capacity)) if 0.0 < coverage <= 1.0 else int(coverage)
+
+
 def assign_faces(sites: Sequence[BindingSite]) -> List[tuple]:
     """
     The face each site counts toward when spreading ligands over a nanocrystal.
@@ -68,14 +73,11 @@ def take_sites(
             elif site not in chosen_sites:
                 chosen_sites.append(site)
     else:
-        if 0.0 < spec.coverage <= 1.0:
-            n_target = int(math.ceil(spec.coverage * len(available)))
-        else:
-            n_target = int(spec.coverage)
-            if n_target > len(available):
-                print(f"[Warning] Requested {n_target} sites for ligand, "
-                      f"but only {len(available)} available.")
-                n_target = len(available)
+        n_target = _n_target(spec.coverage, len(available))
+        if n_target > len(available):
+            print(f"[Warning] Requested {n_target} sites for ligand, "
+                  f"but only {len(available)} available.")
+            n_target = len(available)
 
         coords = np.array([s.position for s in available])
         sc = core.supercell
@@ -136,15 +138,6 @@ def select_constellations(
     a torsion-space refinement first.
     """
     lig = spec.ligand
-    lib = lig.conformers()
-    replace = not spec.adsorb
-    offset = float(spec.anchor_offset)
-    tm = lig.torsion_model()
-    model = tm if refine else None
-    # the frame's van der Waals radii shadow the sites under it (ConstellationSampler.accept);
-    # chains and rings that torsions turn can still get out of a neighbor's way
-    radii = np.where(tm.frame, tm.radii, 0.0)
-    groups = lig.binding_groups
     shadowed = sampler.n_shadowed
     chosen: List[Candidate] = []
 
@@ -161,27 +154,21 @@ def select_constellations(
                 print(f"[Warning] Binding site group {group} is not available for ligand "
                       f"{lig.name}. Skipped.")
                 continue
-            cand, reason = sampler.fit_sites(lib, sites, offset, replace, model, groups, lig.mol,
-                                             radii)
+            cand, reason = sampler.fit_sites(spec, sites, refine)
             if cand is None:
                 print(f"[Warning] Binding site group {group} rejected for ligand {lig.name}: {reason}.")
                 continue
-            sampler.accept(cand, lib, replace, radii)
             chosen.append(cand)
     else:
         # each site type hosts as many ligands as it has free sites per motif needing it
         need = Counter(m.site for m in lig.binding_motifs)
         capacity = min(sum(not s.passivated for s in by_type[t]) // k for t, k in need.items())
-        if 0.0 < spec.coverage <= 1.0:
-            n_target = int(math.ceil(spec.coverage * capacity))
-        else:
-            n_target = int(spec.coverage)
-            if n_target > capacity:
-                print(f"[Warning] Requested {n_target} ligands {lig.name}, but the free sites "
-                      f"host at most {capacity}.")
-                n_target = capacity
-        chosen, failures = sampler.sample(lib, pools, n_target, offset, replace, model, groups,
-                                          lig.mol, radii)
+        n_target = _n_target(spec.coverage, capacity)
+        if n_target > capacity:
+            print(f"[Warning] Requested {n_target} ligands {lig.name}, but the free sites "
+                  f"host at most {capacity}.")
+            n_target = capacity
+        chosen, failures = sampler.sample(spec, pools, n_target, refine)
         if len(sampler.occupancy) > 1:
             occ = list(sampler.occupancy.values())
             log(f"[Log] {lig.name} occupancy per face: {min(occ):.2f}-{max(occ):.2f} "
@@ -200,6 +187,5 @@ def select_constellations(
     for cand in chosen:
         clone = lig.clone()
         clone.planes = [s.plane for s in cand.sites]
-        clone._anchor_offset = offset
         out.append((clone, cand))
     return out

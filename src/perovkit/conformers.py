@@ -47,15 +47,19 @@ class ConformerLibrary:
     def n_conformers(self) -> int:
         return len(self.coords)
 
+    @property
+    def first_template(self) -> int:
+        """Index of the first template: the conformers before it are the embedded ones."""
+        return self.n_conformers - self.n_templates
+
     def unique_id(self, conformer: int) -> int:
         """
         The conformer, or the one it mirrors: on a mirror-symmetric surface the two make
         the same attempt.
         """
-        n_base = self.n_conformers - self.n_templates
-        if conformer >= n_base or not self.mirrored:
+        if conformer >= self.first_template or not self.mirrored:
             return conformer
-        return conformer % (n_base // 2)
+        return conformer % (self.first_template // 2)
 
     def with_template(self, mol: Chem.Mol, groups: List[List[int]], x: np.ndarray,
                       energy: float, stretched: bool = True) -> "ConformerLibrary":

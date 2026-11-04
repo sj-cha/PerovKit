@@ -191,12 +191,6 @@ def read_assemblies(cls, atoms: Atoms | List[Atoms], json_filename: str):
     if schema_version != 1:
         raise ValueError(f"Unsupported schema_version: {schema_version!r}")
 
-    file_type = topo.get("type")
-    if file_type not in (None, "nanocrystal", "slab"):
-        raise ValueError(
-            f"JSON type is '{file_type}', expected 'nanocrystal' or 'slab'."
-        )
-
     single_input = isinstance(atoms, Atoms)
     atoms_list: List[Atoms] = [atoms] if single_input else list(atoms)
 
@@ -211,18 +205,9 @@ def read_assemblies(cls, atoms: Atoms | List[Atoms], json_filename: str):
         core_pbc = np.array(core_meta["pbc"], dtype=bool)
 
     core_indices_meta = topo["core_indices"]
-
-    octa_raw = core_indices_meta.get("octahedra", None)
-    if octa_raw is not None:
-        octahedra = {
-            int(b): {"X": v["X"], "Ligand": v["Ligand"]}
-            for b, v in octa_raw.items()
-        }
-    else:
-        octahedra = None
-
-    B_ijk_raw = core_indices_meta.get("B_ijk")
-    B_ijk = {int(k): (int(v[0]), int(v[1]), int(v[2])) for k, v in B_ijk_raw.items()}
+    octahedra = {int(b): {"X": v["X"], "Ligand": v["Ligand"]}
+                 for b, v in core_indices_meta["octahedra"].items()}
+    B_ijk = {int(k): (int(v[0]), int(v[1]), int(v[2])) for k, v in core_indices_meta["B_ijk"].items()}
 
     ligand_types_meta = topo["ligand_types"]
     type_id_to_meta: Dict[int, dict] = {
@@ -241,7 +226,7 @@ def read_assemblies(cls, atoms: Atoms | List[Atoms], json_filename: str):
         lig_slices.append(slice(cursor, cursor + n_atoms))
         cursor += n_atoms
 
-    assemblies: List[Assembly] = []
+    assemblies = []
     for atoms_i in atoms_list:
         if n_total_atoms_json != len(atoms_i):
             raise ValueError(

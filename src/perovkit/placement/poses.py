@@ -43,7 +43,7 @@ class SitePose:
             self.ligand.atoms.get_positions(),
             self.plane,
             self.center,
-            getattr(self.ligand, "_anchor_offset", 0.0),
+            self.ligand._anchor_offset,
             theta,
         )
 
@@ -53,7 +53,7 @@ class FitPose:
     Multi-motif ligand fitted to a constellation. Variants are coordinates of the
     candidate's alternative conformer fits, best first, followed by any refined ones;
     a stretched variant goes first. `origins` says where each came from ("fit",
-    "stretched", "refined", "unstuck", "embedded"); theta is the spin about the anchor axis
+    "stretched", "refined", "unstuck"); theta is the spin about the anchor axis
     relative to each.
     """
     random_start = False

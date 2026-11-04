@@ -123,7 +123,7 @@ class TorsionModel:
         tails (np.ndarray): (k,) torsions whose moving side holds no binding atom, so they
             turn a dangling chain without moving any anchor.
         heavy (np.ndarray): (n_atoms,) non-hydrogen atoms.
-        radii (np.ndarray): (n_atoms,) van der Waals radii (Bondi, Å).
+        radii (np.ndarray): (n_atoms,) van der Waals radii (Å, ase.data.vdw_radii).
     """
     bonds: np.ndarray
     masks: np.ndarray
@@ -149,7 +149,9 @@ class TorsionModel:
         return ~self.masks[self.tails].any(axis=0)
 
     @classmethod
-    def build(cls, mol: Chem.Mol, root: int, binding: Sequence[int] = ()) -> TorsionModel:
+    def build(cls, mol: Chem.Mol, binding: Sequence[int]) -> TorsionModel:
+        """Torsions of `mol` rooted at its first binding atom, with `binding` its binding atoms."""
+        root = binding[0]
         n = mol.GetNumAtoms()
         heavy = np.array([a.GetAtomicNum() > 1 for a in mol.GetAtoms()])
         nbrs = [[x.GetIdx() for x in a.GetNeighbors()] for a in mol.GetAtoms()]
@@ -187,7 +189,7 @@ class TorsionModel:
             return max(cand, key=lambda x: heavy[x])  # a heavy neighbor when there is one
         quads = np.array([(outer(i, j), i, j, outer(j, i)) for i, j in bonds], dtype=int).reshape(-1, 4)
         binding = np.asarray(list(binding), dtype=int)
-        tails = ~masks[:, binding].any(axis=1) if len(binding) else np.zeros(len(bonds), dtype=bool)
+        tails = ~masks[:, binding].any(axis=1)
         # 1.8 Å for the elements ASE has no van der Waals radius for
         radii = np.nan_to_num(vdw_radii[[a.GetAtomicNum() for a in mol.GetAtoms()]], nan=1.8)
         return cls(bonds=bonds, masks=masks, far=topo >= 4, quads=quads, tails=tails, heavy=heavy,

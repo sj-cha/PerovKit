@@ -83,8 +83,8 @@ def pack_motifs(value) -> Optional[BindingMotif | List[BindingMotif]]:
 class _SyncedMol:
     """
     Descriptor for Ligand.mol: on every access the conformer is overwritten with the
-    current ASE positions, so it follows orientation, placement and any later edit
-    made through the parent structure's shared position buffer.
+    current ASE positions, so it follows the ligand's atoms wherever they are moved, in
+    an Assembly too.
     """
     def __get__(self, lig, owner=None):
         if lig is None:
@@ -323,7 +323,7 @@ class Ligand(Part):
         """
         model = getattr(self, "_torsions", None)
         if model is None:
-            model = TorsionModel.build(self.mol, self.binding_atoms[0], self.binding_atoms)
+            model = TorsionModel.build(self.mol, self.binding_atoms)
             self._torsions = model
         return model
 
