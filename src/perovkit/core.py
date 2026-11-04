@@ -1,18 +1,16 @@
 from __future__ import annotations
 from copy import deepcopy
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Dict, Tuple, List, Optional, Sequence
 from collections import defaultdict
 
 import random
 import numpy as np
 from ase import Atoms
-from ase.io import write
-from ase.io.vasp import write_vasp
 from scipy.spatial import cKDTree
 from ase.data import covalent_radii, atomic_numbers
 
+from .io import write_structure
 from .ligand import Ligand, BindingMotif, LigandSpec
 
 @dataclass
@@ -649,30 +647,7 @@ class Core:
             nx, ny, nz = self.supercell or (0, 0, 0)
             filename = f"{self.A_label}{self.B}{self.X}3_{nx}x{ny}x{nz}.{fmt}"
 
-        path = Path(filename)
-        path.parent.mkdir(parents=True, exist_ok=True)
-
-        if fmt == "vasp":
-            ase_kwargs = {**kwargs, "sort": True}
-
-            if self.is_slab:
-                write_vasp(str(path), self.atoms, **ase_kwargs)
-            else:
-                pos = self.atoms.get_positions()
-                center = pos.mean(axis=0)
-                extent = pos.max(axis=0) - pos.min(axis=0)
-                cell_diag = extent + vacuum
-
-                vasp_atoms = self.atoms.copy()
-                vasp_atoms.set_cell(np.diag(cell_diag))
-                vasp_atoms.positions += (cell_diag / 2 - center)
-                vasp_atoms.pbc = True
-
-                write_vasp(str(path), vasp_atoms, **ase_kwargs)
-        else:
-            formula = self.atoms.get_chemical_formula()
-            ase_kwargs = {**kwargs, "format": fmt, "comment": formula}
-            write(str(path), self.atoms, **ase_kwargs)
+        write_structure(self.atoms, filename, fmt, box=self.is_nanocrystal, vacuum=vacuum, **kwargs)
 
 
     def _get_surface_atoms(

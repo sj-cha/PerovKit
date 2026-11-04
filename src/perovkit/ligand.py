@@ -1,17 +1,17 @@
 from __future__ import annotations
 import copy
-from dataclasses import dataclass, field
-from pathlib import Path
+from dataclasses import asdict, dataclass, field
+from itertools import product
 from typing import Optional, Tuple, List
 
 import numpy as np
 from ase import Atoms
-from ase.io import read, write
-from ase.io.vasp import write_vasp
+from ase.io import read
 from rdkit import Chem
 from rdkit.Chem import AllChem, rdDetermineBonds, rdMolTransforms
 
 from .conformers import ConformerLibrary
+from .io import write_structure
 from .refine import TorsionModel
 from .utils.rotation import rotation_about_axis, rotation_from_u_to_v
 
@@ -68,14 +68,6 @@ class BindingMotif:
         return (tuple(self.atoms), self.anchor,
                 tuple(self.indices) if self.indices else None, self.site)
 
-    def _to_metadata(self) -> dict:
-        return {
-            "atoms": list(self.atoms),
-            "anchor": self.anchor,
-            "indices": list(self.indices) if self.indices else None,
-            "site": self.site,
-        }
-
     @classmethod
     def _from_metadata(cls, meta: dict) -> Optional[BindingMotif | List[BindingMotif]]:
         """
@@ -122,7 +114,7 @@ class _SyncedMol:
             raise AttributeError  # tells dataclass the field has no default
         mol = lig.__dict__.get("_mol")
         # a size mismatch is left for the __post_init__ check to report
-        if mol is not None and mol.GetNumConformers() and mol.GetNumAtoms() == len(lig.atoms):
+        if mol is not None and mol.GetNumAtoms() == len(lig.atoms):
             mol.GetConformer().SetPositions(lig.atoms.get_positions())
         return mol
 
@@ -170,7 +162,8 @@ class Ligand:
         if mol is None or [a.GetSymbol() for a in mol.GetAtoms()] != self.atoms.get_chemical_symbols():
             raise ValueError("mol and atoms must list the same elements in the same order")
         self.binding_motif = _pack_motifs(self.binding_motif)
-        self._get_volume()
+        # a coarse grid will do: the volume only orders ligands
+        self.volume = float(AllChem.ComputeMolVolume(mol, gridSpacing=0.4))
         if self.binding_motif:
             self._get_binding_atoms_indices()
             self._orient_ligand()
@@ -195,11 +188,8 @@ class Ligand:
         """
         ``binding_atoms`` split per motif: each motif owns as many atoms as it lists elements.
         """
-        motifs = self.binding_motifs
-        if not motifs:
-            return [list(self.binding_atoms)] if self.binding_atoms else []
         groups, start = [], 0
-        for m in motifs:
+        for m in self.binding_motifs:
             groups.append(list(self.binding_atoms[start:start + len(m.atoms)]))
             start += len(m.atoms)
         return groups
@@ -208,8 +198,7 @@ class Ligand:
     def anchor_pos(self) -> Optional[np.ndarray]:
         if not self.binding_atoms:
             return None
-        pos = self.atoms.get_positions()
-        return pos[np.asarray(self.binding_atoms, dtype=int)].mean(axis=0)
+        return self.atoms.get_positions()[self.binding_atoms].mean(axis=0)
 
     @property
     def anchor_positions(self) -> Optional[np.ndarray]:
@@ -219,15 +208,11 @@ class Ligand:
         if not self.binding_atoms:
             return None
         pos = self.atoms.get_positions()
-        return np.array([pos[np.asarray(g, dtype=int)].mean(axis=0) for g in self.binding_groups])
+        return np.array([pos[g].mean(axis=0) for g in self.binding_groups])
 
     @property
     def plane(self) -> Optional[Tuple[int, int, int]]:
         return self.planes[0] if self.planes else None
-
-    @plane.setter
-    def plane(self, value) -> None:
-        self.planes = [] if value is None else [value]
 
 
     @classmethod
@@ -253,42 +238,26 @@ class Ligand:
             A Ligand instance.
         """
         atoms = read(filename)
-        mol = Chem.MolFromXYZFile(rf"{filename}")
+        mol = Chem.MolFromXYZFile(str(filename))
 
-        if charge is None:
-            candidate_charges = (-1, 0, 1)
-        else:
-            candidate_charges = (charge,)
-
-        chosen_mol = None
-        chosen_charge = None
-
-        for q in candidate_charges:
+        for q in (-1, 0, 1) if charge is None else (charge,):
             m = Chem.Mol(mol)
             try:
                 rdDetermineBonds.DetermineBonds(m, charge=q)
                 Chem.SanitizeMol(m)
-            except Exception as e:
+            except Exception:
                 continue
-
-            chosen_mol = m
-            chosen_charge = q
             break
+        else:
+            raise ValueError("Failed to infer charge. Please provide the charge as an argument.")
 
-        if chosen_mol is None:
-            raise ValueError(
-                f"Failed to infer charge. Please provide the charge as an argument."
-            )
-
-        no_H = Chem.RemoveHs(chosen_mol)
-        
-        return cls(atoms=atoms, 
-                   mol=chosen_mol, 
-                   smiles = Chem.MolToSmiles(no_H), 
-                   charge=chosen_charge, 
+        return cls(atoms=atoms,
+                   mol=m,
+                   smiles=Chem.MolToSmiles(Chem.RemoveHs(m)),
+                   charge=q,
                    binding_motif=binding_motif,
                    name=name)
-    
+
 
     @classmethod
     def from_smiles(
@@ -314,8 +283,7 @@ class Ligand:
         Returns:
             A Ligand instance.
         """
-        mol = Chem.MolFromSmiles(smiles)
-        mol = Chem.AddHs(mol)
+        mol = Chem.AddHs(Chem.MolFromSmiles(smiles))
         params = AllChem.ETKDGv3()
         params.randomSeed = random_seed
         conf_id = AllChem.EmbedMolecule(mol, params)
@@ -326,30 +294,21 @@ class Ligand:
             conf_id = AllChem.EmbedMolecule(mol, params)
 
         if conf_id < 0:
-            raise ValueError(
-                f"RDKit failed to generate a conformer for ligand."
-            )
+            raise ValueError("RDKit failed to generate a conformer for ligand.")
 
         if optimize:
-            AllChem.UFFOptimizeMolecule(
-                mol,
-                confId=conf_id,
-                maxIters=1000,
-            )
+            AllChem.UFFOptimizeMolecule(mol, confId=conf_id, maxIters=1000)
         else:
             # Set all rotatable bond dihedrals to 180°
             rotatable = Chem.MolFromSmarts('[!$(*#*)&!D1]-&!@[!$(*#*)&!D1]')
-            matches = mol.GetSubstructMatches(rotatable)
             conf = mol.GetConformer()
             torsion_indices = []
-            for match in matches:
-                i, j = match
-                neighbors_i = [n.GetIdx() for n in mol.GetAtomWithIdx(i).GetNeighbors() if n.GetIdx() != j]
-                neighbors_j = [n.GetIdx() for n in mol.GetAtomWithIdx(j).GetNeighbors() if n.GetIdx() != i]
-                if neighbors_i and neighbors_j:
-                    quad = (neighbors_i[0], i, j, neighbors_j[0])
-                    rdMolTransforms.SetDihedralDeg(conf, *quad, 180.0)
-                    torsion_indices.append(quad)
+            for i, j in mol.GetSubstructMatches(rotatable):
+                neighbor_i = next(n.GetIdx() for n in mol.GetAtomWithIdx(i).GetNeighbors() if n.GetIdx() != j)
+                neighbor_j = next(n.GetIdx() for n in mol.GetAtomWithIdx(j).GetNeighbors() if n.GetIdx() != i)
+                quad = (neighbor_i, i, j, neighbor_j)
+                rdMolTransforms.SetDihedralDeg(conf, *quad, 180.0)
+                torsion_indices.append(quad)
 
             # Relax bonds/angles while keeping torsions fixed at 180°
             ff = AllChem.UFFGetMoleculeForceField(mol)
@@ -357,19 +316,17 @@ class Ligand:
                 ff.UFFAddTorsionConstraint(a, b, c, d, False, 180.0, 180.0, 1.0e5)
             ff.Minimize(maxIts=200)
 
-        positions = mol.GetConformers()[0].GetPositions()
-        symbols = [atom.GetSymbol() for atom in mol.GetAtoms()]
-
-        atoms = Atoms(positions=positions, symbols=symbols)
+        atoms = Atoms(positions=mol.GetConformer().GetPositions(),
+                      symbols=[atom.GetSymbol() for atom in mol.GetAtoms()])
 
         return cls(
-            atoms=atoms, 
-            mol=mol, 
-            smiles=smiles, 
-            charge=Chem.GetFormalCharge(mol), 
+            atoms=atoms,
+            mol=mol,
+            smiles=smiles,
+            charge=Chem.GetFormalCharge(mol),
             binding_motif=binding_motif,
             name=name)
-    
+
 
     def conformers(self, **kwargs) -> ConformerLibrary:
         """
@@ -403,8 +360,9 @@ class Ligand:
         """
         lig = copy.copy(self)
         lig.atoms = self.atoms.copy()
-        if self.mol is not None:
-            lig.mol = Chem.Mol(self.mol)  # own conformer, so it can follow its own atoms
+        mol = self.mol
+        if mol is not None:
+            lig.mol = Chem.Mol(mol)  # own conformer, so it can follow its own atoms
         if self.indices is not None:
             lig.indices = self.indices.copy()
         lig.planes = list(self.planes)
@@ -418,28 +376,19 @@ class Ligand:
         Used when deserializing from the metadata.
         """
         lig = object.__new__(cls)
-        # Set dataclass defaults for optional fields
-        lig.id = None
-        lig.volume = None
         lig.binding_atoms = []
         lig.planes = []
-        lig.indices = None
-        lig._anchor_offset = 0.0
         for k, v in kwargs.items():
             setattr(lig, k, v)
-        lig.binding_motif = _pack_motifs(getattr(lig, "binding_motif", None))
         return lig
 
 
     def _type_key(self) -> tuple:
         """
-        Everything that makes two placed ligands the same JSON ligand type.
+        Everything that makes two placed ligands the same JSON ligand type. The metadata
+        holds one set of motifs and binding atoms per type, so the same molecule anchored
+        through different atoms has to make two types.
         """
-        # The motifs and resolved binding atoms are part of the TYPE: the per-type metadata
-        # stores one set of them for every instance sharing this key. Without them, two
-        # placements of the same molecule anchored through DIFFERENT atoms collide into one
-        # type and both reload with the first one's anchor, silently. `from_smiles` derives
-        # charge from the SMILES and defaults name to None, so that collision needs no opt-in.
         return (
             self.name,
             self.smiles,
@@ -458,7 +407,7 @@ class Ligand:
             "smiles": self.smiles,
             "charge": self.charge,
             "binding_atoms_indices": list(self.binding_atoms or []),
-            "binding_motifs": [m._to_metadata() for m in self.binding_motifs],
+            "binding_motifs": [asdict(m) for m in self.binding_motifs],
         }
 
 
@@ -472,27 +421,7 @@ class Ligand:
         return meta
 
 
-    @staticmethod
-    def _planes_from_metadata(inst_meta: dict) -> list:
-        return inst_meta.get("planes") or [inst_meta["plane"]]
-
-
-    def _get_volume(self):
-        """
-        Compute molecular volume (Å^3). The coarse grid is enough for what it is used for:
-        ordering ligands and the metadata.
-        """
-        self.volume = float(AllChem.ComputeMolVolume(self.mol, gridSpacing=0.4))
-
-
-    def _coordination_numbers(self) -> np.ndarray:
-        """
-        Coordination number of every atom, from the RDKit bond graph.
-        """
-        return np.array([a.GetDegree() for a in self.mol.GetAtoms()], dtype=int)
-
-
-    def _anchor_region(self, motif: BindingMotif, claimed: set = frozenset()) -> List[int]:
+    def _anchor_region(self, motif: BindingMotif, claimed: set) -> List[int]:
         """
         Atoms of the first anchor match and their bonded neighbors, sorted by index.
 
@@ -509,14 +438,13 @@ class Ligand:
             raise ValueError(f"anchor {anchor!r} has no group left in ligand {self.smiles!r} "
                              f"once the earlier motifs took theirs")
 
-        first = set(matches[0])
-        region = set(first)
-        for i in first:
+        region = set(matches[0])
+        for i in matches[0]:
             region.update(n.GetIdx() for n in mol.GetAtomWithIdx(i).GetNeighbors())
         return sorted(region - claimed)
 
 
-    def _get_binding_atoms_indices(self) -> List[int]:
+    def _get_binding_atoms_indices(self) -> None:
         """
         Detect the atom indices that match the binding motifs, motif after motif.
         """
@@ -536,99 +464,51 @@ class Ligand:
                 print(f"[Warning] anchor {anchor!r} matches {len(groups)} groups in ligand "
                       f"{self.name or self.smiles}, but only {anchors.count(anchor)} "
                       f"motif(s) use it; the other groups stay unbound.")
-        return self.binding_atoms
 
 
     def _resolve_motif(self, motif: BindingMotif, claimed: set) -> List[int]:
         """
-        Binding atom indices of one motif, never reusing `claimed` atoms.
+        Binding atom indices of one motif, never reusing `claimed` atoms: those it gives, or
+        else the atoms of its elements in the anchor region with the fewest bonds between
+        them and, among those, the closest pair.
         """
         symbols = self.atoms.get_chemical_symbols()
-        coords  = self.atoms.get_positions()
 
-        binding_elems = list(motif.atoms)
-        explicit = motif.indices
-
-        if explicit is not None:
-            idx = [int(i) for i in explicit]
-            n = len(self.atoms)
-            for i in idx:
-                if not (0 <= i < n):
+        if motif.indices is not None:
+            for i in motif.indices:
+                if i >= len(symbols):
                     raise ValueError(
-                        f"binding motif index {i} out of range for a {n}-atom ligand"
+                        f"binding motif index {i} out of range for a {len(symbols)}-atom ligand"
                     )
-            if len(set(idx)) != len(idx):
-                raise ValueError(f"binding motif indices must be distinct, got {idx}")
-            if not claimed.isdisjoint(idx):
-                raise ValueError(f"binding motif indices {idx} reuse atoms of another motif")
-            for i, elem in zip(idx, binding_elems):
+            if not claimed.isdisjoint(motif.indices):
+                raise ValueError(f"binding motif indices {motif.indices} reuse atoms of another motif")
+            for i, elem in zip(motif.indices, motif.atoms):
                 if symbols[i] != elem:
                     raise ValueError(
                         f"binding motif index {i} is {symbols[i]!r}, but the motif declares "
                         f"{elem!r}; the indices and the element symbols disagree"
                     )
-            return idx
+            return motif.indices
 
         region = self._anchor_region(motif, claimed)
-        cn = self._coordination_numbers()
+        coords = self.atoms.get_positions()
+        cn = [a.GetDegree() for a in self.mol.GetAtoms()]
 
-        if len(binding_elems) == 2:
-            elem1, elem2 = binding_elems
+        options = [[i for i in region if symbols[i] == elem] for elem in motif.atoms]
+        combos = [c for c in product(*options) if len(set(c)) == len(c)]
+        if not combos:
+            raise ValueError(f"No atoms found for binding motif {motif.atoms} "
+                             f"around anchor {motif.anchor!r}")
 
-            idx1 = [i for i in region if symbols[i] == elem1]
-            idx2 = [i for i in region if symbols[i] == elem2]
-
-            if len(idx1) == 0 or len(idx2) == 0:
-                raise ValueError(f"No atoms found for binding motif {binding_elems} "
-                                 f"around anchor {motif.anchor!r}")
-
-            best_pair = None
-            best_key = None
-
-            for i in idx1:
-                p1 = coords[i]
-                for j in idx2:
-                    if i == j:
-                        continue
-                    p2 = coords[j]
-                    dist = float(np.linalg.norm(p1 - p2))
-                    key = (int(cn[i]) + int(cn[j]), dist)
-                    if best_key is None or key < best_key:
-                        best_key = key
-                        best_pair = (i, j)
-
-            if best_pair is None:
-                raise ValueError(f"No atoms found for binding motif {binding_elems} "
-                                 f"around anchor {motif.anchor!r}")
-
-            return list(best_pair)
-
-        elif len(binding_elems) == 1:
-            elem = binding_elems[0]
-
-            elem_indices = [i for i in region if symbols[i] == elem]
-            if len(elem_indices) == 0:
-                raise ValueError(f"No atoms found for binding motif {binding_elems} "
-                                 f"around anchor {motif.anchor!r}")
-
-            elem_cn = cn[np.asarray(elem_indices, dtype=int)]
-
-            min_cn = int(np.min(elem_cn))
-            candidate_local = np.where(elem_cn == min_cn)[0]
-
-            # choose the first one among candidates
-            chosen_global = elem_indices[candidate_local[0]]
-
-            return [chosen_global]
-
-        raise NotImplementedError(
-            "Binding motifs with more than 2 atoms are not yet supported."
-        )
+        return list(min(combos, key=lambda c: (sum(cn[i] for i in c),
+                                               float(np.linalg.norm(coords[c[0]] - coords[c[-1]])))))
 
 
-    def _orient_ligand(self, n_angles: int = 720):
+    def _orient_ligand(self) -> None:
         """
-        Orient the ligand so the binding axis is canonical and the body points up.
+        Orient the ligand so the binding axis is canonical and the body points up: one
+        binding atom sits at the origin with the rest of the ligand along +z, two lie along
+        x with the rest turned toward +z.
 
         A ligand with several motifs is only centered on the mean of its anchors: its
         orientation is set at placement, by fitting every anchor to its own site.
@@ -636,28 +516,26 @@ class Ligand:
         coords = self.atoms.get_positions()
         if self.n_motifs > 1:
             self.atoms.set_positions(coords - self.anchor_positions.mean(axis=0))
-            return None
+            return
 
         binding_idx = self.binding_atoms
-        assert 2 >= len(binding_idx) > 0, "Need 1 or 2 binding atoms"
+        coords0 = coords - coords[binding_idx].mean(axis=0)
+        others = np.delete(coords0, binding_idx, axis=0)
 
-        # Compute the centroid of the binding atoms
-        coords_centroid = coords[binding_idx].mean(axis=0)
-        coords0 = coords - coords_centroid
-
-        # Define the rotation axis
-        if len(binding_idx) >= 2:
+        if len(binding_idx) == 2:
             axis = coords0[binding_idx[1]] - coords0[binding_idx[0]]
             axis /= np.linalg.norm(axis)
-        else:
-            b = binding_idx[0]
-            others = np.delete(coords0, b, axis=0)  # coords0[b] is the origin
 
-            if len(others) == 0:
-                # monatomic ligand: nothing to orient
-                self.atoms.set_positions(coords0)
-                return None
+            ex = np.array([1.0, 0.0, 0.0], dtype=float)
+            coords0 = coords0 @ rotation_from_u_to_v(axis, ex).T
 
+            # Turn about x to maximize the z-projection of the rest
+            others = np.delete(coords0, binding_idx, axis=0)
+            thetas = np.linspace(0.0, 2.0 * np.pi, 720, endpoint=False)
+            scores = others[:, 1].sum() * np.sin(thetas) + others[:, 2].sum() * np.cos(thetas)
+            coords0 = coords0 @ rotation_about_axis(ex, thetas[np.argmax(scores)]).T
+
+        elif len(others) > 0:
             # point binding atom -> unweighted centroid of the rest along +z
             axis = others.mean(axis=0)
             norm = np.linalg.norm(axis)
@@ -669,40 +547,9 @@ class Ligand:
             axis /= norm
 
             z = np.array([0.0, 0.0, 1.0], dtype=float)
-            R_align = rotation_from_u_to_v(axis, z)  
-            coords0 = coords0 @ R_align.T
+            coords0 = coords0 @ rotation_from_u_to_v(axis, z).T
 
-            self.atoms.set_positions(coords0)
-
-            return None
-        
-        ex = np.array([1.0, 0.0, 0.0], dtype=float)
-        R_align = rotation_from_u_to_v(axis, ex)  
-        coords0 = coords0 @ R_align.T
-
-        # Rest of the atoms 
-        mask = np.ones(len(coords0), dtype=bool)
-        mask[binding_idx] = False
-        others = coords0[mask]
-
-        # Rotate to maximize z-projection
-        thetas = np.linspace(0.0, 2.0 * np.pi, n_angles, endpoint=False)
-        best_theta = 0.0
-        best_score = -np.inf
-
-        for th in thetas:
-            R = rotation_about_axis(ex, th)
-            rotated = others @ R.T  # (N_other, 3)
-            score = rotated[:, 2].sum()
-            if score > best_score:
-                best_score = score
-                best_theta = th
-
-        R_best = rotation_about_axis(ex, best_theta)
-        rotated_all = coords0 @ R_best.T
-
-        # update ASE atoms
-        self.atoms.set_positions(rotated_all)
+        self.atoms.set_positions(coords0)
 
 
     def to(
@@ -718,36 +565,13 @@ class Ligand:
         Args:
             fmt (str): File format.
             filename (str): Output path.
+            vacuum (float): Vacuum padding (Å) for VASP output.
         """
-        formula = self.atoms.get_chemical_formula()
-
         if filename is None:
-            if self.name is not None:
-                filename = f"{self.name}.{fmt}"
-            else:
-                filename = f"{formula}.{fmt}"
-        
-        path = Path(filename)
-        path.parent.mkdir(parents=True, exist_ok=True)  
+            stem = self.name if self.name is not None else self.atoms.get_chemical_formula()
+            filename = f"{stem}.{fmt}"
 
-        if fmt == "vasp":
-            ase_kwargs = {**kwargs, "sort": True}
-            pos = self.atoms.get_positions()
-            center = pos.mean(axis=0)
-            extent = pos.max(axis=0) - pos.min(axis=0)
-            cell_diag = extent + vacuum
-
-            vasp_atoms = self.atoms.copy()
-            vasp_atoms.set_cell(np.diag(cell_diag))
-            vasp_atoms.positions += (cell_diag / 2 - center)
-            vasp_atoms.pbc = True
-
-            write_vasp(str(path), vasp_atoms, **ase_kwargs)
-        else:
-            formula = self.atoms.get_chemical_formula()
-            ase_kwargs = {**kwargs, "format": fmt, "comment": formula}
-            write(str(path), self.atoms, **ase_kwargs)
-
+        write_structure(self.atoms, filename, fmt, box=True, vacuum=vacuum, **kwargs)
 
 
 @dataclass
@@ -757,12 +581,10 @@ class LigandSpec:
 
     Attributes:
         ligand (Ligand): The ligand to attach.
-        site (Optional[str]): Which sublattice to target, one of "A", "B", or "X".
-            This selects the binding sites explicitly instead of inferring them from
-            the ligand charge. If None, the target is taken from the motif's own ``site``
-            or, failing that, inferred from the ligand charge (positive -> A-site,
-            otherwise X-site) for backward compatibility. Ligands with several motifs
-            take the site of each motif and leave this None.
+        site (Optional[str]): Which sublattice to target, one of "A", "B", or "X". If None,
+            the target is the motif's own ``site`` or, failing that, follows from the ligand
+            charge (positive -> A-site, otherwise X-site). Ligands with several motifs take
+            the site of each motif and leave this None.
         coverage (Optional[float]): Fractional coverage of available binding sites; above 1,
             a number of ligands. For a multi-motif ligand the fraction is of the most ligands
             the free sites can host, each site type serving its free sites divided by the

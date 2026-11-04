@@ -2,21 +2,20 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Callable, List, Dict, Optional, Tuple, Sequence
 import json
-from pathlib import Path
 
 import random
 import math
 import numpy as np
 
 from ase import Atoms
-from ase.io import read, write
-from ase.io.vasp import write_vasp
+from ase.io import read
 
 from scipy.spatial import cKDTree 
 
 from .core import Core, BindingSite
 from .ligand import Ligand, LigandSpec, BindingMotif
 from .constellation import ConstellationSampler
+from .io import write_structure
 from .refine import INTRA_SCALE
 from .placement import (SitePose, FitPose, Contacts, pack, place_about_normal, motif_pools,
                         select_constellations, intramolecular_contacts)
@@ -113,7 +112,7 @@ class Assembly:
         taken = []
         for site in chosen_sites:
             clone = lig.clone()
-            clone.plane = site.plane
+            clone.planes = [site.plane]
             clone._anchor_offset = float(spec.anchor_offset)
             site.passivated = True
             taken.append((clone, site))
@@ -533,32 +532,15 @@ class Assembly:
         `fmt` defaults to "vasp" for a slab and "xyz" for a nanocrystal; a nanocrystal
         written as vasp is boxed with `vacuum` Å around it.
         """
-        at = self.atoms
-        formula = at.get_chemical_formula()
         if fmt is None:
             fmt = "vasp" if self.core.is_slab else "xyz"
 
         if filename is None:
-            filename = f"{formula}.{fmt}"
-        
-        path = Path(filename)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        if fmt == "vasp":
-            if self.core.is_nanocrystal:
-                pos = at.get_positions()
-                center = pos.mean(axis=0)
-                cell_diag = pos.max(axis=0) - pos.min(axis=0) + vacuum
+            filename = f"{self.atoms.get_chemical_formula()}.{fmt}"
 
-                at = at.copy()
-                at.set_cell(np.diag(cell_diag))
-                at.positions += cell_diag / 2 - center
-                at.pbc = True
-            write_vasp(str(path), at, **{**kwargs, "sort": True})
-        else:
-            write(str(path), at, **{**kwargs, "format": fmt, "comment": formula})
-
+        write_structure(self.atoms, filename, fmt, box=self.core.is_nanocrystal, vacuum=vacuum, **kwargs)
         if write_json:
-            self.to_json(str(path) + ".json", sort=fmt == "vasp")
+            self.to_json(f"{filename}.json", sort=fmt == "vasp")
 
 
     def to_json(self, filename: str, sort: bool = False) -> None:
@@ -741,7 +723,7 @@ class Assembly:
                     binding_motif=motifs[spec_id],
                     name=tmeta["name"],
                     id=inst_meta["ligand_id"],
-                    planes=Ligand._planes_from_metadata(inst_meta),
+                    planes=inst_meta.get("planes") or [inst_meta["plane"]],
                     volume=tmeta["volume"],
                     binding_atoms=binding_atoms,
                 )
