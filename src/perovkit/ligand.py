@@ -14,6 +14,7 @@ from .conformers import ConformerLibrary
 from .io.structure import write_structure
 from .torsion import TorsionModel
 from .utils.rotation import rotation_about_axis, rotation_from_u_to_v
+from .utils.selection import Part, PartAtoms
 
 
 @dataclass
@@ -99,12 +100,12 @@ class _SyncedMol:
 
 
 @dataclass
-class Ligand:
+class Ligand(Part):
     """
     Surface-passivating ligand molecule.
 
     Attributes:
-        atoms (ASE Atoms): ASE Atoms object.
+        atoms (ASE Atoms): ASE Atoms object; in an Assembly, a read-only selection of its atoms.
         mol (Chem.Mol): RDKit Mol object; its conformer follows ``atoms`` positions.
         smiles (str): SMILES string of the ligand without explicit hydrogens.
         charge (int): Formal charge of the ligand.
@@ -117,10 +118,9 @@ class Ligand:
             (see ``binding_groups`` for the split).
         planes (List[Tuple[int, int, int]]): Miller index of the surface each motif is bound
             to; ``plane`` is the first one.
-        indices (np.ndarray): Global atom indices when placed in a parent Assembly.
         _anchor_offset (float): Offset (Å) applied along the axis perpendicular to the plane.
     """
-    atoms: Atoms
+    atoms: Atoms = PartAtoms()
     mol: Chem.Mol = _SyncedMol()
     smiles: str
     charge: int
@@ -130,7 +130,6 @@ class Ligand:
     volume: float = None
     binding_atoms: List[int] = field(default_factory=list)
     planes: List[Tuple[int, int, int]] = field(default_factory=list)
-    indices: Optional[np.ndarray] = None
     _anchor_offset: float = 0.0
 
     def __post_init__(self):
@@ -332,15 +331,13 @@ class Ligand:
 
     def clone(self) -> Ligand:
         """
-        Return a shallow copy with independent atoms, mol and indices.
+        Return a shallow copy with independent atoms and mol, part of no structure.
         """
         lig = copy.copy(self)
-        lig.atoms = self.atoms.copy()
         mol = self.mol
+        lig._detach(self.atoms.copy())
         if mol is not None:
             lig.mol = Chem.Mol(mol)  # own conformer, so it can follow its own atoms
-        if self.indices is not None:
-            lig.indices = self.indices.copy()
         lig.planes = list(self.planes)
         return lig
 
@@ -494,7 +491,7 @@ class Ligand:
         self, 
         fmt: str = 'xyz', 
         filename: str = None,
-        vacuum: float = 15.0,
+        vacuum: float = 20.0,
         **kwargs
     ) -> None:
         """

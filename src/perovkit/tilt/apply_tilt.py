@@ -197,14 +197,4 @@ def apply_tilt(
             # row-vector convention
             pos_new[gidx] = (rb0 + tb) + (pos0[gidx] - rb0) @ R.T
 
-    if isinstance(structure, Core):
-        structure.atoms.positions[:] = pos_new[: len(structure.atoms)]
-        return
-
-    n_core = len(structure.core.atoms)
-    structure.core.atoms.positions[:] = pos_new[:n_core]
-
-    if move_ligands:
-        for lig_id, gidx in lig_global_indices.items():
-            lig = structure.ligands[int(lig_id)]
-            lig.atoms.positions[:] = pos_new[np.asarray(gidx, dtype=int)]
+    structure.atoms.positions[:] = pos_new
