@@ -1,4 +1,5 @@
 from __future__ import annotations
+from copy import deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, Tuple, List, Optional, Sequence
@@ -601,7 +602,7 @@ class Core:
             Assembly: the core with its ligands.
         """
         from .assembly import Assembly
-        assembly = Assembly(core=self, ligand_specs=list(ligand_specs))
+        assembly = Assembly(core=deepcopy(self), ligand_specs=list(ligand_specs))
         assembly._place_ligands(**kwargs)
         return assembly
 
@@ -624,7 +625,7 @@ class Core:
             Assembly: the core with its ligands.
         """
         from .assembly import Assembly
-        assembly = Assembly(core=self, ligand_specs=list(ligand_specs))
+        assembly = Assembly(core=deepcopy(self), ligand_specs=list(ligand_specs))
         assembly._place_ligands_manually(**kwargs)
         return assembly
 
