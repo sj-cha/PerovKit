@@ -62,7 +62,6 @@ class Assembly:
             )
         )
         self._atoms: Optional[Atoms] = None
-        self._setup_pbc()
 
 
     def _symbol_map(self) -> Dict[str, str]:
@@ -116,8 +115,7 @@ class Assembly:
         log = print if verbose else (lambda *a, **k: None)
 
         self._rng = random.Random(random_seed)
-        self.overlap_cutoff = overlap_cutoff
-        
+
         self.ligands = []
         displaced_indices = []
         for s in self.binding_sites:
@@ -159,9 +157,6 @@ class Assembly:
             available = [s for s in pool if not s.passivated]
             
             if spec.binding_sites is not None:
-                if len(spec.binding_sites) == 0:
-                    print(f"[Warning] Empty list provided for ligand {lig.name}. Skipping placement.")
-                    continue
                 chosen_sites = []
                 for idx in spec.binding_sites:
                     site = next((s for s in available if idx in s.atom_indices), None)
@@ -363,7 +358,12 @@ class Assembly:
                         n_target = len(available)
 
                 coords = np.array([s.position for s in available])
-                chosen_indices = farthest_point_sampling(coords, n_target, self._rng)
+                sc = self.core.supercell
+                if self.core.is_nanocrystal and sc is not None and len(set(sc)) > 1:
+                    planes = [s.plane for s in available]
+                    chosen_indices = per_face_farthest_point_sampling(coords, planes, n_target, self._rng)
+                else:
+                    chosen_indices = farthest_point_sampling(coords, n_target, self._rng)
                 chosen_sites = [available[i] for i in chosen_indices]
 
             for site in chosen_sites:
@@ -547,11 +547,8 @@ class Assembly:
         )
 
 
-    def check_overlaps(self, cutoff: float = None, verbose: bool = True) -> float:
+    def check_overlaps(self, cutoff: float = 1.6, verbose: bool = True) -> float:
         log = print if verbose else (lambda *a, **k: None)
-
-        if cutoff is None:
-            cutoff = self.overlap_cutoff
 
         core_positions = self.core.atoms.get_positions()
 
@@ -565,8 +562,6 @@ class Assembly:
         for i, lig in enumerate(self.ligands):
             entities.append(lig.atoms.get_positions())
             entity_labels.append(f"ligand_{i}")
-
-        print(f"[DEBUG] #entities (core + ligands) = {len(entities)}")
 
         global_min = np.inf
         global_pair = None
@@ -598,10 +593,13 @@ class Assembly:
 
         return global_min
 
-    def _setup_pbc(self) -> None:
-        cell = self.core.atoms.get_cell()
-        self._box = np.asarray(cell.lengths(), dtype=float)  # (Lx, Ly, Lz)
-        self._pbc = np.asarray(self.core.atoms.pbc, dtype=bool)
+    @property
+    def _pbc(self) -> np.ndarray:
+        return self.core.atoms.pbc
+
+    @property
+    def _box(self) -> np.ndarray:
+        return self.core.atoms.cell.lengths()
 
     def _mic(self, delta: np.ndarray) -> np.ndarray:
         d = np.array(delta, dtype=float, copy=True)
@@ -1186,7 +1184,6 @@ class Assembly:
         assembly.ligand_coverage = {}
         assembly.binding_sites = []
         assembly._atoms = None
-        assembly._setup_pbc()
         return assembly
 
 
