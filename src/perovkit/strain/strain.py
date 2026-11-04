@@ -89,16 +89,9 @@ def apply_strain(
 
     # Update cell for periodic structures
     if is_periodic:
-        if isinstance(structure, Core):
-            cell = structure.atoms.get_cell().copy()
-        else:
-            cell = structure.core.atoms.get_cell().copy()
+        cell = structure.atoms.get_cell().copy()
 
         for i in range(3):
             cell[i] *= (1 + float(strain[i]))
 
-        if isinstance(structure, Core):
-            structure.atoms.set_cell(cell, scale_atoms=False)
-        else:
-            structure.core.atoms.set_cell(cell, scale_atoms=False)
-            structure.atoms.set_cell(cell, scale_atoms=False)
+        structure.atoms.set_cell(cell, scale_atoms=False)

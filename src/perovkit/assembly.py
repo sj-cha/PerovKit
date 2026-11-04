@@ -1,6 +1,6 @@
 from __future__ import annotations
 from dataclasses import dataclass, field
-from typing import Dict, List, Sequence, Tuple
+from typing import Dict, List, Sequence, Tuple, Optional
 
 import numpy as np
 
@@ -21,6 +21,12 @@ class Assembly:
     minimum-image distances along its periodic axes. A slab keeps its cell.
     Made by Core.place_ligands and Core.place_ligands_manually, or read back with
     from_file and from_ase.
+
+    `atoms` is the only copy of the atoms: whatever is done to them is done there, and the
+    `atoms` of `core` and of each ligand are read-only selections of it. Its per-atom array
+    "ligand_id" tells whose each atom is (-1: the core). Atoms deleted from it leave `core`,
+    `octahedra`, `B_ijk` and `ligands` following; deleting only part of a ligand is not
+    supported.
     """
     core: Core
     ligands: List[Ligand] = field(default_factory=list)
@@ -28,14 +34,16 @@ class Assembly:
 
     @property
     def octahedra(self):
+        self._follow_deleted_atoms()
         return self.core.octahedra
 
     @property
     def B_ijk(self):
+        self._follow_deleted_atoms()
         return self.core.B_ijk
 
     def __post_init__(self):
-        self._link_atoms()
+        self._build_atoms()
 
 
     def remove_ligand(self, id: int, re_index: bool = True) -> None:
@@ -47,11 +55,17 @@ class Assembly:
             raise ValueError(f"No ligand with id={id} found.")
 
         self.ligands.pop(idx)
+        del self.atoms[self.atoms.arrays["ligand_id"] == id]
 
         # Re-index remaining ligands
         if re_index:
+            old_ids = self.atoms.arrays["ligand_id"].copy()
+            new_ids = old_ids.copy()
             for i, lig in enumerate(self.ligands):
+                new_ids[old_ids == lig.id] = i
                 lig.id = i
+                lig._attach(self, "ligand_id", i)
+            self.atoms.set_array("ligand_id", new_ids)
 
             # Remove ligand references from octahedra and remap ids. Entries are rebuilt rather
             # than edited in place: frames loaded together by from_ase share one octahedra dict.
@@ -61,8 +75,6 @@ class Assembly:
                                                for lid in octa["Ligand"] if lid != id]}
                     for b_abs, octa in self.octahedra.items()
                 }
-
-        self._link_atoms()
 
 
     def apply_tilt(
@@ -74,6 +86,7 @@ class Assembly:
         move_ligands: bool = True,
     ):
         from .tilt import apply_tilt 
+        self._follow_deleted_atoms()
         apply_tilt(
             structure=self,
             glazer=glazer,
@@ -89,6 +102,7 @@ class Assembly:
         strain_ligands: bool = True,
     ):
         from .strain import apply_strain
+        self._follow_deleted_atoms()
         apply_strain(
             structure=self,
             strain=strain,
@@ -153,7 +167,7 @@ class Assembly:
         fmt: Optional[str] = None, 
         filename: Optional[str] = None, 
         write_json: bool = True,
-        vacuum: float = 15.0,
+        vacuum: float = 20.0,
         **kwargs
     ) -> None:      
         """
@@ -173,6 +187,7 @@ class Assembly:
 
 
     def to_json(self, filename: str, sort: bool = False) -> None:
+        self._follow_deleted_atoms()
         write_metadata(self, filename, sort)
 
 
@@ -186,32 +201,52 @@ class Assembly:
         return read_assemblies(cls, atoms, json_filename)
 
 
-    def _link_atoms(self) -> None:
+    def _build_atoms(self) -> None:
         """
-        Build the whole structure in `atoms`, with the positions of the core and the ligands
-        as views into its buffer and each ligand's `indices` into it.
+        Put the atoms of the core, with what they carry (arrays, cell, pbc, constraints), and
+        of the ligands into `atoms`, which holds them from then on. "core_id" numbers the
+        core atoms, for _follow_deleted_atoms.
         """
         core_atoms = self.core.atoms
-        all_numbers = [core_atoms.numbers]
-        all_positions = [core_atoms.positions]
+        n_core = len(core_atoms)
 
+        self.atoms = core_atoms.copy()
+        if self.ligands:
+            self.atoms.extend(Atoms(numbers=np.concatenate([lig.atoms.numbers for lig in self.ligands]),
+                                    positions=np.vstack([lig.atoms.positions for lig in self.ligands])))
+        if "a_site_id" in self.atoms.arrays:
+            self.atoms.arrays["a_site_id"][n_core:] = -1
+
+        n_each = [n_core] + [len(lig.atoms) for lig in self.ligands]
+        self.atoms.set_array("ligand_id", np.repeat([-1] + [lig.id for lig in self.ligands], n_each))
+        self.atoms.set_array("core_id", np.concatenate([np.arange(n_core), np.full(sum(n_each[1:]), -1)]))
+        self._n_atoms = len(self.atoms)
+
+        self.core._attach(self, "ligand_id", -1)
         for lig in self.ligands:
-            all_numbers.append(lig.atoms.numbers)
-            all_positions.append(lig.atoms.positions)
+            lig._attach(self, "ligand_id", lig.id)
 
-        self.atoms = Atoms(
-            numbers=np.concatenate(all_numbers),
-            positions=np.vstack(all_positions),
-            pbc=core_atoms.pbc,
-            cell=core_atoms.get_cell(),
-        )
 
-        shared = self.atoms.arrays["positions"]
-        cursor = len(core_atoms)
-        core_atoms.arrays["positions"] = shared[:cursor]
+    def _follow_deleted_atoms(self) -> None:
+        """
+        After atoms were deleted from `atoms`, renumber what holds core indices and drop the
+        cations and ligands that are gone. The indices are mapped rather than rebuilt from
+        positions, which a tilt or strain may have taken beyond what finds the octahedra.
+        """
+        if len(self.atoms) == self._n_atoms:
+            return
+        self._n_atoms = len(self.atoms)
 
-        for lig in self.ligands:
-            n = len(lig.atoms)
-            lig.indices = np.arange(cursor, cursor + n, dtype=int)
-            lig.atoms.arrays["positions"] = shared[cursor:cursor + n]
-            cursor += n
+        core_id = self.atoms.arrays["core_id"]
+        kept = core_id[core_id >= 0]
+        new = {old: i for i, old in enumerate(kept.tolist())}
+        core = self.core
+        if core.octahedra is not None:
+            core.octahedra = {new[b]: {**octa, "X": [new[x] for x in octa["X"] if x in new]}
+                              for b, octa in core.octahedra.items() if b in new}
+        core.B_ijk = {new[b]: ijk for b, ijk in core.B_ijk.items() if b in new}
+        core_id[core_id >= 0] = np.arange(len(kept))
+
+        if isinstance(core.A, list):
+            core.A = [lig for lig in core.A if len(lig.indices)]
+        self.ligands = [lig for lig in self.ligands if len(lig.indices)]

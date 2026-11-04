@@ -93,8 +93,8 @@ def a_site_from_metadata(meta: str | dict, atoms: Atoms, B: str, X: str):
     Reconstruct the A-site value from `a_site_metadata`.
 
     For an inorganic A-site returns the element symbol. For an organic A-site returns a
-    list of placed Ligand instances and sets the "a_site_id" array on `atoms`: the
-    cations are the atoms that are neither B nor X, one molecule after another.
+    one-item list of the cation, for Core to multiply, and sets the "a_site_id" array on
+    `atoms`: the cations are the atoms that are neither B nor X, one molecule after another.
     """
     if not isinstance(meta, dict):
         return str(meta)
@@ -117,7 +117,7 @@ def a_site_from_metadata(meta: str | dict, atoms: Atoms, B: str, X: str):
         volume=lmeta.get("volume"),
         binding_atoms=list(map(int, lmeta.get("binding_atoms_indices", []))),
     )
-    return Core._build_A_ligands(atoms, template)
+    return [template]
 
 
 def write_metadata(assembly, filename: str, sort: bool = False) -> None:

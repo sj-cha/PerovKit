@@ -13,12 +13,13 @@ from .io.structure import write_structure
 from .ligand import Ligand, LigandSpec
 from .utils.box import Box
 from .utils.rotation import rotation_about_axis, rotation_from_u_to_v
+from .utils.selection import Part, PartAtoms
 
 if TYPE_CHECKING:
     from .assembly import Assembly
 
 @dataclass
-class Core:
+class Core(Part):
     """
     ABX3 perovskite core. 
     Currently only supports cubic phase for inorganic perovskites.
@@ -26,7 +27,7 @@ class Core:
     Attributes:
         A (str | List[Ligand]): Chemical symbol of the A-site, or its organic cations.
         B, X (str): Chemical symbols of the B- and X-site species.
-        atoms (ASE Atoms): ASE Atoms object of Core
+        atoms (ASE Atoms): ASE Atoms object of Core; in an Assembly, a read-only selection of its atoms.
         a (float): Cubic lattice constant (Å).
         supercell (Tuple[int, int, int]): Number of repeating unit cells along x, y, z (nx, ny, nz).
         vacuum (float): Vacuum thickness (Å) along a z-direction (used for slabs).
@@ -38,7 +39,7 @@ class Core:
     A: str | List[Ligand]
     B: str
     X: str
-    atoms: Atoms
+    atoms: Atoms = PartAtoms()
     a: float
 
     supercell: Optional[Tuple[int, int, int]] = None
@@ -51,6 +52,8 @@ class Core:
     binding_sites: List[BindingSite] = field(default_factory=list)
 
     def __post_init__(self, build_surface: bool):
+        if isinstance(self.A, list):
+            self.A = self._build_A_ligands(self.A[0])
         if build_surface:
             self._build_surface()
 
@@ -92,7 +95,7 @@ class Core:
         a: float,
         supercell: Sequence[int],
         pbc: bool | Sequence[bool],
-        vacuum: float = 15.0,
+        vacuum: float = 20.0,
         charge_neutral: bool = True,
         random_seed: Optional[int] = 42,
         A_site_disorder: str = "balanced",
@@ -177,7 +180,7 @@ class Core:
             atoms.pbc = periodic
 
         core = cls(
-            A=cls._build_A_ligands(atoms, template) if is_organic else A,
+            A=[template] if is_organic else A,
             B=B,
             X=X,
             atoms=atoms,
@@ -235,7 +238,7 @@ class Core:
         self.atoms = self.atoms[keep]
 
         if isinstance(self.A, list):
-            self.A = self._build_A_ligands(self.atoms, self.A[0])
+            self.A = self._build_A_ligands(self.A[0])
 
 
     def _disorder_A_sites(self, mode: str, random_seed: Optional[int]) -> None:
@@ -261,19 +264,18 @@ class Core:
             positions[idx] = center + (positions[idx] - center) @ R.T
 
         self.atoms.set_positions(positions)
-        self.A = self._build_A_ligands(self.atoms, self.A[0])
 
 
-    @staticmethod
-    def _build_A_ligands(atoms: Atoms, template: Ligand) -> List[Ligand]:
-        ids = atoms.get_array("a_site_id")
+    def _build_A_ligands(self, template: Ligand) -> List[Ligand]:
+        """
+        One copy of `template` for every molecule of the "a_site_id" array of the atoms.
+        """
+        ids = self.atoms.arrays["a_site_id"]
         ligands: List[Ligand] = []
-        for new_id, mol_id in enumerate(sorted(np.unique(ids[ids >= 0]))):
-            idx = np.where(ids == mol_id)[0]
+        for new_id, mol_id in enumerate(np.unique(ids[ids >= 0]).tolist()):
             lig = template.clone()
-            lig.atoms = atoms[idx]
-            lig.indices = idx
             lig.id = new_id
+            lig._attach(self, "a_site_id", mol_id)
             ligands.append(lig)
         return ligands
 
@@ -392,7 +394,7 @@ class Core:
         self, 
         fmt: str, 
         filename: Optional[str] = None, 
-        vacuum: float = 15.0,
+        vacuum: float = 20.0,
         **kwargs,
     ):
         """

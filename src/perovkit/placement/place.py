@@ -4,7 +4,6 @@ import math
 import random
 from typing import List, Optional, Sequence
 
-from ase import Atoms
 import numpy as np
 from scipy.spatial import cKDTree
 
@@ -183,26 +182,14 @@ def _assemble(
 
     keep = np.ones(len(core.atoms), dtype=bool)
     keep[displaced] = False
-    stripped_atoms = Atoms(
-        numbers=core.atoms.numbers[keep],
-        positions=core.atoms.positions[keep],
-        pbc=False,
-    )
+    stripped_atoms = core.atoms[keep]
     if core.is_slab:
         # Periodic along z too, across the vacuum: an MLIP then sees what VASP sees
         stripped_atoms.set_pbc(True)
-        stripped_atoms.set_cell(core.atoms.get_cell())
         stripped_atoms.cell[2, 2] = max_z + core.vacuum
 
-    # An organic A-site loses a molecule with each surface cation replaced: re-derive the
-    # surviving cations from the preserved a_site_id grouping
-    A_value = core.A
-    if isinstance(core.A, list):
-        stripped_atoms.set_array("a_site_id", core.atoms.get_array("a_site_id")[keep])
-        A_value = Core._build_A_ligands(stripped_atoms, core.A[0])
-
     stripped = Core(
-        A=A_value,
+        A=core.A[:1] if isinstance(core.A, list) else core.A,
         B=core.B,
         X=core.X,
         atoms=stripped_atoms,

@@ -11,7 +11,7 @@ def write_structure(
     filename: str,
     fmt: str,
     box: bool = False,
-    vacuum: float = 15.0,
+    vacuum: float = 20.0,
     **kwargs,
 ) -> None:
     """
@@ -20,7 +20,7 @@ def write_structure(
     Args:
         atoms: The structure; it is left as it is.
         filename: Output path.
-        fmt: "vasp", or a format of ase.io.write, which gets the formula as a comment.
+        fmt: "vasp", or a format of ase.io.write; plain "xyz" gets the formula as a comment.
         box: For "vasp", center the atoms in a periodic orthorhombic cell first, as a
             molecule or a nanocrystal needs.
         vacuum: How much wider (Å) that cell is than the atoms along each axis.
@@ -41,4 +41,6 @@ def write_structure(
             atoms.pbc = True
         write_vasp(str(path), atoms, **{**kwargs, "sort": True})
     else:
-        write(str(path), atoms, **{**kwargs, "format": fmt, "comment": atoms.get_chemical_formula()})
+        if fmt == "xyz":
+            kwargs = {**kwargs, "comment": atoms.get_chemical_formula()}
+        write(str(path), atoms, **{**kwargs, "format": fmt})
