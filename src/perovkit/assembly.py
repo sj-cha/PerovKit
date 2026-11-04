@@ -20,7 +20,6 @@ from .placement.poses import FitPose, SitePose, place_about_normal
 from .placement.sampler import ConstellationSampler
 from .placement.sites import motif_pools, select_constellations
 from .refine import INTRA_SCALE
-from .utils.box import build_neighbor_map
 from .utils.sampling import farthest_point_sampling, per_face_farthest_point_sampling
 
 
@@ -201,6 +200,7 @@ class Assembly:
 
         log = print if verbose else (lambda *a, **k: None)
         rng = random.Random(random_seed)
+        box = self.core.box
         sites = self.core.binding_sites
         core_positions = self.core.atoms.get_positions()
 
@@ -212,7 +212,7 @@ class Assembly:
             if spec.ligand.n_motifs > 1:
                 if sampler is None:
                     sampler = ConstellationSampler(
-                        core_positions, self._build_pbc_tree, self._mic, rng,
+                        core_positions, box, rng,
                         displaced=displaced, overlap_cutoff=overlap_cutoff,
                         max_rmsd=max_anchor_rmsd, sites=sites, **sampler_options,
                     )
@@ -237,9 +237,8 @@ class Assembly:
 
         assert poses, "No ligands to place."
 
-        core_tree, _ = self._build_pbc_tree(np.delete(core_positions, displaced, axis=0))
-        contacts = Contacts(core_tree, self._build_pbc_tree, self._mic, self._wrap,
-                            self._build_neighbor_map, overlap_cutoff)
+        core_tree, _ = box.tree(np.delete(core_positions, displaced, axis=0))
+        contacts = Contacts(core_tree, box, overlap_cutoff)
         coords_list = pack(
             poses, contacts, rng, max_iters=max_iters, coarse_step_deg=coarse_step_deg,
             fine_step_deg=fine_step_deg, window_deg=window_deg,
@@ -252,7 +251,7 @@ class Assembly:
         fit_poses = [p for p in poses if isinstance(p, FitPose)]
         if fit_poses:
             dev = np.concatenate([
-                np.linalg.norm(self._mic(p.ligand.anchor_positions - p.candidate.targets), axis=1)
+                np.linalg.norm(box.mic(p.ligand.anchor_positions - p.candidate.targets), axis=1)
                 for p in fit_poses
             ])
             bent = sum(p.origins[p.variant] != "fit" for p in fit_poses)
@@ -375,6 +374,7 @@ class Assembly:
         `verbose`, also lists the pairs closer than `cutoff`.
         """
         log = print if verbose else (lambda *a, **k: None)
+        box = self.core.box
 
         entities = [self.core.atoms.get_positions()] + [lig.atoms.get_positions() for lig in self.ligands]
         entity_labels = ["core"] + [f"ligand_{i}" for i in range(len(self.ligands))]
@@ -389,14 +389,14 @@ class Assembly:
 
         for i in range(len(entities)):
             # Atoms come no closer than their bounding spheres, so most pairs need no query
-            gaps = np.linalg.norm(self._mic(centers[i + 1:] - centers[i]), axis=1) - radii[i] - radii[i + 1:]
+            gaps = np.linalg.norm(box.mic(centers[i + 1:] - centers[i]), axis=1) - radii[i] - radii[i + 1:]
             tree_i = None
             for j, gap in enumerate(gaps, start=i + 1):
                 if gap > max(global_min, cutoff) + 1e-6:
                     continue
 
                 if tree_i is None:
-                    tree_i, _ = self._build_pbc_tree(entities[i])
+                    tree_i, _ = box.tree(entities[i])
                 dists_j, _ = tree_i.query(entities[j], k=1)
                 d_min = float(np.min(dists_j))
 
@@ -418,60 +418,6 @@ class Assembly:
         )
 
         return global_min
-
-
-    def _mic(self, delta: np.ndarray) -> np.ndarray:
-        pbc = self.core.atoms.pbc
-        if not pbc.any():
-            return delta
-        box = self.core.atoms.cell.lengths()
-        d = np.array(delta, dtype=float)
-        for ax in np.flatnonzero(pbc):
-            d[..., ax] -= box[ax] * np.round(d[..., ax] / box[ax])
-        return d
-
-
-    def _wrap(self, points: np.ndarray) -> np.ndarray:
-        pbc = self.core.atoms.pbc
-        if not pbc.any():
-            return points
-        box = self.core.atoms.cell.lengths()
-        x = np.array(points, dtype=float)
-        for ax in np.flatnonzero(pbc):
-            x[..., ax] -= box[ax] * np.floor(x[..., ax] / box[ax])
-        return x
-
-
-    def _build_pbc_tree(self, points: np.ndarray) -> Tuple[cKDTree, np.ndarray]:
-        """
-        KD-tree of `points` and their images one box away along the periodic axes, with the
-        point each comes from.
-        """
-        pts = np.asarray(points, dtype=float)
-        x, y, z = [(-1, 0, 1) if periodic else (0,) for periodic in self.core.atoms.pbc]
-        shifts = np.array([(i, j, k) for i in x for j in y for k in z], dtype=float)
-        shifts = shifts * self.core.atoms.cell.lengths()
-        return cKDTree((pts + shifts[:, None]).reshape(-1, 3)), np.tile(np.arange(len(pts)), len(shifts))
-
-
-    def _build_neighbor_map(self, centers: np.ndarray, radii: np.ndarray, cutoff: float):
-        if not self.core.atoms.pbc.any():
-            return build_neighbor_map(centers, radii, cutoff)
-
-        tree, idx_map = self._build_pbc_tree(centers)
-        rmax = float(np.max(radii))
-
-        neighbor_map: Dict[int, List[int]] = {}
-        for i in range(len(centers)):
-            hits = tree.query_ball_point(centers[i], r=float(radii[i] + rmax + cutoff))
-            cand = set(int(idx_map[h]) for h in hits)
-            cand.discard(i)
-
-            # exact filter with MIC on centers
-            neighbor_map[i] = [j for j in cand
-                               if np.linalg.norm(self._mic(centers[i] - centers[j])) < radii[i] + radii[j] + cutoff]
-
-        return neighbor_map
 
 
     def _assign_ligands_to_octahedra(self) -> None:

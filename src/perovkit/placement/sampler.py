@@ -3,7 +3,7 @@ from collections import Counter
 import dataclasses
 import itertools
 import random
-from typing import Callable, Dict, Iterator, List, Optional, Sequence, Tuple
+from typing import Dict, Iterator, List, Optional, Sequence, Tuple
 
 import numpy as np
 from scipy.spatial import cKDTree
@@ -12,6 +12,7 @@ from ..conformers import ConformerLibrary, embed_at, uff_energy, uff_polish
 from ..core import BindingSite
 from ..refine import refine, stretch
 from ..torsion import TorsionModel
+from ..utils.box import Box
 from ..utils.rotation import rotations_about_axis
 from .fitting import Candidate, Fit, fit_conformers, mean_normal, site_normals
 from .grid import CoreGrid, _over_sites
@@ -26,8 +27,7 @@ class ConstellationSampler:
 
     Args:
         core_positions (np.ndarray): Positions of all core atoms, before any are removed.
-        tree_builder (Callable): Points -> (cKDTree, index map), with periodic images for slabs.
-        mic (Callable): Minimum-image convention for difference vectors (identity if not periodic).
+        box (Box): The cell of the core.
         rng (random.Random): Random generator of the placement.
         sites (Sequence[BindingSite]): Every surface site; a ligand takes the free ones under
             it out of use (accept), and a fit may not lie over one already taken.
@@ -53,8 +53,7 @@ class ConstellationSampler:
     def __init__(
         self,
         core_positions: np.ndarray,
-        tree_builder: Callable,
-        mic: Callable[[np.ndarray], np.ndarray],
+        box: Box,
         rng: random.Random,
         sites: Sequence[BindingSite],
         displaced: Sequence[int] = (),
@@ -74,10 +73,9 @@ class ConstellationSampler:
         embed_conformers: int = 8,
         max_embeddings: int = 12,
     ):
-        self.core_tree, self.core_map = tree_builder(np.asarray(core_positions, dtype=float))
+        self.core_tree, self.core_map = box.tree(np.asarray(core_positions, dtype=float))
         self._n_core = len(core_positions)
-        self.tree_builder = tree_builder
-        self.mic = mic
+        self.box = box
         self.rng = rng
         self.displaced = set(int(i) for i in displaced)
         self.overlap_cutoff = overlap_cutoff
@@ -102,7 +100,7 @@ class ConstellationSampler:
         self._site_positions = np.array([s.position for s in self.sites], dtype=float).reshape(-1, 3)
         planes = np.array([s.plane for s in self.sites], dtype=float).reshape(-1, 3)
         self._site_normals = planes / np.maximum(np.linalg.norm(planes, axis=1, keepdims=True), 1e-12)
-        self._site_tree = self.tree_builder(self._site_positions)
+        self._site_tree = self.box.tree(self._site_positions)
         self.n_shadowed = 0
         self._radii: Optional[np.ndarray] = None   # of the ligand type being placed
         self._n_embedded = 0
@@ -168,7 +166,7 @@ class ConstellationSampler:
         taken = np.array([s.position for s in sites if s.passivated], dtype=float).reshape(-1, 3)
         gap = np.full(len(seeds), np.inf)
         for y in taken:
-            gap = np.minimum(gap, np.linalg.norm(self.mic(X - y), axis=1))
+            gap = np.minimum(gap, np.linalg.norm(self.box.mic(X - y), axis=1))
         tried = np.zeros(len(seeds), dtype=bool)
 
         while len(accepted) < n_target:
@@ -196,7 +194,7 @@ class ConstellationSampler:
             accepted.append(cand)
             placed[face] += 1
             for s in cand.sites:
-                gap = np.minimum(gap, np.linalg.norm(self.mic(X - s.position), axis=1))
+                gap = np.minimum(gap, np.linalg.norm(self.box.mic(X - s.position), axis=1))
 
         self.occupancy = {f: placed[f] / capacity[f] for f in faces}
         return accepted, failures
@@ -220,7 +218,7 @@ class ConstellationSampler:
         lib = self._libraries.get(id(original), lib)
         self._radii = radii
         seed = sites[0]
-        rel = np.array([self.mic(s.position - seed.position) for s in sites])
+        rel = np.array([self.box.mic(s.position - seed.position) for s in sites])
         cand, reason, stuck = self._evaluate(lib, sites, seed.position + rel, anchor_offset, replace)
         if cand is None and stuck and model is not None:
             cand = self._rescue(stuck, model, groups)
@@ -243,7 +241,7 @@ class ConstellationSampler:
             self.displaced.update(cand.atom_indices)
         x = cand.fits[0].coords(lib)
         self.placed.append(x)
-        self._lig_tree = self.tree_builder(np.vstack(self.placed))
+        self._lig_tree = self.box.tree(np.vstack(self.placed))
         self.n_shadowed += self._shadow(x, radii)
 
 
@@ -260,7 +258,7 @@ class ConstellationSampler:
         out = np.zeros(len(coords), dtype=bool)
         if len(sites):
             # the sites' images nearest the pose, so that plain differences are minimum images
-            P = pivot + self.mic(self._site_positions[sites] - pivot)
+            P = pivot + self.box.mic(self._site_positions[sites] - pivot)
             _over_sites(np.ascontiguousarray(coords, dtype=float), np.ascontiguousarray(P),
                         np.ascontiguousarray(self._site_normals[sites]),
                         np.ascontiguousarray(radii, dtype=float), out)
@@ -320,7 +318,7 @@ class ConstellationSampler:
         # constellations shaped like the templates (poses proven at real sites) come first
         typical = np.median(d[lib.n_conformers - lib.n_templates:] if lib.n_templates else d, axis=0)
         tol = 2.0 * self.max_rmsd
-        rel_pools = [self.mic(np.array([s.position for s in p], dtype=float) - seed.position)
+        rel_pools = [self.box.mic(np.array([s.position for s in p], dtype=float) - seed.position)
                      if p else np.zeros((0, 3)) for p in pools]
 
         def extend(chosen: List[BindingSite], rel: List[np.ndarray]):
