@@ -3,7 +3,7 @@ from __future__ import annotations
 import numpy as np
 
 from ..ligand import Ligand
-from ..utils.rotation import rotation_about_axis, rotation_from_u_to_v, rotations_about_axis
+from ..utils.rotation import rotation_about_axis, rotation_from_u_to_v
 from .fitting import Candidate
 
 
@@ -84,7 +84,7 @@ class MultiMotifPose:
         x = self.variants[variant]
         if not self.spins or theta == 0.0:
             return x.copy()
-        R = rotations_about_axis(self.axis, np.array([theta]))[0]
+        R = rotation_about_axis(self.axis, theta)
         return (x - self.center) @ R.T + self.center
 
     def add_variant(self, coords: np.ndarray, origin: str = "refined", first: bool = False) -> int:

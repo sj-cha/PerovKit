@@ -13,7 +13,7 @@ from ..core import BindingSite
 from ..refine import refine, stretch
 from ..torsion import TorsionModel
 from ..utils.box import Box
-from ..utils.rotation import rotations_about_axis
+from ..utils.rotation import rotation_about_axis
 from .fitting import Candidate, Fit, fit_conformers, mean_normal, site_normals
 from .grid import CoreGrid, _over_sites
 from .sites import assign_faces
@@ -421,7 +421,7 @@ class ConstellationSampler:
         axis = res["axis"]
         thetas = (np.linspace(0.0, 2.0 * np.pi, self.n_spin, endpoint=False)
                   if axis is not None else np.zeros(1))
-        spins = rotations_about_axis(axis, thetas) if axis is not None else np.eye(3)[None]
+        spins = rotation_about_axis(axis, thetas) if axis is not None else np.eye(3)[None]
         has_dir = np.linalg.norm(lib.directions, axis=-1) > 0
         nbar = normals.mean(axis=0)
         nbar = nbar / np.linalg.norm(nbar)

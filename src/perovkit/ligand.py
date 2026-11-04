@@ -464,11 +464,11 @@ class Ligand(Part):
             ex = np.array([1.0, 0.0, 0.0], dtype=float)
             coords0 = coords0 @ rotation_from_u_to_v(axis, ex).T
 
-            # Turn about x to maximize the z-projection of the rest
+            # Turn about x by the angle t that maximizes the z sum of the rest,
+            # sum(y) sin t + sum(z) cos t
             others = np.delete(coords0, binding_idx, axis=0)
-            thetas = np.linspace(0.0, 2.0 * np.pi, 720, endpoint=False)
-            scores = others[:, 1].sum() * np.sin(thetas) + others[:, 2].sum() * np.cos(thetas)
-            coords0 = coords0 @ rotation_about_axis(ex, thetas[np.argmax(scores)]).T
+            theta = np.arctan2(others[:, 1].sum(), others[:, 2].sum())
+            coords0 = coords0 @ rotation_about_axis(ex, theta).T
 
         elif len(others) > 0:
             # point binding atom -> unweighted centroid of the rest along +z

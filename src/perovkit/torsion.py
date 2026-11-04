@@ -63,18 +63,6 @@ def _torsion_gradient(X, G, bonds, moving, starts, out):
             out[l, b] = (ux * tx + uy * ty + uz * tz) / r
 
 
-def _rotation(u: np.ndarray, phi: float) -> np.ndarray:
-    """
-    Rotation by `phi` about the unit axis `u` (Rodrigues).
-    """
-    x, y, z = float(u[0]), float(u[1]), float(u[2])
-    c, s = math.cos(phi), math.sin(phi)
-    t = 1.0 - c
-    return np.array([[c + t * x * x, t * x * y - s * z, t * x * z + s * y],
-                     [t * x * y + s * z, c + t * y * y, t * y * z - s * x],
-                     [t * x * z - s * y, t * y * z + s * x, c + t * z * z]])
-
-
 def _euler_many(angles: np.ndarray):
     """
     _euler for (L, 3) angles: R (L, 3, 3) and its three derivatives (3, L, 3, 3).

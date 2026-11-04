@@ -7,6 +7,7 @@ import numpy as np
 from scipy.sparse import coo_matrix
 from scipy.sparse.linalg import splu
 
+from ..utils.box import Box
 from .glazer_pattern import build_octahedra_rotmat
 from perovkit import Core, Assembly
 
@@ -14,17 +15,6 @@ from perovkit import Core, Assembly
 Some features have beem adapted from Terumasa Tadano's codes and modified.   
 Please refer to DistortPerovskite: https://github.com/ttadano/DistortPerovskite/tree/main
 """
-
-
-def _mic(v, cell_inv, cell_arr, pbc):
-    """Minimum-image convention for displacement vector(s) *v*."""
-    if cell_inv is None:
-        return v
-    frac = v @ cell_inv
-    for ax in range(3):
-        if pbc[ax]:
-            frac[..., ax] -= np.round(frac[..., ax])
-    return frac @ cell_arr
 
 
 def _build_X_to_B(octahedra: Dict[int, dict]) -> Dict[int, list[int]]:
@@ -40,9 +30,7 @@ def _adjust_network(
     b_keys: np.ndarray,
     x_to_bs: Dict[int, list[int]],
     R_b: Dict[int, np.ndarray],
-    cell_inv: np.ndarray | None = None,
-    cell_arr: np.ndarray | None = None,
-    pbc: np.ndarray | None = None,
+    box: Box,
 ) -> Dict[int, np.ndarray]:
 
     b_keys_list = [int(b) for b in b_keys]
@@ -81,12 +69,12 @@ def _adjust_network(
 
                 rbi0 = pos0[bi]
                 rbj0 = pos0[bj]
-                vi = _mic(pos0[x] - rbi0, cell_inv, cell_arr, pbc)
-                vj = _mic(pos0[x] - rbj0, cell_inv, cell_arr, pbc)
+                vi = box.mic(pos0[x] - rbi0)
+                vj = box.mic(pos0[x] - rbj0)
 
                 pred_i = rbi0 + Ri @ vi
                 pred_j = rbj0 + Rj @ vj
-                delta_ij = _mic(pred_i - pred_j, cell_inv, cell_arr, pbc)
+                delta_ij = box.mic(pred_i - pred_j)
 
                 add_directed(bi, bj, delta_ij)
                 add_directed(bj, bi, -delta_ij)
@@ -153,17 +141,11 @@ def apply_tilt(
 
     x_to_bs = _build_X_to_B(octahedra)
 
-    # Periodic boundary info
-    atoms = structure.atoms if isinstance(structure, Core) else structure.core.atoms
-    pbc = np.asarray(atoms.pbc)
-    if any(pbc):
-        cell_arr = np.asarray(atoms.get_cell(), dtype=float)
-        cell_inv = np.linalg.inv(cell_arr)
-    else:
-        cell_arr = cell_inv = None
+    # Minimum images along the periodic axes of the core
+    box = (structure if isinstance(structure, Core) else structure.core).box
 
     # Solve translations to restore corner sharing
-    t_b = _adjust_network(pos0, b_keys, x_to_bs, R_b, cell_inv, cell_arr, pbc)
+    t_b = _adjust_network(pos0, b_keys, x_to_bs, R_b, box)
 
     # 1) B: translate only
     for b in b_keys:
@@ -177,12 +159,12 @@ def apply_tilt(
             R = R_b.get(int(b), np.eye(3))
             tb = t_b.get(int(b), np.zeros(3))
             rb0 = pos0[int(b)]
-            v0 = _mic(pos0[int(x)] - rb0, cell_inv, cell_arr, pbc)
+            v0 = box.mic(pos0[int(x)] - rb0)
             preds.append((rb0 + tb) + (R @ v0))
         if len(preds) > 1:
             ref = preds[0]
             for i in range(1, len(preds)):
-                preds[i] = ref + _mic(preds[i] - ref, cell_inv, cell_arr, pbc)
+                preds[i] = ref + box.mic(preds[i] - ref)
         pos_new[int(x)] = np.mean(preds, axis=0)
 
     # 3) Ligands: rigidly follow assigned B (row-vector update)

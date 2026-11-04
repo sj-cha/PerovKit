@@ -7,7 +7,8 @@ import numpy as np
 from scipy.optimize import minimize
 from scipy.spatial import cKDTree
 
-from .torsion import TorsionModel, _dihedral, _rotation
+from .torsion import TorsionModel, _dihedral
+from .utils.rotation import rotation_about_axis
 
 
 # Atoms of one ligand four or more bonds apart are kept INTRA_SCALE x the sum of their van
@@ -363,14 +364,13 @@ def stretch(
     for b in order:
         (i, j), mask, quad = model.bonds[b], model.masks[b], model.quads[b]
         u = x[j] - x[i]
-        u /= np.linalg.norm(u)
         phi = _dihedral(x[quad])
         moved, rest = np.flatnonzero(mask), np.flatnonzero(~mask)
         rest_tree = cKDTree(x[rest])
         reach = 2.0 * INTRA_SCALE * float(model.radii.max())
         best, best_overlap = None, np.inf
         for target in (np.pi, np.pi / 3, -np.pi / 3):
-            R = _rotation(u, target - phi)
+            R = rotation_about_axis(u, target - phi)
             y = (x[mask] - x[i]) @ R.T + x[i]
             d, k = rest_tree.query(y, k=min(8, len(rest)), distance_upper_bound=reach)
             other = rest[np.minimum(k, len(rest) - 1)]
