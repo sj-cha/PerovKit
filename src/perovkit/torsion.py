@@ -8,7 +8,8 @@ import numba
 import numpy as np
 from rdkit import Chem
 
-_ROTATABLE = Chem.MolFromSmarts("[!$(*#*)&!D1]-&!@[!$(*#*)&!D1]")
+# acyclic single bonds between atoms neither terminal nor triple-bonded
+ROTATABLE = Chem.MolFromSmarts("[!$(*#*)&!D1]-&!@[!$(*#*)&!D1]")
 
 
 @numba.njit(cache=True)
@@ -168,7 +169,7 @@ class TorsionModel:
             return mask
 
         found = []
-        for i, j in mol.GetSubstructMatches(_ROTATABLE):
+        for i, j in mol.GetSubstructMatches(ROTATABLE):
             mask = side(j, i)
             if mask[root]:
                 i, j = j, i

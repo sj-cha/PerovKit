@@ -12,7 +12,7 @@ from rdkit.Chem import AllChem, rdDetermineBonds, rdMolTransforms
 
 from .conformers import ConformerLibrary
 from .io.structure import write_structure
-from .torsion import TorsionModel
+from .torsion import ROTATABLE, TorsionModel
 from .utils.rotation import rotation_about_axis, rotation_from_u_to_v
 from .utils.selection import Part, PartAtoms
 
@@ -275,10 +275,9 @@ class Ligand(Part):
             AllChem.UFFOptimizeMolecule(mol, confId=conf_id, maxIters=1000)
         else:
             # Set all rotatable bond dihedrals to 180°
-            rotatable = Chem.MolFromSmarts('[!$(*#*)&!D1]-&!@[!$(*#*)&!D1]')
             conf = mol.GetConformer()
             torsion_indices = []
-            for i, j in mol.GetSubstructMatches(rotatable):
+            for i, j in mol.GetSubstructMatches(ROTATABLE):
                 neighbor_i = next(n.GetIdx() for n in mol.GetAtomWithIdx(i).GetNeighbors() if n.GetIdx() != j)
                 neighbor_j = next(n.GetIdx() for n in mol.GetAtomWithIdx(j).GetNeighbors() if n.GetIdx() != i)
                 quad = (neighbor_i, i, j, neighbor_j)

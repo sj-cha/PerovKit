@@ -5,7 +5,7 @@ from typing import Optional, Sequence
 import numpy as np
 from scipy.spatial import cKDTree
 
-from ..refine import stretch
+from ..refine import CONTACT_MARGINS, stretch
 from .fitting import mean_normal
 from .poses import MultiMotifPose
 
@@ -74,7 +74,7 @@ def stretch_poses(poses: Sequence, core_tree, cutoff: float, n_workers: int = 1)
     todo = [p for p in multi_motif_poses
             if p.origins[p.variant] != "stretched" and p.ligand.torsion_model().tails.any()]
     jobs = [(p.ligand.torsion_model(), p.variants[0], p.ligand.binding_groups,
-             p.candidate.targets, mean_normal(p.candidate.sites), cutoff + 0.2) for p in todo]
+             p.candidate.targets, mean_normal(p.candidate.sites), cutoff + CONTACT_MARGINS[0]) for p in todo]
     n_workers = min(n_workers, available_cpus(), len(jobs))
     if n_workers > 1:
         with ProcessPoolExecutor(max_workers=n_workers,
