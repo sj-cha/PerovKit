@@ -5,7 +5,6 @@ import random
 from typing import List, Optional, Sequence
 
 import numpy as np
-from scipy.spatial import cKDTree
 
 from ..assembly import Assembly
 from ..core import Core
@@ -214,12 +213,7 @@ def _assign_to_octahedra(core: Core, ligands: List[Ligand]) -> None:
     if not octahedra:
         return
 
-    at = core.atoms
-    syms = np.array(at.get_chemical_symbols())
-    b_idx = np.where(syms == core.B)[0]
-
-    core_pos, boxsize = core._box_positions()
-    B_pos = core_pos[b_idx]
+    b_idx = np.flatnonzero(np.array(core.atoms.get_chemical_symbols()) == core.B)
 
     anchor_positions = []
     ligand_ids = []
@@ -236,12 +230,11 @@ def _assign_to_octahedra(core: Core, ligands: List[Ligand]) -> None:
             ligand_ids.append(int(lig.id))
 
     if anchor_positions:
-        anchor_positions = np.vstack(anchor_positions)
+        # the nearest B, minimum images along the periodic axes
+        tree, image_of = core.box.tree(core.atoms.positions[b_idx])
+        _, nearest = tree.query(np.vstack(anchor_positions))
 
-        b_tree = cKDTree(B_pos, boxsize=boxsize)
-        _, b_loc = b_tree.query(anchor_positions, k=1)
-
-        for j, b_loc_j in enumerate(b_loc):
-            b_abs = int(b_idx[int(b_loc_j)])
+        for j, k in enumerate(nearest):
+            b_abs = int(b_idx[image_of[k]])
             if ligand_ids[j] not in octahedra[b_abs]["Ligand"]:
                 octahedra[b_abs]["Ligand"].append(ligand_ids[j])

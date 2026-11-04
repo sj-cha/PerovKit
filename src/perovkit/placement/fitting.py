@@ -6,7 +6,7 @@ import numpy as np
 
 from ..conformers import ConformerLibrary
 from ..core import BindingSite
-from ..utils.rotation import rotations_about_axis
+from ..utils.rotation import rotation_about_axis
 
 
 def site_normals(sites: Sequence[BindingSite]) -> np.ndarray:
@@ -50,7 +50,7 @@ class Fit:
             return self.xyz.copy()
         x = (lib.coords[self.conformer] - self.center) @ self.rotation.T
         if self.axis is not None and self.theta != 0.0:
-            x = x @ rotations_about_axis(self.axis, np.array([self.theta]))[0].T
+            x = x @ rotation_about_axis(self.axis, self.theta).T
         return x + self.pivot
 
 
@@ -131,7 +131,7 @@ def fit_conformers(
 
     if axis is not None:
         thetas = np.linspace(0.0, 2.0 * np.pi, n_spin, endpoint=False)
-        spins = rotations_about_axis(axis, thetas)                    # (S, 3, 3)
+        spins = rotation_about_axis(axis, thetas)                    # (S, 3, 3)
         # cos[c, s, n] = normal_n . (spin_s @ dir_cn), with the normals turned back instead
         back = normals @ spins                                        # (S, n, 3)
         cos = (dirs.transpose(1, 0, 2) @ back.transpose(1, 2, 0)).transpose(1, 2, 0)   # (C, S, n)

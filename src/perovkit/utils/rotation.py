@@ -1,61 +1,33 @@
 import numpy as np
 
-def rotation_about_axis(axis: np.ndarray, theta: float) -> np.ndarray:
+def rotation_about_axis(axis: np.ndarray, theta: float | np.ndarray) -> np.ndarray:
     """
-    Rodrigues' rotation formula for rotation about arbitrary axis.
-
-    axis : (3,) unit vector
-    theta : rotation angle in radians
+    Rodrigues rotation by `theta` radians about `axis`, of any length: (3, 3) for one
+    angle, (n, 3, 3) for an array of them.
     """
-    axis = np.asarray(axis, dtype=float)
-    axis /= np.linalg.norm(axis)
-
-    x, y, z = axis
-    K = np.array([[0, -z, y],
-                [z, 0, -x],
-                [-y, x, 0]], dtype=float)
-
-    return np.eye(3) + np.sin(theta) * K + (1.0 - np.cos(theta)) * (K @ K)
+    x, y, z = np.asarray(axis, dtype=float) / np.linalg.norm(axis)
+    K = np.array([[0, -z, y], [z, 0, -x], [-y, x, 0]], dtype=float)
+    s = np.sin(np.asarray(theta))[..., None, None]
+    c = np.cos(np.asarray(theta))[..., None, None]
+    return np.eye(3) + s * K + (1.0 - c) * (K @ K)
 
 def rotation_from_u_to_v(u: np.ndarray, v: np.ndarray) -> np.ndarray:
     """
-    u: source vector
-    v: target vector
+    Rotation turning the direction of `u` onto that of `v`.
     """
-    u = np.asarray(u, dtype=float)
-    v = np.asarray(v, dtype=float)
-
-    u /= np.linalg.norm(u)
-    v /= np.linalg.norm(v)
-
+    u = np.asarray(u, dtype=float) / np.linalg.norm(u)
+    v = np.asarray(v, dtype=float) / np.linalg.norm(v)
     c = float(np.dot(u, v))
 
     # already aligned
     if np.isclose(c, 1.0):
         return np.eye(3)
-    
+
+    # opposite: half a turn about any axis perpendicular to u
     if np.isclose(c, -1.0):
         tmp = np.array([1.0, 0.0, 0.0])
         if np.allclose(np.abs(u), np.abs(tmp)):
             tmp = np.array([0.0, 1.0, 0.0])
-        axis = np.cross(u, tmp)
-        axis /= np.linalg.norm(axis)
-        theta = np.pi
-        return rotation_about_axis(axis, theta)
+        return rotation_about_axis(np.cross(u, tmp), np.pi)
 
-    # general case
-    axis = np.cross(u, v)
-    axis /= np.linalg.norm(axis)
-    theta = np.arccos(c)
-
-    return rotation_about_axis(axis, theta)
-
-def rotations_about_axis(axis: np.ndarray, thetas: np.ndarray) -> np.ndarray:
-    """
-    Rodrigues rotation matrices about one unit axis for many angles: (n_theta, 3, 3).
-    """
-    x, y, z = axis
-    K = np.array([[0, -z, y], [z, 0, -x], [-y, x, 0]], dtype=float)
-    s = np.sin(thetas)[:, None, None]
-    c = np.cos(thetas)[:, None, None]
-    return np.eye(3) + s * K + (1.0 - c) * (K @ K)
+    return rotation_about_axis(np.cross(u, v), np.arccos(c))

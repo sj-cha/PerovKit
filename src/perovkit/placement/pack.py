@@ -4,7 +4,6 @@ import random
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
-from scipy.spatial import cKDTree
 from tqdm.auto import tqdm
 
 from ..refine import INTRA_SCALE, K_CONTACT, intra_pairs, refine, refine_joint
@@ -346,26 +345,24 @@ class Contacts:
         return global_min, conflict_ligs, dists
 
 
-def active_cluster(conflict_ligs: List[int], site_positions: np.ndarray, radius: float) -> List[int]:
+def active_cluster(conflict_ligs: List[int], site_positions: np.ndarray, radius: float, box: Box) -> List[int]:
     """
     The ligands in conflict and every ligand whose site lies within `radius` of a site
-    already in the cluster, grown until no more join.
+    already in the cluster (minimum images along the periodic axes of `box`), grown until
+    no more join.
     """
     if not conflict_ligs:
         return []
-    site_tree = cKDTree(site_positions)
+    tree, image_of = box.tree(site_positions)
     active = set(conflict_ligs)
     queue = list(conflict_ligs)
-    visited = set(conflict_ligs)
     while queue:
         i = queue.pop()
-        for j in site_tree.query_ball_point(site_positions[i], r=radius):
-            if j in visited:
-                continue
-            visited.add(j)
-            active.add(j)
-            queue.append(j)
-    return sorted(list(active))
+        for j in image_of[tree.query_ball_point(site_positions[i], r=radius)].tolist():
+            if j not in active:
+                active.add(j)
+                queue.append(j)
+    return sorted(active)
 
 
 def pack(
@@ -437,7 +434,7 @@ def pack(
             log(f"[Log] Hard cutoff {cutoff:.3f} Å satisfied. Stopping optimization.")
             break
 
-        active = active_cluster(conflict_ligs, site_positions, active_radius)
+        active = active_cluster(conflict_ligs, site_positions, active_radius, contacts.box)
 
         improved = False
         rng.shuffle(active)

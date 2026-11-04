@@ -6,7 +6,6 @@ from collections import defaultdict
 import random
 import numpy as np
 from ase import Atoms
-from scipy.spatial import cKDTree
 from ase.data import covalent_radii, atomic_numbers
 
 from .io.structure import write_structure
@@ -460,31 +459,20 @@ class Core(Part):
         return sites
 
 
-    def _box_positions(self) -> Tuple[np.ndarray, Optional[tuple]]:
-        """
-        Atom positions and the `boxsize` for a KD-tree of them: wrapped into the cell of a
-        periodic structure, as they are otherwise.
-        """
-        if self.is_nanocrystal:
-            return self.atoms.get_positions(), None
-        cell = self.atoms.get_cell()
-        return self.atoms.get_scaled_positions(wrap=True) @ cell.array, tuple(cell.lengths())
-
-
     def _build_octahedra(self) -> None:
         """
-        Build the octahedral network: the nearest X neighbors of each B, and the integer
-        (i, j, k) lattice coordinates of each B.
+        Build the octahedral network: the nearest X neighbors of each B (minimum images
+        along the periodic axes), and the integer (i, j, k) lattice coordinates of each B.
         """
         syms = np.array(self.atoms.get_chemical_symbols())
         b_idx = np.where(syms == self.B)[0]
         x_idx = np.where(syms == self.X)[0]
 
-        pos, boxsize = self._box_positions()
-        tree = cKDTree(pos[x_idx], boxsize=boxsize)
+        pos = self.atoms.get_positions()
+        tree, image_of = self.box.tree(pos[x_idx])
         neigh_lists = tree.query_ball_point(pos[b_idx], float(self.a)/2 + 1e-2)
 
-        self.octahedra = {int(b): {"X": [int(x_idx[j]) for j in neighbors], "Ligand": []}
+        self.octahedra = {int(b): {"X": sorted({int(x_idx[image_of[j]]) for j in neighbors}), "Ligand": []}
                           for b, neighbors in zip(b_idx, neigh_lists)}
 
         b_pos = self.atoms.positions[b_idx]
