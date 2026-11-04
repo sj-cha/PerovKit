@@ -11,18 +11,10 @@ from .torsion import TorsionModel, _dihedral
 from .utils.rotation import rotation_about_axis
 
 
-# Atoms of one ligand four or more bonds apart are kept INTRA_SCALE x the sum of their van
-# der Waals radii apart (1.68 A for H...H, 2.38 for C...C); a larger scale jams the densest
-# packings.
-INTRA_SCALE = 0.7
-
-
-K_CONTACT = 40.0   # per Å^2, soft-sphere weight of a contact
-
-
-# Intramolecular overlaps weigh INTRA_WEIGHT x a contact, so that pulling the anchors onto
-# their sites does not fold a ligand onto itself.
-INTRA_WEIGHT = 10.0
+CONTACT_MARGINS = (0.2, 0.05)  # Å, contacts are pushed to the cutoff plus each, in turn
+INTRA_SCALE = 0.7              # atoms four or more bonds apart keep this x their summed vdW radii
+K_CONTACT = 40.0               # per Å^2, soft-sphere weight of a contact
+SKIN = 1.0                     # Å, Verlet list skin
 
 
 def intra_pairs(model, X, scale, skin=0.0):
@@ -50,11 +42,6 @@ def intra_pairs(model, X, scale, skin=0.0):
 class Refinement:
     coords: np.ndarray
     anchor_rmsd: float
-
-
-# Verlet lists: contacts are searched within their reach + SKIN, and searched again only for
-# the ligands that have moved far enough since that every pair within reach stays listed.
-SKIN = 1.0
 
 
 @numba.njit(cache=True)
@@ -233,7 +220,7 @@ def _terms(model, X, groups, T, nb, k_anchor, k_contact):
     flat, G_flat = X.reshape(-1, 3), G.reshape(-1, 3)
     e, closest = _fixed_terms(flat, nb.atom, nb.partner, nb.contact, k_contact, G_flat)
     e_in, _, hits = _pair_terms(flat, nb.pa, nb.pb, nb.no_shift, nb.limit,
-                                INTRA_WEIGHT * k_contact, G_flat)
+                                10.0 * k_contact, G_flat)
     E += e + e_in
     tangled = hits > 0
     return E, G, closest, tangled, np.sqrt(sq / len(groups))

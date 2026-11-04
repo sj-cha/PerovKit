@@ -6,21 +6,10 @@ from typing import Callable, Dict, List, Optional, Sequence, Tuple
 import numpy as np
 from tqdm.auto import tqdm
 
-from ..refine import INTRA_SCALE, K_CONTACT, intra_pairs, refine, refine_joint
+from ..refine import CONTACT_MARGINS, INTRA_SCALE, K_CONTACT, intra_pairs, refine, refine_joint
 from ..utils.box import Box
 from .poses import FitPose
 from .stretch import stretch_poses
-
-
-# Soft-sphere radii (cutoff + margin) tried in turn: a wide margin clears contacts with room
-# to spare but in a dense shell also pushes on contacts already fine; the narrow one acts
-# on the real ones alone.
-MARGINS = (0.2, 0.05)
-
-
-# Contact weights, as multiples of refine's default, that bend_clusters tries in turn when
-# the margins fail: anchor springs can hold a ligand a hair below the cutoff against the core.
-STIFFNESS = (1.0, 2.0, 4.0)
 
 
 def bend_pose(
@@ -44,7 +33,7 @@ def bend_pose(
     if neighbors_coords:
         trees.append(box.tree(np.vstack(neighbors_coords))[0])
     best, best_d = None, -float("inf")
-    for margin in MARGINS:
+    for margin in CONTACT_MARGINS:
         res = refine(pose.ligand.torsion_model(), coords, pose.ligand.binding_groups,
                      pose.candidate.targets, trees, contact=cutoff + margin,
                      stop_at=cutoff + margin / 2, stop_rmsd=max_rmsd)
@@ -102,11 +91,6 @@ def bounding_spheres(poses: Sequence, coords_list: List[np.ndarray]) -> Tuple[np
             centers[i] = pose.center
             radii[i] = pose.reach
     return centers, radii
-
-
-# Above this many atom pairs, Contacts.closest finds each neighbor atom's nearest atom in a
-# tree and measures those pairs alone, with the same arithmetic.
-DENSE_PAIRS = 20000
 
 
 def tree_min_distance(core_tree, box: Box, neighbors_coords: List[np.ndarray]) -> Callable:
@@ -209,7 +193,7 @@ def bend_clusters(
     Ligands closer than `cutoff` form a contact graph. In every connected component with a
     contact below the cutoff (a single ligand touching the core included), the multi-motif
     members are refined jointly against the core and all other ligands and pushed apart
-    from each other, with the margins of MARGINS and then stiffer contacts (STIFFNESS).
+    from each other, with the margins of CONTACT_MARGINS and then stiffer contacts (2x and 4x).
     Members whose anchors end farther than `max_rmsd` from their sites keep their poses;
     the others take theirs if the closest contact of the component improves. Each
     refinement stops once every contact is `stop_at` Å (by default halfway into the
@@ -250,7 +234,7 @@ def bend_clusters(
             continue  # nothing to clear: a lone ligand with no contact below the cutoff
         others = [c for j, c in enumerate(coords_list) if j not in members]
         trees = [core_tree, box.tree(np.vstack(others))[0] if others else None]
-        for stiff, margin in [(k, m) for k in STIFFNESS for m in MARGINS]:
+        for stiff, margin in [(k, m) for k in (1.0, 2.0, 4.0) for m in CONTACT_MARGINS]:
             results = refine_joint(
                 [poses[i].ligand.torsion_model() for i in members],
                 [coords_list[i] for i in members],
@@ -296,7 +280,7 @@ class Contacts:
             return d_core
 
         neighbors = np.vstack(neighbors_coords)  # (N,3)
-        if len(coords) * len(neighbors) > DENSE_PAIRS:
+        if len(coords) * len(neighbors) > 20000:
             # wrapped into the box, periodic images one box away hold every minimum image
             tree, image_of = self.box.tree(self.box.wrap(coords))
             _, k = tree.query(self.box.wrap(neighbors))

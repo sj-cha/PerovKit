@@ -10,7 +10,7 @@ from scipy.spatial import cKDTree
 
 from ..conformers import ConformerLibrary, embed_at, uff_energy, uff_polish
 from ..core import BindingSite
-from ..refine import refine, stretch
+from ..refine import CONTACT_MARGINS, refine, stretch
 from ..torsion import TorsionModel
 from ..utils.box import Box
 from ..utils.rotation import rotation_about_axis
@@ -56,9 +56,9 @@ class ConstellationSampler:
         box: Box,
         rng: random.Random,
         sites: Sequence[BindingSite],
+        overlap_cutoff: float,
+        max_rmsd: float,
         displaced: Sequence[int] = (),
-        overlap_cutoff: float = 1.6,
-        max_rmsd: float = 0.5,
         n_fits: int = 4,
         n_constellations: int = 4,
         max_branch: int = 64,
@@ -586,7 +586,7 @@ class ConstellationSampler:
         excluded = self._excluded(cand.sites, replace)
         core = self._local_tree(self.core_tree, self.core_map, fit.pivot, np.inf, excluded)
         res = stretch(model, x, groups, cand.targets, mean_normal(cand.sites), [core],
-                      self.overlap_cutoff + 0.2)
+                      self.overlap_cutoff + CONTACT_MARGINS[0])
         poses = []
         if res is not None:
             held = [i for g in groups for i in g]
@@ -642,8 +642,8 @@ class ConstellationSampler:
         before packing still stands it up fully) if that works, else None.
         """
         res = stretch(model, start, groups, targets, mean_normal(sites),
-                      self._surroundings(start, base.pivot, excluded), self.overlap_cutoff + 0.2,
-                      stop_at=self.overlap_cutoff + 0.1)
+                      self._surroundings(start, base.pivot, excluded), self.overlap_cutoff + CONTACT_MARGINS[0],
+                      stop_at=self.overlap_cutoff + CONTACT_MARGINS[0] / 2)
         if res is None or self._core_clearance(res.coords[None], excluded)[0] < self.overlap_cutoff:
             return None
         return dataclasses.replace(base, theta=0.0, xyz=res.coords, origin="unstuck")
@@ -663,8 +663,8 @@ class ConstellationSampler:
         around it; returns it as a fit with explicit coordinates, or None if it stays stuck.
         """
         trees = self._surroundings(start, base.pivot, excluded)
-        res = refine(model, start, groups, targets, trees, contact=self.overlap_cutoff + 0.2,
-                     stop_at=self.overlap_cutoff + 0.1, stop_rmsd=self.max_rmsd)
+        res = refine(model, start, groups, targets, trees, contact=self.overlap_cutoff + CONTACT_MARGINS[0],
+                     stop_at=self.overlap_cutoff + CONTACT_MARGINS[0] / 2, stop_rmsd=self.max_rmsd)
         if res.anchor_rmsd > self.max_rmsd:
             return None
         if self._core_clearance(res.coords[None], excluded)[0] < self.overlap_cutoff:

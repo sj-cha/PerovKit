@@ -72,11 +72,11 @@ def fit_conformers(
     lib: ConformerLibrary,
     targets: np.ndarray,
     normals: np.ndarray,
+    w_align: float,
+    w_foot: float,
+    foot_scale: float,
     sigma_rmsd: float = 0.25,
     energy_scale: float = 5.0,
-    w_align: float = 2.0,
-    w_foot: float = 1.0,
-    foot_scale: float = 2.0,
     n_spin: int = 72,
 ) -> Dict[str, np.ndarray]:
     """

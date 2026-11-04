@@ -173,7 +173,7 @@ def uff_polish(mol: Chem.Mol, x: np.ndarray, fixed: List[int], max_displ: float 
     return y, AllChem.UFFGetMoleculeForceField(m).CalcEnergy()
 
 
-def embed_at(mol: Chem.Mol, pins: dict, n_conformers: int = 8, random_seed: int = 42,
+def embed_at(mol: Chem.Mol, pins: dict, n_conformers: int, random_seed: int,
              n_threads: int = 0, uff_iters: int = 500) -> np.ndarray:
     """
     Conformers of `mol` with the atoms of `pins` (index -> position) where given: ETKDG
