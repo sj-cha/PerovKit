@@ -114,147 +114,26 @@ class Core:
         Returns:
             A Core instance.
         """
-        periodic = tuple(bool(p) for p in np.broadcast_to(np.asarray(pbc, dtype=bool), 3))
-        if periodic == (True, True, False):
-            return cls._build_slab(A, B, X, a, supercell, vacuum=vacuum)
-        if not any(periodic):
-            return cls._build_nanocrystal(A, B, X, a, supercell, charge_neutral=charge_neutral,
-                                          random_seed=random_seed)
-        raise ValueError(f"pbc must be False (nanocrystal) or (True, True, False) (slab); got {pbc}")
+        periodic = np.broadcast_to(np.asarray(pbc, dtype=bool), 3)
+        if periodic.any() and periodic.tolist() != [True, True, False]:
+            raise ValueError(f"pbc must be False (nanocrystal) or (True, True, False) (slab); got {pbc}")
+        if len(supercell) != 3 or min(supercell) <= 0:
+            raise ValueError(f"supercell must be three positive integers (nx, ny, nz); got {supercell}")
+        n_cells = np.array(supercell, dtype=int)
+        a = float(a)
 
-    @classmethod
-    def _build_nanocrystal(
-        cls,
-        A: str | Ligand,
-        B: str,
-        X: str,
-        a: float,
-        supercell: Sequence[int],
-        charge_neutral: bool = True,
-        random_seed: Optional[int] = None
-    ) -> Core:
-        """
-        Build an AX-terminated ABX3 nanocrystal.
-
-        Args:
-            A (str | Ligand): A-site species. A chemical symbol for an inorganic cation, 
-                              or a Ligand instance for an organic cation.
-            B, X (str): Chemical symbols for B- and X-site species.
-            a (float): Cubic lattice constant (Å).
-            supercell (Sequence[int]): Number of repeating unit cells along x, y, z.
-            charge_neutral (bool): If True, remove surface A cations to ensure charge neutrality
-                                   Corners are removed first, then additional surface A cations are randomly removed if needed.
-            random_seed (Optional[int]): Seed for choosing which surface A cations to remove.
-
-        Returns:
-            A Core instance representing the nanocrystal.
-        """
-        if len(supercell) != 3:
-            raise ValueError(f"supercell must be length-3 (nx, ny, nz); got {supercell}")
-        nx, ny, nz = map(int, supercell)
-
-        is_organic_A, A_template, A_label = cls._resolve_A_site(A)
-
-        # A-site is handled separately
-        bx_species = [B, X, X, X]
-        bx_coords = np.array(
-            [
-                [0.5, 0.5, 0.5],  # B
-                [0.5, 0.5, 0.0],  # X
-                [0.5, 0.0, 0.5],  # X
-                [0.0, 0.5, 0.5],  # X
-            ],
-            dtype=float,
-        ) * float(a)
-
-        all_symbols: List[str] = []
-        all_positions: List[np.ndarray] = []
-        a_site_id: List[int] = []
-        next_a_id = 0
-
-        for i in range(nx + 1):
-            for j in range(ny + 1):
-                for k in range(nz + 1):
-                    shift = np.array([i, j, k], dtype=float) * float(a)
-
-                    # A site
-                    next_a_id = cls._append_A_site(
-                        all_symbols, all_positions, a_site_id,
-                        shift, is_organic_A, A_template, next_a_id,
-                    )
-
-                    # B and X sites
-                    for s, c in zip(bx_species, bx_coords):
-                        all_symbols.append(s)
-                        all_positions.append(c + shift)
-                        a_site_id.append(-1)
-
-        all_positions = np.array(all_positions, dtype=float)
-        a_site_id = np.array(a_site_id, dtype=int)
-
-        atoms = Atoms(
-            symbols=all_symbols,
-            positions=all_positions,
-            pbc=False,
-        )
-        atoms.set_array("a_site_id", a_site_id)
-
-        # Ensure AX termination
-        max_coords = np.array([nx, ny, nz], dtype=float) * float(a)
-        pos = atoms.positions
-        ids = atoms.get_array("a_site_id")
-        filt = (ids == -1) & np.any(pos > (max_coords + 1e-5), axis=1)
-        atoms = atoms[~filt]
-
-        sc = (nx, ny, nz)
-
-        if is_organic_A:
-            A_site = cls._build_A_ligands(atoms, A_template)
+        is_organic = isinstance(A, Ligand)
+        if is_organic:
+            template = A.clone()
+            template.atoms.positions -= template.atoms.get_positions().mean(axis=0)
+            A_symbols, A_coords = template.atoms.get_chemical_symbols(), template.atoms.get_positions()
         else:
-            A_site = A_label
+            A_symbols, A_coords = [A], np.zeros((1, 3))
 
-        core = cls(A=A_site, B=B, X=X, atoms=atoms, a=float(a), supercell=sc)
-
-        if charge_neutral:
-            core._neutralize(random_seed)
-
-        return core
-
-    @classmethod
-    def _build_slab(
-        cls,
-        A: str | Ligand,
-        B: str,
-        X: str,
-        a: float,
-        supercell: Sequence[int],
-        vacuum: float = 15.0,
-    ) -> Core:
-        """
-        Build an ABX3 slab periodic in x,y with vacuum along z.
-
-        Args:
-            A (str | Ligand): A-site species. A chemical symbol for an inorganic cation, 
-                              or a Ligand instance for an organic cation.
-            B, X (str): Chemical symbols for B- and X-site species.
-            a (float): Cubic lattice constant (Å).
-            supercell (Sequence[int]): Number of repeating unit cells along x, y, z.
-            vacuum (float): Vacuum thickness (Å) along a z-direction.
-
-        Returns:
-            A Core instance representing the slab.
-        """
-        if len(supercell) != 3:
-            raise ValueError(f"supercell must be length-3 (nx, ny, nz); got {supercell}")
-        nx, ny, nz = map(int, supercell)
-        if nx <= 0 or ny <= 0 or nz <= 0:
-            raise ValueError(f"supercell entries must be positive; got {supercell}")
-
-        is_organic_A, A_template, A_label = cls._resolve_A_site(A)
-
-        if is_organic_A:
-            symbols = [B, X, X, X]
-            scaled = np.array(
+        symbols = A_symbols + [B, X, X, X]
+        unit = np.vstack([
+            A_coords,
+            np.array(
                 [
                     [0.5, 0.5, 0.5],  # B
                     [0.5, 0.5, 0.0],  # X
@@ -262,106 +141,44 @@ class Core:
                     [0.0, 0.5, 0.5],  # X
                 ],
                 dtype=float,
-            )
-        else:
-            symbols = [A, B, X, X, X]
-            scaled = np.array(
-                [
-                    [0.0, 0.0, 0.0],  # A
-                    [0.5, 0.5, 0.5],  # B
-                    [0.5, 0.5, 0.0],  # X
-                    [0.5, 0.0, 0.5],  # X
-                    [0.0, 0.5, 0.5],  # X
-                ],
-                dtype=float,
-            )
+            ) * a,
+        ])
 
-        bulk = Atoms(
-            symbols=symbols,
-            scaled_positions=scaled,
-            cell=np.eye(3) * float(a),
-            pbc=True
-        )
+        # A non-periodic axis gets one more layer of cells for AX termination, with the B
+        # and X past its last A plane left out
+        open_axes = ~periodic
+        grid = np.meshgrid(*[np.arange(m) for m in n_cells + open_axes], indexing="ij")
+        corners = np.stack(grid, axis=-1).reshape(-1, 3) * a
+        positions = (unit + corners[:, None]).reshape(-1, 3)
 
-        atoms = bulk.repeat((nx, ny, nz + 1))
+        is_A = np.tile(np.arange(len(symbols)) < len(A_symbols), len(corners))
+        past_end = positions[:, open_axes] > (n_cells * a)[open_axes] + 1e-5
+        keep = is_A | ~past_end.any(axis=1)
+        atoms = Atoms(symbols=symbols * len(corners), positions=positions)[keep]
 
-        z_cut = float(a) * float(nz)
-        pos = atoms.get_positions()
-        keep = pos[:, 2] <= (z_cut + 1e-5)
-        atoms = atoms[keep]
+        if is_organic:
+            ids = np.repeat(np.arange(len(corners)), len(symbols))
+            ids[~is_A] = -1
+            atoms.set_array("a_site_id", ids[keep])
 
-        if is_organic_A:
-            n_framework = len(atoms)
-            a_symbols: List[str] = []
-            a_positions: List[np.ndarray] = []
-            a_ids: List[int] = []
-            next_a_id = 0
-            for i in range(nx):
-                for j in range(ny):
-                    for k in range(nz + 1):
-                        center = np.array([i, j, k], dtype=float) * float(a)
-                        if center[2] > z_cut + 1e-5:
-                            continue
-                        next_a_id = cls._append_A_site(
-                            a_symbols, a_positions, a_ids,
-                            center, True, A_template, next_a_id,
-                        )
+        if periodic.any():
+            atoms.set_cell(n_cells * a + [0.0, 0.0, float(vacuum)])
+            atoms.pbc = periodic
 
-            atoms += Atoms(symbols=a_symbols, positions=np.array(a_positions, dtype=float))
-            ids = np.array([-1] * n_framework + a_ids, dtype=int)
-            atoms.set_array("a_site_id", ids)
-
-        atoms.set_cell([nx * float(a), ny * float(a), nz * float(a) + float(vacuum)])
-        atoms.pbc = [True, True, False]
-
-        if is_organic_A:
-            A_site = cls._build_A_ligands(atoms, A_template)
-        else:
-            A_site = A_label
-
-        slab = cls(
-            A=A_site,
+        core = cls(
+            A=cls._build_A_ligands(atoms, template) if is_organic else A,
             B=B,
             X=X,
             atoms=atoms,
-            a=float(a),
-            supercell=(nx, ny, nz),
-            vacuum=float(vacuum),
+            a=a,
+            supercell=tuple(n_cells.tolist()),
+            vacuum=float(vacuum) if periodic.any() else None,
         )
-        return slab
 
+        if charge_neutral and not periodic.any():
+            core._neutralize(random_seed)
 
-    @staticmethod
-    def _resolve_A_site(A: str | Ligand) -> Tuple[bool, object, str]:
-        if isinstance(A, Ligand):
-            template = A.clone()
-            template.atoms.positions -= template.atoms.get_positions().mean(axis=0)
-            label = A.name if A.name is not None else template.atoms.get_chemical_formula()
-            return True, template, label
-        return False, A, A
-
-
-    @staticmethod
-    def _append_A_site(
-        symbols: List[str],
-        positions: List[np.ndarray],
-        ids: List[int],
-        center: np.ndarray,
-        is_organic: bool,
-        A_template: object,
-        next_id: int,
-    ) -> int:
-        if is_organic:
-            for sym, rel in zip(A_template.atoms.get_chemical_symbols(),
-                                A_template.atoms.get_positions()):
-                symbols.append(sym)
-                positions.append(center + rel)
-                ids.append(next_id)
-        else:
-            symbols.append(A_template)
-            positions.append(center)
-            ids.append(next_id)
-        return next_id + 1
+        return core
 
 
     def _remove(self, indices: Sequence[int]) -> None:
@@ -481,28 +298,27 @@ class Core:
 
 
     @staticmethod
-    def a_site_from_json(meta: str | dict, atoms: Atoms):
+    def a_site_from_json(meta: str | dict, atoms: Atoms, B: str, X: str):
         """
         Reconstruct the A-site value from `a_site_metadata`.
 
-        For an inorganic A-site returns the element symbol. For an organic A-site
-        returns a list of placed Ligand instances and sets the "a_site_id" array
-        on `atoms` (A-site molecules are the first, contiguously grouped atoms).
+        For an inorganic A-site returns the element symbol. For an organic A-site returns a
+        list of placed Ligand instances and sets the "a_site_id" array on `atoms`: the
+        cations are the atoms that are neither B nor X, one molecule after another.
         """
         if not isinstance(meta, dict):
             return str(meta)
 
         lmeta = meta["ligand"]
-        n_inst = int(meta["n_instances"])
         n_atoms = int(lmeta["n_atoms"])
 
+        cation_atoms = np.flatnonzero(~np.isin(atoms.numbers, [atomic_numbers[B], atomic_numbers[X]]))
         ids = np.full(len(atoms), -1, dtype=int)
-        for g in range(n_inst):
-            ids[g * n_atoms:(g + 1) * n_atoms] = g
+        ids[cation_atoms] = np.arange(len(cation_atoms)) // n_atoms
         atoms.set_array("a_site_id", ids)
 
         template = Ligand._from_data(
-            atoms=atoms[0:n_atoms],
+            atoms=atoms[cation_atoms[:n_atoms]],
             mol=None,
             smiles=lmeta["smiles"],
             charge=lmeta["charge"],

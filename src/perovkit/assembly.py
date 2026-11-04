@@ -690,7 +690,7 @@ class Assembly:
             )
 
             core = Core(
-                A=Core.a_site_from_json(core_meta["A"], core_atoms),
+                A=Core.a_site_from_json(core_meta["A"], core_atoms, core_meta["B"], core_meta["X"]),
                 B=core_meta["B"],
                 X=core_meta["X"],
                 atoms=core_atoms,
