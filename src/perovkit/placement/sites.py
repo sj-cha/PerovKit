@@ -1,12 +1,14 @@
 from __future__ import annotations
 from collections import Counter
 import math
+import random
 from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
-from ..core import BindingSite
+from ..core import BindingSite, Core
 from ..ligand import Ligand, LigandSpec
+from ..utils.sampling import farthest_point_sampling, per_face_farthest_point_sampling
 from .fitting import Candidate
 
 if TYPE_CHECKING:
@@ -36,6 +38,68 @@ def assign_faces(sites: Sequence[BindingSite]) -> List[tuple]:
         for k, i in enumerate(sorted(idx, key=lambda i: tuple(sites[i].position))):
             faces[i] = options[k % len(options)]
     return faces
+
+
+def take_sites(
+    core: Core,
+    spec: LigandSpec,
+    sites: List[BindingSite],
+    rng: random.Random,
+    displaced: List[int],
+    log: Callable,
+) -> List[Tuple[Ligand, BindingSite]]:
+    """
+    Take free sites for a single-motif spec, those it names or else as many as its
+    coverage asks for, spread by farthest-point sampling. The site type is `spec.site`,
+    or else A for a cation and X otherwise. Returns a copy of the ligand for each site;
+    the surface atoms the ligands replace are added to `displaced`.
+    """
+    lig = spec.ligand
+    kind = spec.site if spec.site is not None else ("A" if lig.charge > 0 else "X")
+    symbol = core.site_symbols[kind]
+    available = [s for s in sites if s.symbol == symbol and not s.passivated]
+
+    if spec.binding_sites is not None:
+        chosen_sites = []
+        for idx in spec.binding_sites:
+            site = next((s for s in available if idx in s.atom_indices), None)
+            if site is None:
+                print(f"[Warning] Requested binding site index {idx} not available for ligand {lig.name}.")
+            elif site not in chosen_sites:
+                chosen_sites.append(site)
+    else:
+        if 0.0 < spec.coverage <= 1.0:
+            n_target = int(math.ceil(spec.coverage * len(available)))
+        else:
+            n_target = int(spec.coverage)
+            if n_target > len(available):
+                print(f"[Warning] Requested {n_target} sites for ligand, "
+                      f"but only {len(available)} available.")
+                n_target = len(available)
+
+        coords = np.array([s.position for s in available])
+        sc = core.supercell
+        if core.is_nanocrystal and sc is not None and len(set(sc)) > 1:
+            planes = [s.plane for s in available]
+            chosen_indices = per_face_farthest_point_sampling(coords, planes, n_target, rng)
+        else:
+            chosen_indices = farthest_point_sampling(coords, n_target, rng)
+        chosen_sites = [available[i] for i in chosen_indices]
+
+    taken = []
+    for site in chosen_sites:
+        clone = lig.clone()
+        clone.planes = [site.plane]
+        clone._anchor_offset = float(spec.anchor_offset)
+        site.passivated = True
+        taken.append((clone, site))
+        # Replace mode removes the surface atom(s); adsorb mode keeps them.
+        if not spec.adsorb:
+            displaced.extend(site.atom_indices)
+
+    mode = "Adsorbed" if spec.adsorb else "Placed"
+    log(f"[Log] {mode} total {len(chosen_sites)} {kind}-site ligands.")
+    return taken
 
 
 def motif_pools(

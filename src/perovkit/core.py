@@ -1,7 +1,6 @@
 from __future__ import annotations
-from copy import deepcopy
 from dataclasses import InitVar, dataclass, field
-from typing import Dict, Tuple, List, Optional, Sequence
+from typing import TYPE_CHECKING, Dict, Tuple, List, Optional, Sequence
 from collections import defaultdict
 
 import random
@@ -10,10 +9,13 @@ from ase import Atoms
 from scipy.spatial import cKDTree
 from ase.data import covalent_radii, atomic_numbers
 
-from .io import write_structure
-from .ligand import Ligand, BindingMotif, LigandSpec
+from .io.structure import write_structure
+from .ligand import Ligand, LigandSpec
 from .utils.box import Box
 from .utils.rotation import rotation_about_axis, rotation_from_u_to_v
+
+if TYPE_CHECKING:
+    from .assembly import Assembly
 
 @dataclass
 class Core:
@@ -67,6 +69,11 @@ class Core:
     @property
     def box(self) -> Box:
         return Box(self.atoms.cell.lengths(), self.atoms.pbc)
+
+    @property
+    def site_symbols(self) -> Dict[str, str]:
+        """Symbol of the binding sites of each sublattice."""
+        return {"A": self.A_label, "B": self.B, "X": self.X}
 
     @property
     def A_label(self) -> str:
@@ -271,63 +278,6 @@ class Core:
         return ligands
 
 
-    def a_site_metadata(self) -> str | dict:
-        """
-        Serialize the A-site for JSON.
-
-        Returns the element symbol for an inorganic A-site, or a dict carrying the
-        molecular cation's Ligand information (one type, repeated `n_instances`
-        times) for an organic A-site. Inverse of `a_site_from_json`.
-        """
-        if not isinstance(self.A, list):
-            return self.A
-
-        lig = self.A[0]
-        return {
-            "label": self.A_label,
-            "kind": "molecular",
-            "n_instances": len(self.A),
-            "ligand": {
-                **lig._type_metadata(),
-                "n_atoms": len(lig.atoms),
-                "volume": float(lig.volume) if lig.volume is not None else None,
-            },
-        }
-
-
-    @staticmethod
-    def a_site_from_json(meta: str | dict, atoms: Atoms, B: str, X: str):
-        """
-        Reconstruct the A-site value from `a_site_metadata`.
-
-        For an inorganic A-site returns the element symbol. For an organic A-site returns a
-        list of placed Ligand instances and sets the "a_site_id" array on `atoms`: the
-        cations are the atoms that are neither B nor X, one molecule after another.
-        """
-        if not isinstance(meta, dict):
-            return str(meta)
-
-        lmeta = meta["ligand"]
-        n_atoms = int(lmeta["n_atoms"])
-
-        cation_atoms = np.flatnonzero(~np.isin(atoms.numbers, [atomic_numbers[B], atomic_numbers[X]]))
-        ids = np.full(len(atoms), -1, dtype=int)
-        ids[cation_atoms] = np.arange(len(cation_atoms)) // n_atoms
-        atoms.set_array("a_site_id", ids)
-
-        template = Ligand._from_data(
-            atoms=atoms[cation_atoms[:n_atoms]],
-            mol=None,
-            smiles=lmeta["smiles"],
-            charge=lmeta["charge"],
-            binding_motif=BindingMotif._from_metadata(lmeta),
-            name=lmeta["name"],
-            volume=lmeta.get("volume"),
-            binding_atoms=list(map(int, lmeta.get("binding_atoms_indices", []))),
-        )
-        return Core._build_A_ligands(atoms, template)
-
-
     def perturb(
         self, 
         bound: Sequence[float], 
@@ -413,10 +363,8 @@ class Core:
         Returns:
             Assembly: the core with its ligands.
         """
-        from .assembly import Assembly
-        assembly = Assembly(core=deepcopy(self), ligand_specs=list(ligand_specs))
-        assembly._place_ligands(**kwargs)
-        return assembly
+        from .placement import place_ligands
+        return place_ligands(self, ligand_specs, **kwargs)
 
 
     def place_ligands_manually(self, ligand_specs: Sequence[LigandSpec], **kwargs) -> Assembly:
@@ -436,10 +384,8 @@ class Core:
         Returns:
             Assembly: the core with its ligands.
         """
-        from .assembly import Assembly
-        assembly = Assembly(core=deepcopy(self), ligand_specs=list(ligand_specs))
-        assembly._place_ligands_manually(**kwargs)
-        return assembly
+        from .placement import place_ligands_manually
+        return place_ligands_manually(self, ligand_specs, **kwargs)
 
 
     def to(
