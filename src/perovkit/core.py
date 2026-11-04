@@ -12,6 +12,7 @@ from ase.data import covalent_radii, atomic_numbers
 
 from .io import write_structure
 from .ligand import Ligand, BindingMotif, LigandSpec
+from .utils.rotation import rotation_about_axis, rotation_from_u_to_v
 
 @dataclass
 class Core:
@@ -81,7 +82,8 @@ class Core:
         pbc: bool | Sequence[bool],
         vacuum: float = 15.0,
         charge_neutral: bool = True,
-        random_seed: Optional[int] = None,
+        random_seed: Optional[int] = 42,
+        A_site_disorder: str = "balanced",
     ) -> Core:
         """
         Build an ABX3 core periodic along the axes given by `pbc` (as in ASE, one bool for
@@ -99,7 +101,12 @@ class Core:
             charge_neutral (bool): Remove surface A cations to ensure charge neutrality, corners
                                    first, then others at random (nanocrystal only).
             random_seed (Optional[int]): Seed for choosing which surface A cations to remove
-                                         (nanocrystal only).
+                                         (nanocrystal only) and for `A_site_disorder`.
+            A_site_disorder (str): Orientation of organic A cations, each about its own center
+                                   and with a random spin about its axis (+z of the Ligand as
+                                   it was passed). "balanced": random axes, half of them the
+                                   opposite of the other half, which leaves no net dipole
+                                   along them. "random": random axes. "none": all as passed.
 
         Returns:
             A Core instance.
@@ -109,6 +116,8 @@ class Core:
             raise ValueError(f"pbc must be False (nanocrystal) or (True, True, False) (slab); got {pbc}")
         if len(supercell) != 3 or min(supercell) <= 0:
             raise ValueError(f"supercell must be three positive integers (nx, ny, nz); got {supercell}")
+        if A_site_disorder not in ("balanced", "random", "none"):
+            raise ValueError(f"A_site_disorder must be 'balanced', 'random' or 'none'; got {A_site_disorder!r}")
         n_cells = np.array(supercell, dtype=int)
         a = float(a)
 
@@ -168,6 +177,8 @@ class Core:
 
         if charge_neutral and not periodic.any():
             core._neutralize(random_seed)
+        if is_organic and A_site_disorder != "none":
+            core._disorder_A_sites(A_site_disorder, random_seed)
         core._build_surface()
 
         return core
@@ -213,6 +224,32 @@ class Core:
 
         if isinstance(self.A, list):
             self.A = self._build_A_ligands(self.atoms, self.A[0])
+
+
+    def _disorder_A_sites(self, mode: str, random_seed: Optional[int]) -> None:
+        """
+        Turn every organic A-site cation about its center: its +z axis to a random direction,
+        with an odd one out for "balanced" if the number of cations is odd, and by a random
+        spin about that axis.
+        """
+        rng = np.random.default_rng(random_seed)
+        cations = self._A_sites()
+
+        axes = rng.normal(size=(len(cations), 3))
+        axes /= np.linalg.norm(axes, axis=1, keepdims=True)
+        if mode == "balanced":
+            half = len(cations) // 2
+            axes[half:2 * half] = -axes[:half]
+            rng.shuffle(axes)
+
+        positions = self.atoms.get_positions()
+        z = np.array([0.0, 0.0, 1.0], dtype=float)
+        for (center, idx), axis, spin in zip(cations, axes, rng.uniform(0.0, 2.0 * np.pi, len(cations))):
+            R = rotation_about_axis(axis, spin) @ rotation_from_u_to_v(z, axis)
+            positions[idx] = center + (positions[idx] - center) @ R.T
+
+        self.atoms.set_positions(positions)
+        self.A = self._build_A_ligands(self.atoms, self.A[0])
 
 
     @staticmethod
