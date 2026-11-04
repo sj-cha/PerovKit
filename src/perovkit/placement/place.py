@@ -55,16 +55,15 @@ def place_ligands(
 
     displaced: List[int] = []
     poses: List[SingleMotifPose | MultiMotifPose] = []
-    sampler: Optional[ConstellationSampler] = None
+    # made even without multi-motif ligands, so that a misspelled option fails at once
+    sampler = ConstellationSampler(
+        core_positions, box, rng,
+        displaced=displaced, overlap_cutoff=overlap_cutoff,
+        max_rmsd=max_anchor_rmsd, sites=sites, **sampler_options,
+    )
 
     for spec in specs:
         if spec.ligand.n_motifs > 1:
-            if sampler is None:
-                sampler = ConstellationSampler(
-                    core_positions, box, rng,
-                    displaced=displaced, overlap_cutoff=overlap_cutoff,
-                    max_rmsd=max_anchor_rmsd, sites=sites, **sampler_options,
-                )
             pools, by_type = motif_pools(spec, sites, core.site_symbols)
             for lig_cloned, cand in select_constellations(spec, pools, by_type, sampler, log,
                                                           refine=refine_torsions):
@@ -73,17 +72,17 @@ def place_ligands(
                     displaced.extend(cand.atom_indices)
             continue
 
-        if sampler is not None:
-            # sites under a multi-motif ligand cannot take one more
-            n_blocked = sampler.block_covered(sites, overlap_cutoff + 1.0)
-            if n_blocked:
-                log(f"[Log] Left out {n_blocked} free sites covered by multi-motif ligands.")
+        # sites under a multi-motif ligand cannot take one more
+        n_blocked = sampler.block_covered(sites, overlap_cutoff + 1.0)
+        if n_blocked:
+            log(f"[Log] Left out {n_blocked} free sites covered by multi-motif ligands.")
 
         for lig_cloned, site in take_sites(core, spec, sites, rng, displaced, log):
             poses.append(SingleMotifPose(lig_cloned, np.array(site.plane, dtype=float),
                                   np.array(site.position, dtype=float)))
 
-    assert poses, "No ligands to place."
+    if not poses:
+        raise RuntimeError("No ligands to place.")
 
     core_tree, _ = box.tree(np.delete(core_positions, displaced, axis=0))
     contacts = Contacts(core_tree, box, overlap_cutoff)
@@ -142,7 +141,8 @@ def place_ligands_manually(
     displaced: List[int] = []
     placed = [pair for spec in specs
               for pair in take_sites(core, spec, sites, rng, displaced, log)]
-    assert placed, "No ligands to place."
+    if not placed:
+        raise RuntimeError("No ligands to place.")
 
     moved = set(range(len(placed))) if ligand_ids is None else {int(i) for i in ligand_ids}
     unknown = sorted(moved - set(range(len(placed))))
@@ -172,7 +172,7 @@ def _assemble(
 ) -> Assembly:
     """
     Give the ligands their coordinates and ids, and put them on a copy of `core` without
-    the `displaced` atoms.
+    the `displaced` atoms, keeping the core's octahedra and lattice coordinates.
     """
     max_z = 0
     for i, (lig, coords) in enumerate(zip(ligands, coords_list)):
@@ -198,7 +198,11 @@ def _assemble(
         vacuum=core.vacuum,
         build_surface=False,
     )
-    stripped._build_octahedra()
+    # the core's own octahedra, renumbered: strain or tilt can defeat a distance search
+    new = np.cumsum(keep) - 1
+    stripped.octahedra = {int(new[b]): {"X": [int(new[x]) for x in octa["X"] if keep[x]], "Ligand": []}
+                          for b, octa in core.octahedra.items() if keep[b]}
+    stripped.B_ijk = {int(new[b]): ijk for b, ijk in core.B_ijk.items() if keep[b]}
     _assign_to_octahedra(stripped, ligands)
 
     return Assembly(core=stripped, ligands=list(ligands),

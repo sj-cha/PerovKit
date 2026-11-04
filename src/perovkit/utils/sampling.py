@@ -13,6 +13,8 @@ def farthest_point_sampling(
     initial_idx: int | None = None,
 ) -> List[int]:
     n = coords.shape[0]
+    if n_target <= 0:
+        return []
     if n_target >= n:
         return list(range(n))
 
