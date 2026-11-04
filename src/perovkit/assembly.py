@@ -157,14 +157,12 @@ class Assembly:
             stripped_atoms.set_cell(old.atoms.get_cell())
             stripped_atoms.cell[2, 2] = max_z + old.vacuum
 
-        # Rebuild the A-site. For an organic A-site, replacing a surface cation
-        # removes its molecule, so re-derive the surviving cations from the
-        # preserved a_site_id grouping; otherwise keep the symbol.
+        # An organic A-site loses a molecule with each surface cation replaced: re-derive the
+        # surviving cations from the preserved a_site_id grouping
         A_value = old.A
-        if "a_site_id" in old.atoms.arrays:
+        if isinstance(old.A, list):
             stripped_atoms.set_array("a_site_id", old.atoms.get_array("a_site_id")[keep])
-            if isinstance(old.A, list) and old.A:
-                A_value = Core._build_A_ligands(stripped_atoms, old.A[0])
+            A_value = Core._build_A_ligands(stripped_atoms, old.A[0])
 
         self.core = Core(
             A=A_value,
@@ -177,7 +175,6 @@ class Assembly:
             build_surface=False,
         )
         self.core._build_octahedra()
-        self.core._build_B_ijk()
 
         self._assign_ligands_to_octahedra()
         self._link_atoms()
@@ -484,13 +481,7 @@ class Assembly:
         syms = np.array(at.get_chemical_symbols())
         b_idx = np.where(syms == self.core.B)[0]
 
-        if self.core.is_slab:
-            cell = at.get_cell()
-            boxsize = tuple(cell.lengths())
-            core_pos = at.get_scaled_positions(wrap=True) @ cell.array
-        else:
-            boxsize = None
-            core_pos = at.get_positions()
+        core_pos, boxsize = self.core._box_positions()
         B_pos = core_pos[b_idx]
 
         anchor_positions = []
