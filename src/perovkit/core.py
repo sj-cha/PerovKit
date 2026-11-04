@@ -1,6 +1,6 @@
 from __future__ import annotations
 from copy import deepcopy
-from dataclasses import dataclass, field
+from dataclasses import InitVar, dataclass, field
 from typing import Dict, Tuple, List, Optional, Sequence
 from collections import defaultdict
 
@@ -20,14 +20,15 @@ class Core:
     Currently only supports cubic phase for inorganic perovskites.
 
     Attributes:
-        A, B, X (str): Chemical symbols for A-, B-, and X-site species.
+        A (str | List[Ligand]): Chemical symbol of the A-site, or its organic cations.
+        B, X (str): Chemical symbols of the B- and X-site species.
         atoms (ASE Atoms): ASE Atoms object of Core
         a (float): Cubic lattice constant (Å).
         supercell (Tuple[int, int, int]): Number of repeating unit cells along x, y, z (nx, ny, nz).
         vacuum (float): Vacuum thickness (Å) along a z-direction (used for slabs).
         octahedra (Dict[int, Dict[str, List[int]]]): Map B-atom index -> {"X": [...], "Ligand": [...]}.
         B_ijk (Dict[int, Tuple[int, int, int]]): Map B-atom index -> integer lattice coordinates.
-        build_surface (bool): Whether to compute Core metadata (surface atoms, binding sites, octahedra) on initialization. 
+        build_surface (bool): Whether to find the binding sites and octahedra on initialization.
         binding_sites (List[BindingSite]): List of surface binding sites.
     """
     A: str | List[Ligand]
@@ -42,27 +43,16 @@ class Core:
     octahedra: Dict[int, Dict[str, List[int]]] = field(default_factory=dict)
     B_ijk: Dict[int, Tuple[int, int, int]] = field(default_factory=dict)
 
-    build_surface: bool = True
+    build_surface: InitVar[bool] = True
     binding_sites: List[BindingSite] = field(default_factory=list)
-    _surface_atoms: Dict[str, np.ndarray] = field(init=False)
-    _plane_atoms: Dict[Tuple[int, int, int], Dict[str, List[int]]] = field(default_factory=dict)
 
-    def __post_init__(self):
-        if self.supercell is not None:
-            if len(self.supercell) != 3:
-                raise ValueError(f"supercell must be length-3 (nx, ny, nz); got {self.supercell}")
-            self.supercell = tuple(int(x) for x in self.supercell)
+    def __post_init__(self, build_surface: bool):
+        if build_surface:
+            self._build_surface()
 
-        if self.build_surface:
-            self._surface_atoms = self._get_surface_atoms()
-            self.binding_sites = self._build_binding_sites()
-            self._build_octahedra()
-            self._build_B_ijk()
-        else:
-            self._surface_atoms = {}
-            self.binding_sites = []
-            self.octahedra = {}
-            self.B_ijk = {}
+    def _build_surface(self) -> None:
+        self.binding_sites = self._build_binding_sites()
+        self._build_octahedra()
 
     @property
     def is_slab(self) -> bool:
@@ -173,39 +163,23 @@ class Core:
             a=a,
             supercell=tuple(n_cells.tolist()),
             vacuum=float(vacuum) if periodic.any() else None,
+            build_surface=False,
         )
 
         if charge_neutral and not periodic.any():
             core._neutralize(random_seed)
+        core._build_surface()
 
         return core
 
 
-    def _remove(self, indices: Sequence[int]) -> None:
-        indices = np.asarray(list(indices), dtype=int)
-        if indices.size == 0:
-            return
-
-        mask = np.ones(len(self.atoms), dtype=bool)
-        mask[indices] = False
-        self.atoms = self.atoms[mask]
-
-        if isinstance(self.A, list):
-            template = self.A[0] if self.A else None
-            self.A = self._build_A_ligands(self.atoms, template) if template else []
-
-        if self.build_surface:
-            self._surface_atoms = self._get_surface_atoms()
-            self.binding_sites = self._build_binding_sites()
-            self._build_octahedra()
-            self._build_B_ijk()
-
-
     def _A_sites(self) -> List[Tuple[np.ndarray, np.ndarray]]:
+        """
+        Center and atom indices of every A-site cation.
+        """
         positions = self.atoms.get_positions()
         if isinstance(self.A, list):
-            return [(positions[np.asarray(lig.indices, dtype=int)].mean(axis=0),
-                     np.asarray(lig.indices, dtype=int)) for lig in self.A]
+            return [(positions[lig.indices].mean(axis=0), lig.indices) for lig in self.A]
 
         symbols = np.array(self.atoms.get_chemical_symbols())
         a_idx = np.where(symbols == self.A)[0]
@@ -214,7 +188,7 @@ class Core:
 
     def _neutralize(self, random_seed: Optional[int] = None) -> None:
         """
-        Remove whole surface A-site cations until the Core is charge neutral.
+        Remove whole surface A-site cations until the nanocrystal is charge neutral.
 
         Each A-site cation carries a formal charge of +1, B is +2 and X is -1.
         Corner cations are removed first, then additional surface cations are
@@ -223,39 +197,22 @@ class Core:
         symbols = np.array(self.atoms.get_chemical_symbols())
         cations = self._A_sites()
 
-        net_charge = len(cations) * 1 + int(np.sum(symbols == self.B)) * 2 - int(np.sum(symbols == self.X)) * 1
-        if net_charge <= 0:
+        n_remove = int(len(cations) + 2 * np.sum(symbols == self.B) - np.sum(symbols == self.X))
+        if n_remove <= 0:
             return
 
-        centers = np.array([c[0] for c in cations])
-        pbc = self.atoms.pbc
-        non_periodic = [ax for ax in range(3) if not pbc[ax]]
-        has_periodic = any(pbc)
-        mins, maxs = centers.min(0), centers.max(0)
-
-        tol = 1e-3
-        corner_ids, rest_ids = [], []
-        for i, c in enumerate(centers):
-            plane = self._surface_plane(c, mins, maxs, non_periodic, has_periodic, tol)
-            nz = np.count_nonzero(plane)
-            if non_periodic and nz == len(non_periodic):
-                corner_ids.append(i)
-            elif nz > 0:
-                rest_ids.append(i)
-
-        n_remove = int(net_charge)
-        chosen = list(corner_ids[:n_remove])
+        n_faces = np.count_nonzero(self._surface_planes(np.array([c[0] for c in cations])), axis=1)
+        chosen = np.flatnonzero(n_faces == 3).tolist()[:n_remove]
         if len(chosen) < n_remove:
-            rng = random.Random(random_seed)
-            chosen += rng.sample(sorted(rest_ids), k=n_remove - len(chosen))
+            rest = np.flatnonzero((n_faces > 0) & (n_faces < 3)).tolist()
+            chosen += random.Random(random_seed).sample(rest, k=n_remove - len(chosen))
 
-        self._remove(np.concatenate([cations[i][1] for i in chosen]))
+        keep = np.ones(len(self.atoms), dtype=bool)
+        keep[np.concatenate([cations[i][1] for i in chosen])] = False
+        self.atoms = self.atoms[keep]
 
-        symbols = np.array(self.atoms.get_chemical_symbols())
-        n_A = len(self._A_sites())
-        n_B = int(np.sum(symbols == self.B))
-        n_X = int(np.sum(symbols == self.X))
-        assert n_A * 1 + n_B * 2 - n_X * 1 == 0, "Core is not charge neutral!"
+        if isinstance(self.A, list):
+            self.A = self._build_A_ligands(self.atoms, self.A[0])
 
 
     @staticmethod
@@ -278,7 +235,7 @@ class Core:
 
         Returns the element symbol for an inorganic A-site, or a dict carrying the
         molecular cation's Ligand information (one type, repeated `n_instances`
-        times) for an organic A-site. Inverse of `a_site_from_metadata`.
+        times) for an organic A-site. Inverse of `a_site_from_json`.
         """
         if not isinstance(self.A, list):
             return self.A
@@ -290,7 +247,6 @@ class Core:
             "n_instances": len(self.A),
             "ligand": {
                 **lig._type_metadata(),
-                "charge": int(lig.charge),
                 "n_atoms": len(lig.atoms),
                 "volume": float(lig.volume) if lig.volume is not None else None,
             },
@@ -332,14 +288,14 @@ class Core:
 
     def perturb(
         self, 
-        bound: List[float, float], 
+        bound: Sequence[float], 
         random_seed: int= None
     ):
         """
         Randomly displace every atom by a fraction of its covalent radius.
 
         Args:
-            bound (List[float, float]): bounds on the random displacement as a fraction of the covalent radius (e.g. [0.0, 0.1] for up to 10% displacement).
+            bound (Sequence[float]): bounds on the random displacement as a fraction of the covalent radius (e.g. [0.0, 0.1] for up to 10% displacement).
             random_seed (int): Optional random seed
         """
         if random_seed is not None:
@@ -466,218 +422,84 @@ class Core:
         write_structure(self.atoms, filename, fmt, box=self.is_nanocrystal, vacuum=vacuum, **kwargs)
 
 
-    def _get_surface_atoms(
-        self, 
-    ) -> Dict[str, np.ndarray]:
+    def _surface_planes(self, points: np.ndarray) -> np.ndarray:
         """
-        Identify A- and X-site atoms on non-periodic surfaces.
+        Surface Miller plane (h, k, l) of each of `points`: (N, 3).
 
-        Args:
-            tol: Coordinate tolerance (Å)
-
-        Returns:
-            surface_indices (Dict): Map element symbol -> array of surface atom indices
+        Along a non-periodic axis a point has +1 if it is among the highest of `points`, -1
+        if among the lowest (only for a fully non-periodic structure), else 0. Periodic axes
+        are 0.
         """
-        surface_indices: Dict[str, np.ndarray] = {}
-
-        positions = np.asarray(self.atoms.get_positions(), dtype=float)
-        symbols = np.array(self.atoms.get_chemical_symbols())
         pbc = self.atoms.pbc
-        non_periodic = [i for i in range(3) if not pbc[i]]
-        has_periodic = any(pbc)
-
-        # Organic A-sites (list of Ligands) are not atomic surface sites; only
-        # consider the A symbol when it is an inorganic element.
-        elements = [self.X] if isinstance(self.A, list) else [self.A, self.X]
-        for element in elements:
-            elem_global = np.where(symbols == element)[0]
-            elem_pos = positions[elem_global]
-
-            if elem_pos.size == 0:
-                surface_indices[element] = np.array([], dtype=int)
-                continue
-
-            surface_flags = np.zeros(len(elem_pos), dtype=bool)
-            tol = 1e-3
-            for ax in non_periodic:
-                ax_max = elem_pos[:, ax].max()
-                surface_flags |= np.isclose(elem_pos[:, ax], ax_max, atol=tol)
-                if not has_periodic:
-                    ax_min = elem_pos[:, ax].min()
-                    surface_flags |= np.isclose(elem_pos[:, ax], ax_min, atol=tol)
-
-            surface_indices[element] = elem_global[surface_flags].astype(int)
-
-        return surface_indices
-
-
-    @staticmethod
-    def _surface_plane(point, mins, maxs, non_periodic, has_periodic, tol=1e-3):
-        """
-        Classify a point onto a surface Miller plane (h, k, l).
-
-        Along each non-periodic axis: +1 if the point is at the max, -1 if at the
-        min (only for a fully non-periodic structure), else 0. Periodic axes are 0.
-        """
-        plane = [0, 0, 0]
-        for ax in non_periodic:
-            if np.isclose(point[ax], maxs[ax], atol=tol):
-                plane[ax] = 1
-            elif not has_periodic and np.isclose(point[ax], mins[ax], atol=tol):
-                plane[ax] = -1
-        return tuple(plane)
+        planes = np.zeros(points.shape, dtype=int)
+        for ax in np.flatnonzero(~pbc):
+            if not pbc.any():
+                planes[np.isclose(points[:, ax], points[:, ax].min(), atol=1e-3), ax] = -1
+            planes[np.isclose(points[:, ax], points[:, ax].max(), atol=1e-3), ax] = 1
+        return planes
 
 
     def _build_binding_sites(self) -> List[BindingSite]:
         """
-        Assign each surface atom a Miller index and return BindingSite list.
+        One BindingSite per surface atom, plane by plane. Organic A-site cations are
+        molecules, not single atoms: each surface one is a (molecular) site of its own.
         """
-        surface = self._get_surface_atoms()
-        positions = np.array([a.position for a in self.atoms], dtype=float)
-        symbols = np.array([a.symbol for a in self.atoms])
-        pbc = self.atoms.pbc
-        non_periodic = [i for i in range(3) if not pbc[i]]
-        has_periodic = any(pbc)
+        positions = self.atoms.get_positions()
+        symbols = np.array(self.atoms.get_chemical_symbols())
+        organic = isinstance(self.A, list)
 
-        tol = 1e-3
-        plane_indices = defaultdict(lambda: defaultdict(list))
+        by_plane = defaultdict(lambda: defaultdict(list))
+        for elem in [self.X] if organic else [self.A, self.X]:
+            elem_atoms = np.flatnonzero(symbols == elem)
+            planes = self._surface_planes(positions[elem_atoms])
+            for i, plane in zip(elem_atoms.tolist(), planes.tolist()):
+                if any(plane):
+                    by_plane[tuple(plane)][elem].append(i)
 
-        for elem, idxs in surface.items():
-            elem_global = np.where(symbols == elem)[0]
-            elem_pos = positions[elem_global]
-            if elem_pos.size == 0:
-                continue
+        sites = [BindingSite(index=i, symbol=elem, plane=plane, position=positions[i])
+                 for plane, elems in by_plane.items()
+                 for elem, indices in elems.items()
+                 for i in indices]
 
-            mins, maxs = elem_pos.min(0), elem_pos.max(0)
-
-            for i in idxs:
-                v = self._surface_plane(positions[int(i)], mins, maxs, non_periodic, has_periodic, tol)
-                if np.count_nonzero(v) == 0:
-                    continue
-
-                plane_indices[v][elem].append(int(i))
-
-        self._plane_atoms = {
-            hkl: {elem: idxs for elem, idxs in elems.items()}
-            for hkl, elems in plane_indices.items()
-        }
-
-        idx_to_site: Dict[int, BindingSite] = {}
-        for plane, elem_map in self._plane_atoms.items():
-            for elem, indices in elem_map.items():
-                for idx in indices:
-                    idx = int(idx)
-                    if idx in idx_to_site:
-                        continue
-                    idx_to_site[idx] = BindingSite(index=idx, symbol=elem, plane=plane,
-                                                   position=positions[idx], passivated=False)
-
-        sites = list(idx_to_site.values())
-
-        # Organic A-site cations are molecules, not single atoms: expose each
-        # surface molecule as one (molecular) binding site.
-        if isinstance(self.A, list):
-            sites.extend(
-                self._build_A_molecule_sites(non_periodic, has_periodic, tol)
-            )
+        if organic:
+            a_sites = self._A_sites()
+            planes = self._surface_planes(np.array([center for center, _ in a_sites]))
+            sites.extend(BindingSite(index=idx.tolist(), symbol=self.A_label, plane=tuple(plane), position=center)
+                         for (center, idx), plane in zip(a_sites, planes.tolist()) if any(plane))
 
         return sites
 
 
-    def _build_A_molecule_sites(
-        self,
-        non_periodic: List[int],
-        has_periodic: bool,
-        tol: float,
-    ) -> List[BindingSite]:
+    def _box_positions(self) -> Tuple[np.ndarray, Optional[tuple]]:
         """
-        Build one molecular BindingSite per surface A-site cation (organic A only).
+        Atom positions and the `boxsize` for a KD-tree of them: wrapped into the cell of a
+        periodic structure, as they are otherwise.
         """
-        a_sites = self._A_sites()
-        if not a_sites:
-            return []
-
-        centers = np.array([center for center, _ in a_sites])
-        mins, maxs = centers.min(0), centers.max(0)
-
-        sites: List[BindingSite] = []
-        for center, idx in a_sites:
-            v = self._surface_plane(center, mins, maxs, non_periodic, has_periodic, tol)
-            if np.count_nonzero(v) == 0:
-                continue  # interior molecule, not on a surface
-
-            sites.append(
-                BindingSite(index=[int(i) for i in idx], symbol=self.A_label,
-                            plane=v, position=center, passivated=False)
-            )
-
-        return sites
+        if self.is_nanocrystal:
+            return self.atoms.get_positions(), None
+        cell = self.atoms.get_cell()
+        return self.atoms.get_scaled_positions(wrap=True) @ cell.array, tuple(cell.lengths())
 
 
-    def _build_octahedra(self):
+    def _build_octahedra(self) -> None:
         """
-        Build the octahedral network by finding nearest X neighbors of each B.
+        Build the octahedral network: the nearest X neighbors of each B, and the integer
+        (i, j, k) lattice coordinates of each B.
         """
-        at = self.atoms
-        syms = np.array(at.get_chemical_symbols())
-
+        syms = np.array(self.atoms.get_chemical_symbols())
         b_idx = np.where(syms == self.B)[0]
         x_idx = np.where(syms == self.X)[0]
 
-        if len(b_idx) == 0 or len(x_idx) == 0:
-            self.octahedra = {}
-            return
+        pos, boxsize = self._box_positions()
+        tree = cKDTree(pos[x_idx], boxsize=boxsize)
+        neigh_lists = tree.query_ball_point(pos[b_idx], float(self.a)/2 + 1e-2)
 
-        r_cut = float(self.a)/2 + 1e-2
+        self.octahedra = {int(b): {"X": [int(x_idx[j]) for j in neighbors], "Ligand": []}
+                          for b, neighbors in zip(b_idx, neigh_lists)}
 
-        if any(at.pbc):
-            cell = at.get_cell()
-            Lx, Ly, Lz = cell.lengths()
-
-            scaled = at.get_scaled_positions(wrap=True)
-            pos = scaled @ cell.array
-
-            B_pos = pos[b_idx]
-            X_pos = pos[x_idx]
-
-            tree = cKDTree(X_pos, boxsize=(Lx, Ly, Lz))
-        else:
-            pos = at.get_positions()
-            B_pos = pos[b_idx]
-            X_pos = pos[x_idx]
-
-            tree = cKDTree(X_pos)
-
-        neigh_lists = tree.query_ball_point(B_pos, r_cut)
-
-        octahedra: Dict[int, Dict[str, List[int]]] = {}
-        for b_loc, x_local_list in enumerate(neigh_lists):
-            b_abs = int(b_idx[b_loc])
-            x_abs_list = [int(x_idx[j]) for j in x_local_list]
-            octahedra[b_abs] = {"X": x_abs_list, "Ligand": []}
-
-        self.octahedra = octahedra
-
-
-    def _build_B_ijk(self):
-        """
-        Assign integer (i, j, k) lattice coordinates to each B atom.
-        """
-        if not self.octahedra:
-            self.B_ijk = {}
-            return
-
-        b_keys = np.array(sorted(self.octahedra.keys()), dtype=int)
-        pos = np.asarray(self.atoms.positions, dtype=float)
-        b_pos = pos[b_keys]
-
-        origin = b_pos.min(axis=0, keepdims=True)
-        ijk_arr = np.rint((b_pos - origin) / float(self.a)).astype(int)
-
-        self.B_ijk = {
-            int(b): (int(ijk_arr[i, 0]), int(ijk_arr[i, 1]), int(ijk_arr[i, 2]))
-            for i, b in enumerate(b_keys)
-        }
+        b_pos = self.atoms.positions[b_idx]
+        ijk = np.rint((b_pos - b_pos.min(axis=0)) / float(self.a)).astype(int)
+        self.B_ijk = {int(b): tuple(v) for b, v in zip(b_idx, ijk.tolist())}
 
 
 @dataclass
@@ -702,10 +524,6 @@ class BindingSite:
     passivated: bool = False
 
     @property
-    def is_molecular(self) -> bool:
-        return isinstance(self.index, list)
-
-    @property
     def atom_indices(self) -> List[int]:
         """All atom indices of this site (one for atomic, many for molecular)."""
-        return [int(i) for i in self.index] if self.is_molecular else [int(self.index)]
+        return self.index if isinstance(self.index, list) else [self.index]
