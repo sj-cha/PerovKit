@@ -6,34 +6,23 @@ from typing import Dict, List, Tuple
 import numpy as np
 
 
-def farthest_point_sampling(
-    coords: np.ndarray,
-    n_target: int,
-    rng: random.Random,
-    initial_idx: int | None = None,
-) -> List[int]:
+def farthest_point_sampling(coords: np.ndarray, n_target: int, rng: random.Random) -> List[int]:
+    """
+    `n_target` of the points, starting from a random one, each next the farthest from those
+    taken.
+    """
     n = coords.shape[0]
     if n_target <= 0:
         return []
     if n_target >= n:
         return list(range(n))
 
-    if initial_idx is None:
-        initial_idx = rng.randint(0, n - 1)
-
-    selected = [initial_idx]
-
-    d = np.linalg.norm(coords - coords[initial_idx], axis=1)
-    d[initial_idx] = 0.0
-
+    selected = [rng.randint(0, n - 1)]
+    d = np.linalg.norm(coords - coords[selected[0]], axis=1)
     while len(selected) < n_target:
         next_idx = int(np.argmax(d))
         selected.append(next_idx)
-
-        new_d = np.linalg.norm(coords - coords[next_idx], axis=1)
-        d = np.minimum(d, new_d)
-        d[selected] = 0.0
-
+        d = np.minimum(d, np.linalg.norm(coords - coords[next_idx], axis=1))
     return selected
 
 
@@ -43,11 +32,10 @@ def per_face_farthest_point_sampling(
     n_target: int,
     rng: random.Random,
 ) -> List[int]:
-    """FPS run independently per face, with n_target allocated proportionally."""
-
+    """Farthest-point sampling on every face apart, with n_target shared out in proportion."""
+    # one group per face: (1, 0, 0) and (-1, 0, 0) are opposite faces
     face_groups: Dict[Tuple[int, int, int], List[int]] = defaultdict(list)
     for i, plane in enumerate(planes):
-        # Group by absolute plane (e.g., (1,0,0) and (-1,0,0) are opposite faces)
         face_groups[plane].append(i)
 
     total = len(coords)
@@ -56,25 +44,20 @@ def per_face_farthest_point_sampling(
 
     selected: List[int] = []
     remainder = 0.0
-
-    faces = sorted(face_groups.keys())
-    for face in faces:
+    for face in sorted(face_groups):
         indices = face_groups[face]
-        # Proportional allocation with fractional accumulation
+        # proportional share, the fractions carried on to the next face
         exact = n_target * len(indices) / total + remainder
         n_face = int(math.floor(exact))
         remainder = exact - n_face
         if n_face == 0:
             continue
+        selected.extend(indices[j] for j in farthest_point_sampling(coords[indices], n_face, rng))
 
-        face_coords = coords[indices]
-        face_selected = farthest_point_sampling(face_coords, n_face, rng)
-        selected.extend(indices[j] for j in face_selected)
-
-    # If rounding left us short, fill from unselected sites
+    # what rounding left short comes from the sites not taken
     if len(selected) < n_target:
-        unselected = [i for i in range(total) if i not in set(selected)]
+        taken = set(selected)
+        unselected = [i for i in range(total) if i not in taken]
         rng.shuffle(unselected)
         selected.extend(unselected[:n_target - len(selected)])
-
     return selected

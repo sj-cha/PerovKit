@@ -1,4 +1,4 @@
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 from ase.geometry import find_mic
 import numpy as np
@@ -60,6 +60,25 @@ def _mic_vectors(frames: list, i: np.ndarray, j: np.ndarray) -> np.ndarray:
     return np.stack([_mic(v, c, p) for v, c, p in zip(vecs, cells, pbcs)])
 
 
+def _octahedra(structure, B_sites) -> Tuple[list, bool, dict, dict, set]:
+    """
+    The frames, whether they are a trajectory, the octahedra and lattice coordinates of the
+    first, and the B atoms to consider: those of `B_sites`, all by default.
+    """
+    frames, is_traj = _as_frames(structure)
+    octahedra = frames[0].octahedra
+    b_set = set(B_sites) if B_sites is not None else set(octahedra.keys())
+    return frames, is_traj, octahedra, frames[0].B_ijk, b_set
+
+
+def _table(rows: list, by: list) -> pd.DataFrame:
+    """The rows as a DataFrame sorted by the columns `by`."""
+    df = pd.DataFrame(rows)
+    if not df.empty:
+        df = df.sort_values(by).reset_index(drop=True)
+    return df
+
+
 def _per_row(values: np.ndarray, is_traj: bool) -> list:
     """
     Split (n_frames, n) values into n row entries: (n_frames,) arrays, or scalars for one structure.
@@ -113,23 +132,13 @@ def compute_angles(structure,
     return out if is_traj else out[0]
 
 
-def compute_B_X_B_angles(structure,
-                         B_sites:List=None
-                         ):
+def compute_B_X_B_angles(structure, B_sites: Optional[List[int]] = None) -> pd.DataFrame:
     """
     B-X-B angles (deg) at every X shared by two B sites of `B_sites` (all B by default).
 
     Returns a DataFrame with columns B1, B2, X, B1_ijk, B2_ijk, angles.
     """
-    frames, is_traj = _as_frames(structure)
-    octahedra = frames[0].octahedra
-    B_ijk = frames[0].B_ijk
-
-    # Determine which B atoms to consider
-    if B_sites is not None:
-        b_set = set(B_sites)
-    else:
-        b_set = set(octahedra.keys())
+    frames, is_traj, octahedra, B_ijk, b_set = _octahedra(structure, B_sites)
 
     # Build reverse map: X_index -> list of B indices that contain it
     x_to_b = {}
@@ -142,8 +151,6 @@ def compute_B_X_B_angles(structure,
     # One row for each shared X atom and pair of B atoms holding it
     results = []
     for x_idx, b_list in x_to_b.items():
-        if len(b_list) < 2:
-            continue
         for i in range(len(b_list)):
             for j in range(i + 1, len(b_list)):
                 b1, b2 = b_list[i], b_list[j]
@@ -155,29 +162,16 @@ def compute_B_X_B_angles(structure,
     angles = compute_angles(frames, [(r['B1'], r['X'], r['B2']) for r in results])
     for r, angle in zip(results, _per_row(angles, is_traj)):
         r['angles'] = angle
-
-    df = pd.DataFrame(results)
-    if not df.empty:
-        df = df.sort_values(['B1', 'B2', 'X']).reset_index(drop=True)
-    return df
+    return _table(results, ['B1', 'B2', 'X'])
 
 
-def compute_X_B_X_angles(structure,
-                         B_sites:List=None):
+def compute_X_B_X_angles(structure, B_sites: Optional[List[int]] = None) -> pd.DataFrame:
     """
     X-B-X angles (deg) inside the octahedron of every B in `B_sites` (all B by default).
 
     Returns a DataFrame with columns B, X1, X2, B_ijk, angles.
     """
-    frames, is_traj = _as_frames(structure)
-    octahedra = frames[0].octahedra
-    B_ijk = frames[0].B_ijk
-
-    # Determine which B atoms to consider
-    if B_sites is not None:
-        b_set = set(B_sites)
-    else:
-        b_set = set(octahedra.keys())
+    frames, is_traj, octahedra, B_ijk, b_set = _octahedra(structure, B_sites)
 
     # One row for each pair of X atoms in an octahedron
     results = []
@@ -195,29 +189,16 @@ def compute_X_B_X_angles(structure,
     angles = compute_angles(frames, [(r['X1'], r['B'], r['X2']) for r in results])
     for r, angle in zip(results, _per_row(angles, is_traj)):
         r['angles'] = angle
-
-    df = pd.DataFrame(results)
-    if not df.empty:
-        df = df.sort_values(['B', 'X1', 'X2']).reset_index(drop=True)
-    return df
+    return _table(results, ['B', 'X1', 'X2'])
 
 
-def compute_B_X_distances(structure,
-                          B_sites:List=None):
+def compute_B_X_distances(structure, B_sites: Optional[List[int]] = None) -> pd.DataFrame:
     """
     B-X bond lengths (Å) of the octahedron of every B in `B_sites` (all B by default).
 
     Returns a DataFrame with columns B, X, B_ijk, distances.
     """
-    frames, is_traj = _as_frames(structure)
-    octahedra = frames[0].octahedra
-    B_ijk = frames[0].B_ijk
-
-    # Determine which B atoms to consider
-    if B_sites is not None:
-        b_set = set(B_sites)
-    else:
-        b_set = set(octahedra.keys())
+    frames, is_traj, octahedra, B_ijk, b_set = _octahedra(structure, B_sites)
 
     results = [
         {'B': b_idx, 'X': x_idx, 'B_ijk': B_ijk.get(b_idx)}
@@ -228,16 +209,11 @@ def compute_B_X_distances(structure,
     dists = compute_distances(frames, [(r['B'], r['X']) for r in results])
     for r, d in zip(results, _per_row(dists, is_traj)):
         r['distances'] = d
-
-    df = pd.DataFrame(results)
-    if not df.empty:
-        df = df.sort_values(['B', 'X']).reset_index(drop=True)
-    return df
+    return _table(results, ['B', 'X'])
 
 
-def compute_bond_angle_variance(structure,
-                                B_sites:List=None,
-                                linear_threshold:float=130.0):
+def compute_bond_angle_variance(structure, B_sites: Optional[List[int]] = None,
+                                linear_threshold: float = 130.0) -> pd.DataFrame:
     """
     Bond angle variance (deg^2) of every octahedron: sum of (angle - 90)^2 / (n - 1) over
     its n cis X-B-X angles, i.e. those below `linear_threshold`. For a trajectory the cis
@@ -275,14 +251,13 @@ def compute_bond_angle_variance(structure,
     return variance_df
 
 
-def compute_distortion_index(structure,
-                             B_sites:List=None):
+def compute_distortion_index(structure, B_sites: Optional[List[int]] = None) -> pd.DataFrame:
     """
     Distortion index of every octahedron: mean |d - <d>| / <d> over its B-X bond lengths d.
 
     Returns a DataFrame with columns B, B_ijk, distortion_index.
     """
-    frames, is_traj = _as_frames(structure)
+    frames, _ = _as_frames(structure)
     df = compute_B_X_distances(structure, B_sites)
     if df.empty:
         return pd.DataFrame()
@@ -301,8 +276,7 @@ def compute_distortion_index(structure,
     return pd.DataFrame(results)
 
 
-def compute_quadratic_elongation(structure,
-                                 B_sites:List=None):
+def compute_quadratic_elongation(structure, B_sites: Optional[List[int]] = None) -> pd.DataFrame:
     """
     Quadratic elongation of every complete (6-X) octahedron: mean (d / l_0)^2, with l_0 the
     center-to-vertex distance of a regular octahedron of the same volume. For a trajectory the
@@ -310,15 +284,7 @@ def compute_quadratic_elongation(structure,
 
     Returns a DataFrame with columns B, B_ijk, quadratic_elongation.
     """
-    frames, is_traj = _as_frames(structure)
-    octahedra = frames[0].octahedra
-    B_ijk = frames[0].B_ijk
-
-    # Determine which B atoms to consider
-    if B_sites is not None:
-        b_set = set(B_sites)
-    else:
-        b_set = set(octahedra.keys())
+    frames, is_traj, octahedra, B_ijk, b_set = _octahedra(structure, B_sites)
 
     sites = [(b_idx, entry['X']) for b_idx, entry in octahedra.items()
              if b_idx in b_set and len(entry['X']) == 6]
@@ -330,7 +296,8 @@ def compute_quadratic_elongation(structure,
         v = vecs[:, 6 * k:6 * k + 6]
         dists = np.linalg.norm(v, axis=-1)
 
-        # Robinson l_0: center-to-vertex of a regular octahedron with the same volume as the observed one (V = 4/3 * l_0^3)
+        # Robinson l_0: center-to-vertex distance of the regular octahedron with the
+        # observed volume (V = 4/3 * l_0^3)
         vol = np.array([ConvexHull(vf).volume for vf in v])
         l_0 = (3.0 * vol / 4.0) ** (1.0 / 3.0)
 
@@ -341,8 +308,4 @@ def compute_quadratic_elongation(structure,
             'B_ijk': B_ijk.get(b_idx),
             'quadratic_elongation': quadratic_elongation if is_traj else float(quadratic_elongation[0])
         })
-
-    df = pd.DataFrame(results)
-    if not df.empty:
-        df = df.sort_values('B').reset_index(drop=True)
-    return df
+    return _table(results, 'B')

@@ -4,24 +4,8 @@ from typing import Sequence
 
 import numpy as np
 
-from perovkit import Core, Assembly
-
-
-def _a_cation_groups(core) -> list:
-    """Atom-index groups for organic A-site cation molecules (empty for inorganic A)."""
-    if isinstance(core.A, list):
-        return [np.asarray(lig.indices, dtype=int) for lig in core.A]
-    return []
-
-
-def _rigidify_groups(pos0, pos_new, groups, affine):
-    """
-    Override each atom group with a rigid translation: move the group's center by
-    the affine map and keep its internal geometry fixed (no internal deformation).
-    """
-    for g in groups:
-        c0 = pos0[g].mean(axis=0)
-        pos_new[g] = pos0[g] + (affine(c0) - c0)
+from ..assembly import Assembly
+from ..core import Core
 
 
 def apply_strain(
@@ -29,69 +13,45 @@ def apply_strain(
     strain: Sequence[float],          # (ex, ey, ez)
     strain_ligands: bool = True,
 ):
+    """
+    Stretch `structure` by the fractions (ex, ey, ez) along x, y and z: a slab from the
+    origin, its cell with it, a nanocrystal from the center of its core. Organic A-site
+    cations move rigidly with their centers, and so do the ligands with their anchors
+    unless `strain_ligands`.
+    """
     strain = np.asarray(strain, dtype=float)
     if strain.shape != (3,):
         raise ValueError("Strain must be length-3: (ex, ey, ez)")
-
-    # Deformation gradient (diagonal, no shear)
-    F = np.eye(3, dtype=float)
-    F[0, 0] += strain[0]
-    F[1, 1] += strain[1]
-    F[2, 2] += strain[2]
+    F = np.diag(1.0 + strain)   # deformation gradient, no shear
 
     core = structure if isinstance(structure, Core) else structure.core
-    is_periodic = core.is_slab
-
+    n_core = len(core.atoms)
     pos0 = np.asarray(structure.atoms.get_positions(), dtype=float)
-    a_cation_groups = _a_cation_groups(core)
-
-    if isinstance(structure, Core):
-        if is_periodic:
-            affine = lambda p: p @ F.T
-        else:
-            center = np.mean(pos0, axis=0)
-            affine = lambda p: (p - center) @ F.T + center
-
-        pos_new = affine(pos0)
-        # Organic A-site cations are rigid molecules: translate, don't deform.
-        _rigidify_groups(pos0, pos_new, a_cation_groups, affine)
-
-        structure.atoms.positions[:] = pos_new
-
+    if core.is_slab:
+        affine = lambda p: p @ F.T
     else:
-        # Assembly
-        n_core = len(structure.core.atoms)
+        center = np.mean(pos0[:n_core], axis=0)
+        affine = lambda p: (p - center) @ F.T + center
 
-        if is_periodic:
-            affine = lambda p: p @ F.T
-        else:
-            center = np.mean(pos0[:n_core], axis=0)
-            affine = lambda p: (p - center) @ F.T + center
-
-        if strain_ligands:
-            pos_new = affine(pos0)
-        else:
-            pos_new = pos0.copy()
-            pos_new[:n_core] = affine(pos0[:n_core])
-
-            for lig in structure.ligands:
-                anchor0 = getattr(lig, "anchor_pos", None)
-                if anchor0 is None:
-                    continue
-                anchor0 = np.asarray(anchor0, dtype=float).reshape(3,)
+    if strain_ligands:
+        pos_new = affine(pos0)
+    else:
+        pos_new = pos0.copy()
+        pos_new[:n_core] = affine(pos0[:n_core])
+        for lig in [] if structure is core else structure.ligands:
+            anchor0 = lig.anchor_pos
+            if anchor0 is not None:
                 pos_new[lig.indices] += affine(anchor0) - anchor0
 
-        # Organic A-site cations live in the core block: keep them rigid too.
-        _rigidify_groups(pos0, pos_new, a_cation_groups, affine)
+    for cation in core.A if isinstance(core.A, list) else []:
+        g = cation.indices
+        c0 = pos0[g].mean(axis=0)
+        pos_new[g] = pos0[g] + (affine(c0) - c0)
 
-        # Single write to the shared buffer updates core and all ligands
-        structure.atoms.positions[:] = pos_new
+    structure.atoms.positions[:] = pos_new
 
-    # Update cell for periodic structures
-    if is_periodic:
+    if core.is_slab:
         cell = structure.atoms.get_cell().copy()
-
         for i in range(3):
             cell[i] *= (1 + float(strain[i]))
-
         structure.atoms.set_cell(cell, scale_atoms=False)

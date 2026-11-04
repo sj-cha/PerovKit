@@ -55,11 +55,8 @@ def place_ligands(
     displaced: List[int] = []
     poses: List[SingleMotifPose | MultiMotifPose] = []
     # made even without multi-motif ligands, so that a misspelled option fails at once
-    sampler = ConstellationSampler(
-        core_positions, box, rng,
-        displaced=displaced, overlap_cutoff=overlap_cutoff,
-        max_rmsd=max_anchor_rmsd, sites=sites, **sampler_options,
-    )
+    sampler = ConstellationSampler(core_positions, box, rng, sites, overlap_cutoff=overlap_cutoff,
+                                   max_rmsd=max_anchor_rmsd, **sampler_options)
 
     for spec in specs:
         if spec.ligand.n_motifs > 1:

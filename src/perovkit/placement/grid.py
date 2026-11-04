@@ -32,33 +32,6 @@ def _grid_clearance(x, n_poses, lo, h, shape, table, points, labels, blocked, bo
         out[s] = best
 
 
-@numba.njit(cache=True)
-def _over_sites(x, sites, normals, radii, out):
-    """
-    out[s]: whether pose s of x (S, m, 3) lies over any of `sites` (K, 3): an atom on the
-    outer side of the site's plane (unit `normals`) within its radius of the site laterally.
-    """
-    for s in range(x.shape[0]):
-        hit = False
-        for k in range(sites.shape[0]):
-            for a in range(x.shape[1]):
-                dx = x[s, a, 0] - sites[k, 0]
-                dy = x[s, a, 1] - sites[k, 1]
-                dz = x[s, a, 2] - sites[k, 2]
-                h = dx * normals[k, 0] + dy * normals[k, 1] + dz * normals[k, 2]
-                if h <= 0.0:
-                    continue
-                lx = dx - h * normals[k, 0]
-                ly = dy - h * normals[k, 1]
-                lz = dz - h * normals[k, 2]
-                if lx * lx + ly * ly + lz * lz < radii[a] * radii[a]:
-                    hit = True
-                    break
-            if hit:
-                break
-        out[s] = hit
-
-
 class CoreGrid:
     """
     Cells `h` Å wide over the core, each listing the core atoms (periodic images included)

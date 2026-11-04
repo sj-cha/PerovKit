@@ -131,7 +131,8 @@ class Core(Part):
         if len(supercell) != 3 or min(supercell) <= 0:
             raise ValueError(f"supercell must be three positive integers (nx, ny, nz); got {supercell}")
         if A_site_disorder not in ("balanced", "random", "none"):
-            raise ValueError(f"A_site_disorder must be 'balanced', 'random' or 'none'; got {A_site_disorder!r}")
+            raise ValueError(f"A_site_disorder must be 'balanced', 'random' or 'none'; "
+                             f"got {A_site_disorder!r}")
         n_cells = np.array(supercell, dtype=int)
         a = float(a)
 
@@ -280,16 +281,17 @@ class Core(Part):
 
 
     def perturb(
-        self, 
-        bound: Sequence[float], 
-        random_seed: int= None
+        self,
+        bound: Sequence[float],
+        random_seed: Optional[int] = None,
     ):
         """
         Randomly displace every atom by a fraction of its covalent radius.
 
         Args:
-            bound (Sequence[float]): bounds on the random displacement as a fraction of the covalent radius (e.g. [0.0, 0.1] for up to 10% displacement).
-            random_seed (int): Optional random seed
+            bound (Sequence[float]): Bounds on the displacement as a fraction of the covalent
+                radius (e.g. [0.0, 0.1] for up to 10%).
+            random_seed (Optional[int]): Seed; None draws from numpy's global generator.
         """
         if random_seed is not None:
             rng = np.random.default_rng(random_seed)
@@ -453,7 +455,8 @@ class Core(Part):
         if organic:
             a_sites = self._A_sites()
             planes = self._surface_planes(np.array([center for center, _ in a_sites]))
-            sites.extend(BindingSite(index=idx.tolist(), symbol=self.A_label, plane=tuple(plane), position=center)
+            sites.extend(BindingSite(index=idx.tolist(), symbol=self.A_label, plane=tuple(plane),
+                                     position=center)
                          for (center, idx), plane in zip(a_sites, planes.tolist()) if any(plane))
 
         return sites

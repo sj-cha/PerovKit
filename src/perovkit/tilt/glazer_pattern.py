@@ -1,44 +1,16 @@
 from __future__ import annotations
 
-from typing import Dict, Tuple, Iterable
+from typing import Dict, Iterable, Tuple
 
 import numpy as np
 
 from ..utils.rotation import rotation_about_axis
 
 
-def parse_glazer(glazer: str) -> Tuple[str, str, str]:
-    glazer = glazer.strip()
-    marks = [c for c in glazer if c in ("0", "+", "-")]
-    if len(marks) != 3:
-        raise ValueError(f"Could not parse Glazer '{glazer}'. Expected exactly 3 of 0/+/-.")
-    return marks[0], marks[1], marks[2]
-
-
-def glazer_kvec(pattern: str, axis: int) -> np.ndarray:
-    if pattern == "0":
-        return np.array([0, 0, 0], dtype=int)
-    if pattern == "-":
-        return np.array([1, 1, 1], dtype=int)
-    if pattern == "+":
-        kv = np.array([1, 1, 1], dtype=int)
-        kv[axis] = 0
-        return kv
-
-
-def phase_factor_ijk(ijk: Tuple[int, int, int], kvec: np.ndarray) -> float:
-    n = int(ijk[0] * kvec[0] + ijk[1] * kvec[1] + ijk[2] * kvec[2])
-    return -1.0 if (n % 2) else 1.0
-
-
 def build_ordered_rotmat(angles: np.ndarray, order: str = "xyz") -> np.ndarray:
-    cubic_basis = np.eye(3, dtype=float)
-    ax, ay, az = cubic_basis[:, 0], cubic_basis[:, 1], cubic_basis[:, 2]
-    Rx = rotation_about_axis(ax, float(angles[0]))
-    Ry = rotation_about_axis(ay, float(angles[1]))
-    Rz = rotation_about_axis(az, float(angles[2]))
-    mats = {"x": Rx, "y": Ry, "z": Rz}
-
+    """Turns by `angles` (radians) about x, y and z, in `order` (first letter first)."""
+    basis = np.eye(3, dtype=float)
+    mats = {c: rotation_about_axis(basis[:, k], float(angles[k])) for k, c in enumerate("xyz")}
     R = np.eye(3)
     for c in order:
         R = mats[c] @ R
@@ -52,9 +24,15 @@ def build_octahedra_rotmat(
     b_keys: Iterable[int],
     order: str = "xyz",
 ) -> Dict[int, np.ndarray]:
-    
-    pat_x, pat_y, pat_z = parse_glazer(glazer)
-    patterns = (pat_x, pat_y, pat_z)
+    """
+    Rotation of the octahedron of every B in `b_keys` for the Glazer tilt `glazer` (e.g.
+    "a-b+c0"), by `angles` (degrees) about x, y and z: none for 0; for -, the sign flips
+    from one octahedron to the next along every axis, for +, along the other two only.
+    """
+    glazer = glazer.strip()
+    marks = [c for c in glazer if c in ("0", "+", "-")]
+    if len(marks) != 3:
+        raise ValueError(f"Could not parse Glazer '{glazer}'. Expected exactly 3 of 0/+/-.")
     ang_rad = np.deg2rad(np.array(angles, dtype=float))
 
     R_b: Dict[int, np.ndarray] = {}
@@ -62,15 +40,11 @@ def build_octahedra_rotmat(
         b = int(b)
         ijk = b_ijk[b]
         rot_angle = np.zeros(3, dtype=float)
-
-        for axis, pat in enumerate(patterns):
-            if pat == "0" or abs(ang_rad[axis]) < 1e-16:
-                rot_angle[axis] = 0.0
+        for axis, mark in enumerate(marks):
+            if mark == "0" or abs(ang_rad[axis]) < 1e-16:
                 continue
-            kv = glazer_kvec(pat, axis)
-            s = phase_factor_ijk(ijk, kv)
-            rot_angle[axis] = s * ang_rad[axis]
-
+            flips = [int(mark == "-" or a != axis) for a in range(3)]
+            n = int(ijk[0] * flips[0] + ijk[1] * flips[1] + ijk[2] * flips[2])
+            rot_angle[axis] = (-1.0 if n % 2 else 1.0) * ang_rad[axis]
         R_b[b] = build_ordered_rotmat(rot_angle, order=order)
-
     return R_b

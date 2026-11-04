@@ -237,8 +237,7 @@ class Assembly:
             lig.id = i
             lig._attach(self, "ligand_id", i)
 
-        if core.octahedra is not None:
-            core.octahedra = {new[b]: {"X": [new[x] for x in octa["X"] if x in new],
-                                       "Ligand": [new_id[l] for l in octa["Ligand"] if l in new_id]}
-                              for b, octa in core.octahedra.items() if b in new}
+        core.octahedra = {new[b]: {"X": [new[x] for x in octa["X"] if x in new],
+                                   "Ligand": [new_id[l] for l in octa["Ligand"] if l in new_id]}
+                          for b, octa in core.octahedra.items() if b in new}
         core.B_ijk = {new[b]: ijk for b, ijk in core.B_ijk.items() if b in new}
