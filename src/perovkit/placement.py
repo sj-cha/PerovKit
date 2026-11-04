@@ -277,7 +277,7 @@ def tree_min_distance(core_tree, tree_builder: Callable, neighbors_coords: List[
     tree = tree_builder(np.vstack(neighbors_coords))[0] if neighbors_coords else None
 
     def min_distance(coords: np.ndarray, _neighbors=None) -> float:
-        d_core = float(core_tree.query(coords)[0].min()) if core_tree is not None else float("inf")
+        d_core = float(core_tree.query(coords)[0].min())
         if tree is None:
             return d_core
         return min(d_core, float(tree.query(coords, k=1)[0].min()))
@@ -459,10 +459,7 @@ class Contacts:
         Closest contact of `coords` with the core, and with `neighbors_coords` unless the
         core is already closer than the cutoff.
         """
-        if self.core_tree is not None:
-            d_core = float(np.min(self.core_tree.query(coords)[0]))
-        else:
-            d_core = float("inf")
+        d_core = float(np.min(self.core_tree.query(coords)[0]))
         if d_core < self.cutoff or not neighbors_coords:
             return d_core
 
