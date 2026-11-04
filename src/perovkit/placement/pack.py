@@ -1,8 +1,5 @@
 from __future__ import annotations
-from collections import Counter
-from concurrent.futures import ProcessPoolExecutor
 import math
-import os
 import random
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
@@ -10,195 +7,23 @@ import numpy as np
 from scipy.spatial import cKDTree
 from tqdm.auto import tqdm
 
-from .constellation import Candidate, ConstellationSampler, mean_normal, rotations_about_axis
-from .core import BindingSite
-from .ligand import Ligand, LigandSpec
-from .refine import INTRA_SCALE, K_CONTACT, _intra_pairs, refine, refine_joint, stretch
-from .utils.geometry import compute_bounding_spheres
-from .utils.rotation import rotation_about_axis, rotation_from_u_to_v
-
-
-def place_about_normal(
-    coords_loc: np.ndarray,
-    plane: np.ndarray,
-    site_pos: np.ndarray,
-    anchor_offset: float,
-    theta: float,
-) -> np.ndarray:
-    """
-    Turn an oriented single-motif ligand (body along +z) onto a site normal, spin it by
-    `theta` about that normal and put its anchor on the site, `anchor_offset` above it.
-    """
-    R_align = rotation_from_u_to_v(np.array([0.0, 0.0, 1.0]), plane)
-    R_rot = rotation_about_axis(plane, theta)
-    anchor_pos = site_pos + plane / np.linalg.norm(plane) * float(anchor_offset)
-    return (coords_loc @ R_align.T) @ R_rot.T + anchor_pos
-
-
-class SingleMotifPose:
-    """
-    Single-motif ligand on one site, free to spin about the site normal.
-    """
-    random_start = True
-    spins = True
-    n_variants = 1
-    variant = 0
-
-    def __init__(self, ligand: Ligand, plane: np.ndarray, site_pos: np.ndarray):
-        self.ligand = ligand
-        self.plane = plane
-        self.center = site_pos
-
-    def coords(self, theta: float, variant: int = 0) -> np.ndarray:
-        return place_about_normal(
-            self.ligand.atoms.get_positions(),
-            self.plane,
-            self.center,
-            getattr(self.ligand, "_anchor_offset", 0.0),
-            theta,
-        )
-
-
-class MultiMotifPose:
-    """
-    Multi-motif ligand fitted to a constellation. Variants are coordinates of the
-    candidate's alternative conformer fits, best first, followed by any refined ones;
-    a stretched variant goes first. `origins` says where each came from ("fit",
-    "stretched", "refined", "unstuck", "embedded"); theta is the spin about the anchor axis
-    relative to each.
-    """
-    random_start = False
-
-    def __init__(self, ligand: Ligand, candidate: Candidate):
-        self.ligand = ligand
-        self.candidate = candidate
-        lib = ligand.conformers()
-        self.center = candidate.targets.mean(axis=0)
-        self.axis = candidate.fits[0].axis
-        self.spins = self.axis is not None
-        self.variants = [f.coords(lib) for f in candidate.fits]
-        self.origins = [f.origin for f in candidate.fits]
-        self.variant = 0
-        self.reach = 0.0
-        for x in self.variants:
-            self._extend_reach(x)
-
-    @property
-    def n_variants(self) -> int:
-        return len(self.variants)
-
-    def _extend_reach(self, x: np.ndarray) -> None:
-        # spinning about an axis through the pivot keeps every atom's distance to it
-        self.reach = max(self.reach, float(np.linalg.norm(x - self.center, axis=1).max()))
-
-    def coords(self, theta: float, variant: int = 0) -> np.ndarray:
-        x = self.variants[variant]
-        if not self.spins or theta == 0.0:
-            return x.copy()
-        R = rotations_about_axis(self.axis, np.array([theta]))[0]
-        return (x - self.center) @ R.T + self.center
-
-    def add_variant(self, coords: np.ndarray, origin: str = "refined", first: bool = False) -> int:
-        k = 0 if first else len(self.variants)
-        self.variants.insert(k, np.array(coords, dtype=float))
-        self.origins.insert(k, origin)
-        if first:
-            self.variant += 1
-        self._extend_reach(self.variants[k])
-        return k
-
-
-_WORKER_CORE = None
-
-
-def _single_threaded_blas() -> None:
-    """
-    Run the OpenBLAS that scipy uses on one thread (Linux; silently nothing elsewhere):
-    every L-BFGS step wakes all its threads, which starve each other in a pool of workers.
-    The copy bundled with numpy wheels, which refinement barely uses, is left alone.
-    """
-    import ctypes
-    try:
-        paths = {line.split()[-1] for line in open("/proc/self/maps")
-                 if "openblas" in line and "/numpy.libs/" not in line}
-    except OSError:
-        return
-    for path in paths:
-        try:
-            lib = ctypes.CDLL(path)
-        except OSError:
-            continue
-        for name in ("scipy_openblas_set_num_threads64_", "scipy_openblas_set_num_threads",
-                     "openblas_set_num_threads64_", "openblas_set_num_threads"):
-            if hasattr(lib, name):
-                getattr(lib, name)(1)
-
-
-def _init_stretch_worker(core_points: np.ndarray) -> None:
-    global _WORKER_CORE
-    _single_threaded_blas()
-    _WORKER_CORE = cKDTree(core_points)
-
-
-def _stretch_job(job: tuple, core=None) -> Optional[np.ndarray]:
-    model, coords, groups, targets, normal, contact = job
-    res = stretch(model, coords, groups, targets, normal,
-                  [_WORKER_CORE if core is None else core], contact)
-    return None if res is None else res.coords
-
-
-def available_cpus() -> int:
-    """CPUs this process may run on (a Slurm allocation or taskset included)."""
-    if hasattr(os, "sched_getaffinity"):
-        return len(os.sched_getaffinity(0))
-    return os.cpu_count() or 1
-
-
-def stretch_poses(poses: Sequence, core_tree, cutoff: float, n_workers: int = 1) -> int:
-    """
-    Put a stretched copy of each multi-motif pose's best variant first: its dangling
-    chains anti and raised along the mean normal of its sites, its anchors untouched.
-
-    Stretching sees only the core, so the ligands are independent and, with `n_workers`
-    above 1, go to that many processes (no more than the CPUs available); each builds the
-    core tree once. The result does not depend on `n_workers`.
-
-    Returns:
-        How many poses now start stretched: they had chains to stretch and the result
-        clears the core, or site selection had already stretched them.
-    """
-    multi_motif_poses = [p for p in poses if isinstance(p, MultiMotifPose)]
-    done = sum(p.origins[p.variant] == "stretched" for p in multi_motif_poses)
-    todo = [p for p in multi_motif_poses
-            if p.origins[p.variant] != "stretched" and p.ligand.torsion_model().tails.any()]
-    jobs = [(p.ligand.torsion_model(), p.variants[0], p.ligand.binding_groups,
-             p.candidate.targets, mean_normal(p.candidate.sites), cutoff + 0.2) for p in todo]
-    n_workers = min(n_workers, available_cpus(), len(jobs))
-    if n_workers > 1:
-        with ProcessPoolExecutor(max_workers=n_workers,
-                                 initializer=_init_stretch_worker,
-                                 initargs=(core_tree.data,)) as pool:
-            results = list(pool.map(_stretch_job, jobs,
-                                    chunksize=max(1, len(jobs) // (4 * n_workers))))
-    else:
-        results = [_stretch_job(job, core_tree) for job in jobs]
-    for pose, coords in zip(todo, results):
-        if coords is not None and float(core_tree.query(coords)[0].min()) >= cutoff:
-            pose.variant = pose.add_variant(coords, origin="stretched", first=True)
-            done += 1
-    return done
+from ..refine import INTRA_SCALE, K_CONTACT, intra_pairs, refine, refine_joint
+from .poses import MultiMotifPose
+from .stretch import stretch_poses
 
 
 # Soft-sphere radii (cutoff + margin) tried in turn: a wide margin clears contacts with room
 # to spare but in a dense shell also pushes on contacts already fine; the narrow one acts
 # on the real ones alone.
 MARGINS = (0.2, 0.05)
-# Contact weights, as multiples of refine's default, that refine_clusters tries in turn when
+
+
+# Contact weights, as multiples of refine's default, that bend_clusters tries in turn when
 # the margins fail: anchor springs can hold a ligand a hair below the cutoff against the core.
 STIFFNESS = (1.0, 2.0, 4.0)
 
 
-def refine_pose(
+def bend_pose(
     pose: MultiMotifPose,
     coords: np.ndarray,
     neighbors_coords: List[np.ndarray],
@@ -243,10 +68,26 @@ def intramolecular_contacts(poses: Sequence, coords_list: List[np.ndarray]) -> T
         if not isinstance(pose, MultiMotifPose):
             continue
         model = pose.ligand.torsion_model()
-        n += len(_intra_pairs(model, x[None], INTRA_SCALE)[0])
+        n += len(intra_pairs(model, x[None], INTRA_SCALE)[0])
         d = np.linalg.norm(x[:, None] - x[None], axis=-1)[np.triu(model.far)]
         closest = min(closest, float(d.min()) if d.size else closest)
     return closest, n
+
+
+def compute_bounding_spheres(
+        coords_list: List[np.ndarray],
+    ) -> Tuple[np.ndarray, np.ndarray]:
+
+    n_lig = len(coords_list)
+    centers = np.zeros((n_lig, 3), dtype=float)
+    radii = np.zeros(n_lig, dtype=float)
+
+    for i, coords in enumerate(coords_list):
+        c = coords.mean(axis=0)
+        centers[i] = c
+        radii[i] = np.linalg.norm(coords - c, axis=1).max()
+
+    return centers, radii
 
 
 def bounding_spheres(poses: Sequence, coords_list: List[np.ndarray]) -> Tuple[np.ndarray, np.ndarray]:
@@ -285,7 +126,7 @@ def tree_min_distance(core_tree, tree_builder: Callable, neighbors_coords: List[
     return min_distance
 
 
-def optimize_pose(
+def turn_pose(
     pose,
     neighbors_coords: List[np.ndarray],
     min_distance: Callable,
@@ -351,7 +192,7 @@ def optimize_pose(
     return best_variant, best_coords
 
 
-def refine_clusters(
+def bend_clusters(
     poses: Sequence,
     coords_list: List[np.ndarray],
     core_tree,
@@ -559,10 +400,10 @@ def pack(
     `n_workers` processes) and, if any were, relaxed together. Then, up to `max_iters`
     times, the ligands in conflict and those whose sites lie within `active_radius` of
     theirs turn one by one, in random order, to the spin (and fit variant) that clears their
-    neighbors best (optimize_pose: a scan every `coarse_step_deg`, then every
+    neighbors best (turn_pose: a scan every `coarse_step_deg`, then every
     `fine_step_deg` within `window_deg` of the best). With `refine_torsions`, a multi-motif
     ligand that turning cannot clear is refined in torsion space, and ligands that none can
-    clear alone are refined together (refine_clusters); anchors may end `max_rmsd` Å
+    clear alone are refined together (bend_clusters); anchors may end `max_rmsd` Å
     (RMS) from their sites.
 
     Returns:
@@ -591,7 +432,7 @@ def pack(
 
     # relax the stretched shell together, short of the cutoff; single turns clear the rest
     if n_stretched and refine_torsions:
-        refine_clusters(poses, coords_list, contacts.core_tree, contacts.tree_builder, contacts.mic,
+        bend_clusters(poses, coords_list, contacts.core_tree, contacts.tree_builder, contacts.mic,
                         contacts.exact, cutoff, max_rmsd, stop_at=cutoff - 0.1)
 
     # Rotation optimization loop
@@ -621,7 +462,7 @@ def pack(
             search = contacts.closest
             if multi:
                 search = tree_min_distance(contacts.core_tree, contacts.tree_builder, neighbors_coords)
-            best_variant, best_coords = optimize_pose(
+            best_variant, best_coords = turn_pose(
                 poses[i], neighbors_coords, search, rng, cutoff,
                 coarse_step_deg, fine_step_deg, window_deg,
             )
@@ -630,7 +471,7 @@ def pack(
             # if turning fails, a multi-motif ligand may bend, against every other ligand
             if refine_torsions and multi and d_new < cutoff:
                 others = [c for j, c in enumerate(coords_list) if j != i]
-                refined = refine_pose(poses[i], best_coords, others, contacts.core_tree,
+                refined = bend_pose(poses[i], best_coords, others, contacts.core_tree,
                                       contacts.tree_builder, cutoff, max_rmsd, min_distance)
                 if refined is not None:
                     d_ref = min_distance(refined, others)
@@ -647,7 +488,7 @@ def pack(
 
         if not improved and refine_torsions:
             # nobody could move alone: let jammed multi-motif ligands give way together
-            improved = refine_clusters(
+            improved = bend_clusters(
                 poses, coords_list, contacts.core_tree, contacts.tree_builder, contacts.mic,
                 contacts.exact, cutoff, max_rmsd,
             )
@@ -662,106 +503,3 @@ def pack(
     if global_min < cutoff:
         raise RuntimeError("[Log] Maximum iterations reached without satisfying overlap cutoff.")
     return coords_list
-
-
-def motif_pools(
-    spec: LigandSpec,
-    binding_sites: List[BindingSite],
-    symbol_map: Dict[str, str],
-) -> Tuple[List[List[BindingSite]], Dict[str, List[BindingSite]]]:
-    """
-    Candidate sites of every motif, and the sites of every site type the motifs need.
-    """
-    by_type = {t: [s for s in binding_sites if s.symbol == symbol_map[t]]
-               for t in {m.site for m in spec.ligand.binding_motifs}}
-    return [by_type[m.site] for m in spec.ligand.binding_motifs], by_type
-
-
-def select_constellations(
-    spec: LigandSpec,
-    pools: List[List[BindingSite]],
-    by_type: Dict[str, List[BindingSite]],
-    sampler: ConstellationSampler,
-    log: Callable = print,
-    refine: bool = True,
-) -> List[Tuple[Ligand, Candidate]]:
-    """
-    Choose the constellations of one multi-motif LigandSpec and clone a ligand for each.
-
-    With ``spec.binding_sites`` every entry lists one site atom index per motif, in motif
-    order. Otherwise ``spec.coverage`` is a fraction of the most ligands the free sites
-    can host (or, above 1, a count), spread so that every face holds about the same
-    fraction of its sites (see ConstellationSampler.sample), and seeds are tried until it
-    is met or the surface is exhausted; a shortfall is reported with the reasons seeds were
-    rejected. The first motif's sites set the per-face balance, so it is best given the
-    scarcer site type. With `refine`, constellations whose fits all clash with the core get
-    a torsion-space refinement first.
-    """
-    lig = spec.ligand
-    lib = lig.conformers()
-    replace = not spec.adsorb
-    offset = float(spec.anchor_offset)
-    tm = lig.torsion_model()
-    model = tm if refine else None
-    # the frame's van der Waals radii shadow the sites under it (ConstellationSampler.accept);
-    # chains and rings that torsions turn can still get out of a neighbor's way
-    radii = np.where(tm.frame, tm.radii, 0.0)
-    groups = lig.binding_groups
-    shadowed = sampler.n_shadowed
-    chosen: List[Candidate] = []
-
-    if spec.binding_sites is not None:
-        for group in spec.binding_sites:
-            group = list(group) if isinstance(group, (list, tuple)) else [group]
-            if len(group) != lig.n_motifs:
-                print(f"[Warning] Binding site group {group} for ligand {lig.name} needs one "
-                      f"site index per motif ({lig.n_motifs}). Skipped.")
-                continue
-            sites = [next((s for s in pool if idx in s.atom_indices and not s.passivated), None)
-                     for idx, pool in zip(group, pools)]
-            if any(s is None for s in sites) or len({id(s) for s in sites}) < len(sites):
-                print(f"[Warning] Binding site group {group} is not available for ligand "
-                      f"{lig.name}. Skipped.")
-                continue
-            cand, reason = sampler.fit_sites(lib, sites, offset, replace, model, groups, lig.mol,
-                                             radii)
-            if cand is None:
-                print(f"[Warning] Binding site group {group} rejected for ligand {lig.name}: {reason}.")
-                continue
-            sampler.accept(cand, lib, replace, radii)
-            chosen.append(cand)
-    else:
-        # each site type hosts as many ligands as it has free sites per motif needing it
-        need = Counter(m.site for m in lig.binding_motifs)
-        capacity = min(sum(not s.passivated for s in by_type[t]) // k for t, k in need.items())
-        if 0.0 < spec.coverage <= 1.0:
-            n_target = int(math.ceil(spec.coverage * capacity))
-        else:
-            n_target = int(spec.coverage)
-            if n_target > capacity:
-                print(f"[Warning] Requested {n_target} ligands {lig.name}, but the free sites "
-                      f"host at most {capacity}.")
-                n_target = capacity
-        chosen, failures = sampler.sample(lib, pools, n_target, offset, replace, model, groups,
-                                          lig.mol, radii)
-        if len(sampler.occupancy) > 1:
-            occ = list(sampler.occupancy.values())
-            log(f"[Log] {lig.name} occupancy per face: {min(occ):.2f}-{max(occ):.2f} "
-                f"over {len(occ)} faces.")
-        if len(chosen) < n_target:
-            reasons = ", ".join(f"{r} ({n}x)" for r, n in failures.most_common())
-            print(f"[Warning] Placed {len(chosen)} of {n_target} requested {lig.name} ligands; "
-                  f"rejected seeds: {reasons or 'none left to try'}.")
-
-    mode = "Adsorbed" if spec.adsorb else "Placed"
-    log(f"[Log] {mode} total {len(chosen)} {lig.name} ligands with {lig.n_motifs} motifs "
-        f"({'/'.join(m.site for m in lig.binding_motifs)} sites); {sampler.n_shadowed - shadowed} "
-        f"free sites under them taken out of use.")
-
-    out = []
-    for cand in chosen:
-        clone = lig.clone()
-        clone.planes = [s.plane for s in cand.sites]
-        clone._anchor_offset = offset
-        out.append((clone, cand))
-    return out

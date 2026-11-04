@@ -152,7 +152,7 @@ class ConformerLibrary:
                    reference_energy=reference)
 
 
-def _uff_polish(mol: Chem.Mol, x: np.ndarray, fixed: List[int], max_displ: float = 0.3,
+def uff_polish(mol: Chem.Mol, x: np.ndarray, fixed: List[int], max_displ: float = 0.3,
                 iters: int = 300) -> Tuple[np.ndarray, float]:
     """
     Relax a pose with UFF, `fixed` atoms held in place and other heavy atoms kept within
@@ -206,7 +206,7 @@ def embed_at(mol: Chem.Mol, pins: dict, n_conformers: int = 8, random_seed: int 
     return np.array(out).reshape((-1, m.GetNumAtoms(), 3))
 
 
-def _uff_energy(mol: Chem.Mol, x: np.ndarray) -> float:
+def uff_energy(mol: Chem.Mol, x: np.ndarray) -> float:
     """UFF energy (kcal/mol) of `mol` at positions `x`."""
     m = Chem.Mol(mol)
     m.GetConformer().SetPositions(np.asarray(x, dtype=float))

@@ -12,7 +12,7 @@ from rdkit.Chem import AllChem, rdDetermineBonds, rdMolTransforms
 
 from .conformers import ConformerLibrary
 from .io import write_structure
-from .refine import TorsionModel
+from .torsion import TorsionModel
 from .utils.rotation import rotation_about_axis, rotation_from_u_to_v
 
 
