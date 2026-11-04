@@ -33,7 +33,7 @@ def bend_pose(
     best, best_d = None, -float("inf")
     for margin in CONTACT_MARGINS:
         res = refine(pose.ligand.torsion_model(), coords, pose.ligand.binding_groups,
-                     pose.candidate.targets, trees, contact=cutoff + margin,
+                     pose.candidate.targets, trees, contact_distance=cutoff + margin,
                      stop_at=cutoff + margin / 2, stop_rmsd=max_rmsd)
         if res.anchor_rmsd > max_rmsd:
             continue
@@ -50,15 +50,15 @@ def intramolecular_contacts(poses: Sequence, coords_list: List[np.ndarray]) -> T
     Over the multi-motif ligands: the closest pair of atoms of one ligand four or more bonds
     apart (Å), and how many such pairs are closer than INTRA_SCALE x their summed radii.
     """
-    closest, n = float("inf"), 0
+    min_distance, n = float("inf"), 0
     for pose, x in zip(poses, coords_list):
         if not isinstance(pose, FitPose):
             continue
         model = pose.ligand.torsion_model()
         n += len(intra_pairs(model, x[None], INTRA_SCALE)[0])
         d = np.linalg.norm(x[:, None] - x[None], axis=-1)[np.triu(model.far)]
-        closest = min(closest, float(d.min()) if d.size else closest)
-    return closest, n
+        min_distance = min(min_distance, float(d.min()) if d.size else min_distance)
+    return min_distance, n
 
 
 def compute_bounding_spheres(coords_list: List[np.ndarray]) -> Tuple[np.ndarray, np.ndarray]:
@@ -102,7 +102,7 @@ def tree_min_distance(core_tree, box: Box, neighbors_coords: List[np.ndarray]) -
 
 def turn_pose(
     pose,
-    clearance: Callable,
+    min_distance: Callable,
     rng: random.Random,
     cutoff: float,
     coarse_step_deg: float,
@@ -110,7 +110,7 @@ def turn_pose(
     window_deg: float,
 ) -> Tuple[int, np.ndarray]:
     """
-    Search the spin (and the fit variant) that maximizes `clearance`, the closest contact
+    Search the spin (and the fit variant) that maximizes `min_distance`, the closest contact
     of the coordinates with the core and the neighboring ligands.
 
     Variants are scanned in order and the search stops at the first one whose coarse scan
@@ -127,7 +127,7 @@ def turn_pose(
     theta0 = 2.0 * math.pi * rng.random()
 
     # Coarse search
-    n_coarse = max(int(round(360.0 / coarse_step_deg)), 1) if pose.spins else 1
+    n_coarse = max(int(round(360.0 / coarse_step_deg)), 1) if pose.can_spin else 1
 
     for v in range(pose.n_variants):
         for k in range(n_coarse):
@@ -135,7 +135,7 @@ def turn_pose(
             theta = theta % (2.0 * math.pi)
 
             coords = pose.coords(theta, v)
-            min_d = clearance(coords)
+            min_d = min_distance(coords)
 
             if min_d > best_min_d:
                 best_theta, best_variant, best_min_d, best_coords = theta, v, min_d, coords
@@ -143,7 +143,7 @@ def turn_pose(
         if best_min_d >= cutoff:
             return best_variant, best_coords
 
-    if not pose.spins:
+    if not pose.can_spin:
         return best_variant, best_coords
 
     # Fine search
@@ -157,7 +157,7 @@ def turn_pose(
         theta = (best_theta + delta) % (2.0 * math.pi)
 
         coords = pose.coords(theta, best_variant)
-        min_d = clearance(coords)
+        min_d = min_distance(coords)
 
         if min_d > best_min_d:
             best_theta, best_min_d, best_coords = theta, min_d, coords
@@ -209,7 +209,7 @@ def bend_clusters(
     for i in range(n):
         components.setdefault(root(i), []).append(i)
 
-    def closest(coords, i):
+    def min_distance(coords, i):
         return contacts.exact(coords[i], [c for j, c in enumerate(coords) if j != i])
 
     improved = False
@@ -217,7 +217,7 @@ def bend_clusters(
         members = [i for i in comp if isinstance(poses[i], FitPose)]
         if not members:
             continue
-        before = min(closest(coords_list, i) for i in members)
+        before = min(min_distance(coords_list, i) for i in members)
         if before >= cutoff:
             continue  # nothing to clear: a lone ligand with no contact below the cutoff
         others = [c for j, c in enumerate(coords_list) if j not in members]
@@ -237,7 +237,7 @@ def bend_clusters(
             trial = list(coords_list)
             for i, r in moved:
                 trial[i] = r.coords
-            after = min(closest(trial, i) for i in members)
+            after = min(min_distance(trial, i) for i in members)
             if after > before + 1e-3:
                 for i, r in moved:
                     coords_list[i] = r.coords
@@ -258,7 +258,7 @@ class Contacts:
         self.box = box
         self.cutoff = cutoff
 
-    def closest(self, coords: np.ndarray, neighbors_coords: Optional[List[np.ndarray]]) -> float:
+    def quick(self, coords: np.ndarray, neighbors_coords: Optional[List[np.ndarray]]) -> float:
         """
         Closest contact of `coords` with the core, and with `neighbors_coords` unless the
         core is already closer than the cutoff.
@@ -297,7 +297,7 @@ class Contacts:
         neighbor_map: Dict[int, List[int]],
     ) -> Tuple[float, List[int], np.ndarray]:
         """
-        Closest contact of every ligand with the core and its neighbors (closest).
+        Closest contact of every ligand with the core and its neighbors (quick).
 
         Returns:
             (overall closest contact, ligands closer than the cutoff, contact per ligand)
@@ -309,7 +309,7 @@ class Contacts:
         for i in range(n_lig):
             idxs = neighbor_map.get(i, [])
             neighbors_coords = [coords_list[j] for j in idxs] if idxs else None
-            d_i = self.closest(coords_list[i], neighbors_coords)
+            d_i = self.quick(coords_list[i], neighbors_coords)
             dists[i] = d_i
             global_min = min(global_min, d_i)
             if d_i < self.cutoff:
@@ -401,7 +401,7 @@ def pack(
     global_min, conflict_ligs, dists = contacts.conflicts(coords_list, neighbor_map)
     log(f"[Log] Initial global_min = {global_min:.3f} Å")
 
-    for iter in range(1, max_iters + 1):
+    for iteration in range(1, max_iters + 1):
         if global_min >= cutoff:
             log(f"[Log] Hard cutoff {cutoff:.3f} Å satisfied. Stopping optimization.")
             break
@@ -411,21 +411,21 @@ def pack(
         improved = False
         rng.shuffle(active)
 
-        for i in tqdm(active, desc=f"Optimizing ligand (iter {iter})", disable=not verbose):
+        for i in tqdm(active, desc=f"Optimizing ligand (iter {iteration})", disable=not verbose):
             neighbors_coords = [coords_list[j] for j in neighbor_map.get(i, [])]
 
             # multi-motif ligands need exact contacts, neighbors included even near the core
             multi = isinstance(poses[i], FitPose)
             if multi:
-                clearance = tree_min_distance(contacts.core_tree, contacts.box, neighbors_coords)
-                d_old = clearance(coords_list[i])
+                min_distance = tree_min_distance(contacts.core_tree, contacts.box, neighbors_coords)
+                d_old = min_distance(coords_list[i])
             else:
-                clearance = lambda x: contacts.closest(x, neighbors_coords)
+                min_distance = lambda x: contacts.quick(x, neighbors_coords)
                 d_old = dists[i]
             best_variant, best_coords = turn_pose(
-                poses[i], clearance, rng, cutoff, coarse_step_deg, fine_step_deg, window_deg,
+                poses[i], min_distance, rng, cutoff, coarse_step_deg, fine_step_deg, window_deg,
             )
-            d_new = clearance(best_coords)
+            d_new = min_distance(best_coords)
 
             # if turning fails, a multi-motif ligand may bend, against every other ligand
             if refine_torsions and multi and d_new < cutoff:
@@ -451,7 +451,7 @@ def pack(
 
         neighbor_map = contacts.neighbors(poses, coords_list)
         global_min, conflict_ligs, dists = contacts.conflicts(coords_list, neighbor_map)
-        log(f"[Log] Iter {iter}  global_min = {global_min:.3f} Å")
+        log(f"[Log] Iter {iteration}  global_min = {global_min:.3f} Å")
 
     if global_min < cutoff:
         raise RuntimeError("[Log] Maximum iterations reached without satisfying overlap cutoff.")

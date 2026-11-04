@@ -42,10 +42,10 @@ def _init_stretch_worker(core_points: np.ndarray) -> None:
     _WORKER_CORE = cKDTree(core_points)
 
 
-def _stretch_job(job: tuple, core=None) -> Optional[np.ndarray]:
-    model, coords, groups, targets, normal, contact = job
+def _stretch_job(job: tuple, core_tree=None) -> Optional[np.ndarray]:
+    model, coords, groups, targets, normal, contact_distance = job
     res = stretch(model, coords, groups, targets, normal,
-                  [_WORKER_CORE if core is None else core], contact)
+                  [_WORKER_CORE if core_tree is None else core_tree], contact_distance)
     return None if res is None else res.coords
 
 
@@ -70,9 +70,9 @@ def stretch_poses(poses: Sequence, core_tree, cutoff: float, n_workers: int = 1)
         clears the core, or site selection had already stretched them.
     """
     fit_poses = [p for p in poses if isinstance(p, FitPose)]
-    done = sum(p.origins[p.variant] == "stretched" for p in fit_poses)
+    done = sum(p.sources[p.variant] == "stretched" for p in fit_poses)
     todo = [p for p in fit_poses
-            if p.origins[p.variant] != "stretched" and p.ligand.torsion_model().tails.any()]
+            if p.sources[p.variant] != "stretched" and p.ligand.torsion_model().tails.any()]
     jobs = [(p.ligand.torsion_model(), p.variants[0], p.ligand.binding_groups,
              p.candidate.targets, mean_normal(p.candidate.sites), cutoff + CONTACT_MARGINS[0]) for p in todo]
     n_workers = min(n_workers, available_cpus(), len(jobs))
@@ -86,6 +86,6 @@ def stretch_poses(poses: Sequence, core_tree, cutoff: float, n_workers: int = 1)
         results = [_stretch_job(job, core_tree) for job in jobs]
     for pose, coords in zip(todo, results):
         if coords is not None and float(core_tree.query(coords)[0].min()) >= cutoff:
-            pose.variant = pose.add_variant(coords, origin="stretched", first=True)
+            pose.variant = pose.add_variant(coords, source="stretched", first=True)
             done += 1
     return done

@@ -9,7 +9,7 @@ from .fitting import Candidate
 
 def place_about_normal(
     coords_loc: np.ndarray,
-    plane: np.ndarray,
+    normal: np.ndarray,
     site_pos: np.ndarray,
     anchor_offset: float,
     theta: float,
@@ -18,9 +18,9 @@ def place_about_normal(
     Turn an oriented single-motif ligand (body along +z) onto a site normal, spin it by
     `theta` about that normal and put its anchor on the site, `anchor_offset` above it.
     """
-    R_align = rotation_from_u_to_v(np.array([0.0, 0.0, 1.0]), plane)
-    R_rot = rotation_about_axis(plane, theta)
-    anchor_pos = site_pos + plane / np.linalg.norm(plane) * float(anchor_offset)
+    R_align = rotation_from_u_to_v(np.array([0.0, 0.0, 1.0]), normal)
+    R_rot = rotation_about_axis(normal, theta)
+    anchor_pos = site_pos + normal / np.linalg.norm(normal) * float(anchor_offset)
     return (coords_loc @ R_align.T) @ R_rot.T + anchor_pos
 
 
@@ -29,19 +29,19 @@ class SitePose:
     Single-motif ligand on one site, free to spin about the site normal.
     """
     random_start = True
-    spins = True
+    can_spin = True
     n_variants = 1
     variant = 0
 
-    def __init__(self, ligand: Ligand, plane: np.ndarray, site_pos: np.ndarray):
+    def __init__(self, ligand: Ligand, normal: np.ndarray, site_pos: np.ndarray):
         self.ligand = ligand
-        self.plane = plane
+        self.normal = normal
         self.center = site_pos
 
     def coords(self, theta: float, variant: int = 0) -> np.ndarray:
         return place_about_normal(
             self.ligand.atoms.get_positions(),
-            self.plane,
+            self.normal,
             self.center,
             self.ligand._anchor_offset,
             theta,
@@ -52,7 +52,7 @@ class FitPose:
     """
     Multi-motif ligand fitted to a constellation. Variants are coordinates of the
     candidate's alternative conformer fits, best first, followed by any refined ones;
-    a stretched variant goes first. `origins` says where each came from ("fit",
+    a stretched variant goes first. `sources` says where each came from ("fit",
     "stretched", "refined", "unstuck"); theta is the spin about the anchor axis
     relative to each.
     """
@@ -64,9 +64,9 @@ class FitPose:
         lib = ligand.conformers()
         self.center = candidate.targets.mean(axis=0)
         self.axis = candidate.fits[0].axis
-        self.spins = self.axis is not None
+        self.can_spin = self.axis is not None
         self.variants = [f.coords(lib) for f in candidate.fits]
-        self.origins = [f.origin for f in candidate.fits]
+        self.sources = [f.source for f in candidate.fits]
         self.variant = 0
         self.reach = 0.0
         for x in self.variants:
@@ -82,15 +82,15 @@ class FitPose:
 
     def coords(self, theta: float, variant: int = 0) -> np.ndarray:
         x = self.variants[variant]
-        if not self.spins or theta == 0.0:
+        if not self.can_spin or theta == 0.0:
             return x.copy()
         R = rotation_about_axis(self.axis, theta)
         return (x - self.center) @ R.T + self.center
 
-    def add_variant(self, coords: np.ndarray, origin: str = "refined", first: bool = False) -> int:
+    def add_variant(self, coords: np.ndarray, source: str = "refined", first: bool = False) -> int:
         k = 0 if first else len(self.variants)
         self.variants.insert(k, np.array(coords, dtype=float))
-        self.origins.insert(k, origin)
+        self.sources.insert(k, source)
         if first:
             self.variant += 1
         self._extend_reach(self.variants[k])

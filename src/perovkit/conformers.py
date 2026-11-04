@@ -52,7 +52,7 @@ class ConformerLibrary:
         """Index of the first template: the conformers before it are the embedded ones."""
         return self.n_conformers - self.n_templates
 
-    def unique_id(self, conformer: int) -> int:
+    def canonical(self, conformer: int) -> int:
         """
         The conformer, or the one it mirrors: on a mirror-symmetric surface the two make
         the same attempt.
@@ -157,7 +157,7 @@ class ConformerLibrary:
 
 
 def uff_polish(mol: Chem.Mol, x: np.ndarray, fixed: List[int], max_displ: float = 0.3,
-                iters: int = 300) -> Tuple[np.ndarray, float]:
+                max_iters: int = 300) -> Tuple[np.ndarray, float]:
     """
     Relax a pose with UFF, `fixed` atoms held in place and other heavy atoms kept within
     `max_displ` Å: removes the close contacts torsion moves leave without changing the
@@ -172,13 +172,13 @@ def uff_polish(mol: Chem.Mol, x: np.ndarray, fixed: List[int], max_displ: float 
             ff.UFFAddPositionConstraint(a, 0.0, 1.0e4)
         elif m.GetAtomWithIdx(a).GetAtomicNum() > 1:
             ff.UFFAddPositionConstraint(a, max_displ, 100.0)
-    ff.Minimize(maxIts=iters)
+    ff.Minimize(maxIts=max_iters)
     y = np.array(m.GetConformer().GetPositions())
     return y, AllChem.UFFGetMoleculeForceField(m).CalcEnergy()
 
 
 def embed_at(mol: Chem.Mol, pins: dict, n_conformers: int, random_seed: int,
-             n_threads: int = 0, uff_iters: int = 500) -> np.ndarray:
+             n_threads: int = 0, max_iters: int = 500) -> np.ndarray:
     """
     Conformers of `mol` with the atoms of `pins` (index -> position) where given: ETKDG
     with a coordinate map, relaxed with UFF with those atoms held, superposed on the pins.
@@ -199,7 +199,7 @@ def embed_at(mol: Chem.Mol, pins: dict, n_conformers: int, random_seed: int,
             ff = AllChem.UFFGetMoleculeForceField(m, confId=cid)
             for a in pinned:
                 ff.UFFAddPositionConstraint(a, 0.0, 1.0e4)
-            ff.Minimize(maxIts=uff_iters)
+            ff.Minimize(maxIts=max_iters)
         x = np.array(m.GetConformer(cid).GetPositions())
         # the embedding keeps the pins' distances, not their frame
         P, Q = x[pinned], target

@@ -6,7 +6,7 @@ from scipy.spatial import cKDTree
 
 
 @numba.njit(cache=True)
-def _grid_clearance(x, n_poses, lo, h, shape, table, points, labels, blocked, bound, out):
+def _grid_min_distance(x, n_poses, lo, h, shape, table, points, image_of, blocked, bound, out):
     m = x.shape[0] // n_poses
     for s in range(n_poses):
         best = np.inf
@@ -21,7 +21,7 @@ def _grid_clearance(x, n_poses, lo, h, shape, table, points, labels, blocked, bo
                 a = table[row, k]
                 if a < 0:
                     break
-                if blocked[labels[a]]:
+                if blocked[image_of[a]]:
                     continue
                 dx = x[p, 0] - points[a, 0]
                 dy = x[p, 1] - points[a, 1]
@@ -39,9 +39,9 @@ class CoreGrid:
     of a point is among a handful of candidates.
     """
 
-    def __init__(self, points: np.ndarray, labels: np.ndarray, bound: float, h: float = 1.0):
+    def __init__(self, points: np.ndarray, image_of: np.ndarray, bound: float, h: float = 1.0):
         self.points = np.ascontiguousarray(points, dtype=float)
-        self.labels = np.asarray(labels, dtype=np.int64)
+        self.image_of = np.asarray(image_of, dtype=np.int64)
         self.bound, self.h = float(bound), float(h)
         self.lo = self.points.min(axis=0) - bound
         self.shape = (np.ceil((self.points.max(axis=0) + bound - self.lo) / h).astype(np.int64) + 1)
@@ -53,13 +53,13 @@ class CoreGrid:
         cols = np.arange(len(rows)) - np.repeat(np.cumsum(lens) - lens, lens)
         self.table[rows, cols] = np.concatenate([np.asarray(l, dtype=np.int64) for l in lists if l])
 
-    def clearance(self, coords: np.ndarray, blocked: np.ndarray) -> np.ndarray:
+    def min_distance(self, coords: np.ndarray, blocked: np.ndarray) -> np.ndarray:
         """
-        Per-pose distance to the nearest core atom whose label is not `blocked`: (S,) for
-        (S, m, 3), inf where none is within `bound`.
+        Per-pose distance to the nearest core atom whose original index (image_of) is not
+        `blocked`: (S,) for (S, m, 3), inf where none is within `bound`.
         """
         out = np.empty(coords.shape[0])
-        _grid_clearance(np.ascontiguousarray(coords, dtype=float).reshape(-1, 3), coords.shape[0],
-                        self.lo, self.h, self.shape, self.table, self.points, self.labels,
-                        blocked, self.bound, out)
+        _grid_min_distance(np.ascontiguousarray(coords, dtype=float).reshape(-1, 3), coords.shape[0],
+                           self.lo, self.h, self.shape, self.table, self.points, self.image_of,
+                           blocked, self.bound, out)
         return out

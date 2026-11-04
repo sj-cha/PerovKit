@@ -1,33 +1,32 @@
 from __future__ import annotations
 from dataclasses import asdict
 import json
-from typing import Dict, List, Optional
+from typing import Dict, List
 
 from ase import Atoms
 from ase.data import atomic_numbers
 import numpy as np
 
 from ..core import Core
-from ..ligand import BindingMotif, Ligand, pack_motifs
+from ..ligand import BindingMotif, Ligand
 
 
-def motif_from_metadata(meta: dict) -> Optional[BindingMotif | List[BindingMotif]]:
+def motifs_from_metadata(meta: dict) -> List[BindingMotif]:
     """
-    Rebuild from serialized ligand metadata, in the form ``Ligand.binding_motif`` takes:
-    one motif, a list of several, or None when the ligand has none.
+    Rebuild ``Ligand.binding_motifs`` from serialized ligand metadata.
     """
     if meta.get("binding_motifs") is not None:
-        return pack_motifs([BindingMotif(**m) for m in meta["binding_motifs"]])
+        return [BindingMotif(**m) for m in meta["binding_motifs"]]
     # older files hold their one motif in flat keys
     atoms = meta.get("binding_motif_atoms")
     if not atoms:
-        return None
+        return []
     anchor = meta.get("binding_motif_anchor")
     indices = meta.get("binding_motif_indices")
     if anchor is None and indices is None:
         # written before anchors existed: pin the binding atoms resolved back then
         indices = meta.get("binding_atoms_indices")
-    return BindingMotif(atoms, anchor=anchor, indices=indices)
+    return [BindingMotif(atoms, anchor=anchor, indices=indices)]
 
 
 def ligand_type_key(lig: Ligand) -> tuple:
@@ -72,7 +71,7 @@ def a_site_metadata(core: Core) -> str | dict:
     molecular cation's Ligand information (one type, repeated `n_instances`
     times) for an organic A-site. Inverse of `a_site_from_metadata`.
     """
-    if not isinstance(core.A, list):
+    if not core.has_organic_A:
         return core.A
 
     lig = core.A[0]
@@ -112,7 +111,7 @@ def a_site_from_metadata(meta: str | dict, atoms: Atoms, B: str, X: str):
         mol=None,
         smiles=lmeta["smiles"],
         charge=lmeta["charge"],
-        binding_motif=motif_from_metadata(lmeta),
+        binding_motifs=motifs_from_metadata(lmeta),
         name=lmeta["name"],
         volume=lmeta.get("volume"),
         binding_atoms=list(map(int, lmeta.get("binding_atoms_indices", []))),
@@ -217,7 +216,7 @@ def read_assemblies(cls, atoms: Atoms | List[Atoms], json_filename: str):
 
     # Everything that is the same for every frame is resolved once, outside the loop.
     order = np.argsort(sort_idx) if sort_idx is not None else None
-    motifs = {t["id"]: motif_from_metadata(t) for t in ligand_types_meta}
+    motifs = {t["id"]: motifs_from_metadata(t) for t in ligand_types_meta}
 
     lig_slices: List[slice] = []
     cursor = n_core_atoms
@@ -278,7 +277,7 @@ def read_assemblies(cls, atoms: Atoms | List[Atoms], json_filename: str):
                 mol=None,
                 smiles=tmeta["smiles"],
                 charge=tmeta["charge"],
-                binding_motif=motifs[spec_id],
+                binding_motifs=motifs[spec_id],
                 name=tmeta["name"],
                 id=inst_meta["ligand_id"],
                 planes=inst_meta.get("planes") or [inst_meta["plane"]],

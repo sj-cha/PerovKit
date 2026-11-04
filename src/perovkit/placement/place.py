@@ -60,9 +60,9 @@ def place_ligands(
 
     for spec in specs:
         if spec.ligand.n_motifs > 1:
-            pools, by_type = motif_pools(spec, sites, core.site_symbols)
-            for lig_cloned, cand in select_constellations(spec, pools, by_type, sampler, log,
-                                                          refine=refine_torsions):
+            pools, by_sublattice = motif_pools(spec, sites, core.site_symbols)
+            for lig_cloned, cand in select_constellations(spec, pools, by_sublattice, sampler, log,
+                                                          refine_torsions=refine_torsions):
                 poses.append(FitPose(lig_cloned, cand))
                 if not spec.adsorb:
                     displaced.extend(cand.atom_indices)
@@ -97,11 +97,11 @@ def place_ligands(
             np.linalg.norm(box.mic(p.ligand.anchor_positions - p.candidate.targets), axis=1)
             for p in fit_poses
         ])
-        bent = sum(p.origins[p.variant] != "fit" for p in fit_poses)
-        closest, n_close = intramolecular_contacts(poses, coords_list)
+        bent = sum(p.sources[p.variant] != "fit" for p in fit_poses)
+        min_distance, n_close = intramolecular_contacts(poses, coords_list)
         log(f"[Log] Multi-motif anchors sit {dev.mean():.2f} Å (max {dev.max():.2f} Å) from their sites; "
             f"{bent} of {len(fit_poses)} ligands refined in torsion space; closest intramolecular "
-            f"contact {closest:.2f} Å ({n_close} pairs within {INTRA_SCALE:g}x their vdW radii).")
+            f"contact {min_distance:.2f} Å ({n_close} pairs within {INTRA_SCALE:g}x their vdW radii).")
 
     return assembly
 
@@ -185,7 +185,7 @@ def _assemble(
         stripped_atoms.cell[2, 2] = max_z + core.vacuum
 
     stripped = Core(
-        A=core.A[:1] if isinstance(core.A, list) else core.A,
+        A=core.A[:1] if core.has_organic_A else core.A,
         B=core.B,
         X=core.X,
         atoms=stripped_atoms,

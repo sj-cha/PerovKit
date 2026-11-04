@@ -1,6 +1,6 @@
 from __future__ import annotations
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Sequence
+from typing import List, NamedTuple, Optional, Sequence
 
 import numpy as np
 
@@ -25,15 +25,15 @@ class Fit:
     """
     Rigid placement of one conformer onto a constellation.
 
-    Coordinates are ``(x - center) @ rotation.T + pivot``, then turned by ``theta`` about
-    ``axis`` through ``pivot`` when the fit leaves that spin free (two anchors, or anchors
-    on one line). Other poses keep their coordinates in ``xyz``. ``origin`` says where a
-    fit came from: "fit", "stretched" (a template with its chains stood up), "refined",
-    "unstuck" (chains stretched just until they clear the core) or "embedded".
+    Coordinates are ``(x - conformer_center) @ rotation.T + pivot``, then turned by ``theta``
+    about ``axis`` through ``pivot`` when the fit leaves that spin free (two anchors, or
+    anchors on one line). Other poses keep their coordinates in ``xyz``. ``source`` says
+    where a fit came from: "fit", "stretched" (a template with its chains stood up),
+    "refined", "unstuck" (chains stretched just until they clear the core) or "embedded".
     """
     conformer: int
     rotation: np.ndarray
-    center: np.ndarray
+    conformer_center: np.ndarray
     pivot: np.ndarray
     axis: Optional[np.ndarray]
     theta: float
@@ -43,12 +43,12 @@ class Fit:
     energy: float
     cost: float
     xyz: Optional[np.ndarray] = None
-    origin: str = "fit"
+    source: str = "fit"
 
     def coords(self, lib: ConformerLibrary) -> np.ndarray:
         if self.xyz is not None:
             return self.xyz.copy()
-        x = (lib.coords[self.conformer] - self.center) @ self.rotation.T
+        x = (lib.coords[self.conformer] - self.conformer_center) @ self.rotation.T
         if self.axis is not None and self.theta != 0.0:
             x = x @ rotation_about_axis(self.axis, self.theta).T
         return x + self.pivot
@@ -68,6 +68,24 @@ class Candidate:
         return [i for s in self.sites for i in s.atom_indices]
 
 
+class ConformerFits(NamedTuple):
+    """
+    What fit_conformers returns. For every conformer: the rotation (C, 3, 3) taking its
+    anchors, about their centroid `conformer_center` (C, 3), onto the targets about
+    `pivot` (3,), and its rmsd, alignment, footprint, fit_cost and cost (C,). For all:
+    the pivot, and the spin axis (3,) the fit leaves free, or None.
+    """
+    rotation: np.ndarray
+    conformer_center: np.ndarray
+    pivot: np.ndarray
+    axis: Optional[np.ndarray]
+    rmsd: np.ndarray
+    alignment: np.ndarray
+    footprint: np.ndarray
+    fit_cost: np.ndarray
+    cost: np.ndarray
+
+
 def fit_conformers(
     lib: ConformerLibrary,
     targets: np.ndarray,
@@ -78,21 +96,17 @@ def fit_conformers(
     sigma_rmsd: float = 0.25,
     energy_scale: float = 5.0,
     n_spin: int = 72,
-) -> Dict[str, np.ndarray]:
+) -> ConformerFits:
     """
     Kabsch-fit every conformer's anchors to `targets` at once.
 
-    The cost of a conformer is ``fit + orient``, with
-    ``fit = (rmsd / sigma_rmsd)^2 + energy / energy_scale`` and
+    The cost of a conformer is ``fit_cost + orient``, with
+    ``fit_cost = (rmsd / sigma_rmsd)^2 + energy / energy_scale`` and
     ``orient = w_align * (1 - alignment) + w_foot * (footprint / foot_scale)^2``.
     Alignment is the mean cosine between motif directions and site normals; footprint is
     the spread (Å, RMS) of the body atoms across the mean normal, small when the ligand
     stands up rather than lying on the surface. When the fit leaves a spin free, the
     spin minimizing ``orient`` is taken.
-
-    Returns:
-        Dict of per-conformer arrays: rotation (C, 3, 3), center (C, 3), rmsd, alignment,
-        footprint, fit, cost (C,), plus the pivot (3,) and spin axis (3,) or None.
     """
     P = lib.anchors
     center = P.mean(axis=1)
@@ -148,7 +162,7 @@ def fit_conformers(
         lat2 = spread - np.einsum("i,cij,j->c", nbar, cov, nbar)
         orient = w_align * (1.0 - alignment) + w_foot * lat2 / foot_scale ** 2
 
-    fit = (rmsd / sigma_rmsd) ** 2 + lib.energies / energy_scale
-    return dict(rotation=R, center=center, pivot=pivot, axis=axis, rmsd=rmsd,
-                alignment=alignment, footprint=np.sqrt(np.maximum(lat2, 0.0)),
-                fit=fit, cost=fit + orient)
+    fit_cost = (rmsd / sigma_rmsd) ** 2 + lib.energies / energy_scale
+    return ConformerFits(rotation=R, conformer_center=center, pivot=pivot, axis=axis, rmsd=rmsd,
+                         alignment=alignment, footprint=np.sqrt(np.maximum(lat2, 0.0)),
+                         fit_cost=fit_cost, cost=fit_cost + orient)
