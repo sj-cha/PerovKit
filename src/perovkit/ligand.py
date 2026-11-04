@@ -1,6 +1,6 @@
 from __future__ import annotations
 import copy
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from itertools import product
 from typing import Optional, Tuple, List
 
@@ -11,7 +11,7 @@ from rdkit import Chem
 from rdkit.Chem import AllChem, rdDetermineBonds, rdMolTransforms
 
 from .conformers import ConformerLibrary
-from .io import write_structure
+from .io.structure import write_structure
 from .torsion import TorsionModel
 from .utils.rotation import rotation_about_axis, rotation_from_u_to_v
 
@@ -64,31 +64,7 @@ class BindingMotif:
         if len(set(self.indices)) != len(self.indices):
             raise ValueError(f"BindingMotif: indices must be distinct, got {self.indices}")
 
-    def _key(self) -> tuple:
-        return (tuple(self.atoms), self.anchor,
-                tuple(self.indices) if self.indices else None, self.site)
-
-    @classmethod
-    def _from_metadata(cls, meta: dict) -> Optional[BindingMotif | List[BindingMotif]]:
-        """
-        Rebuild from serialized ligand metadata, in the form ``Ligand.binding_motif`` takes:
-        one motif, a list of several, or None when the ligand has none.
-        """
-        if meta.get("binding_motifs") is not None:
-            return _pack_motifs([cls(**m) for m in meta["binding_motifs"]])
-        # older files hold their one motif in flat keys
-        atoms = meta.get("binding_motif_atoms")
-        if not atoms:
-            return None
-        anchor = meta.get("binding_motif_anchor")
-        indices = meta.get("binding_motif_indices")
-        if anchor is None and indices is None:
-            # written before anchors existed: pin the binding atoms resolved back then
-            indices = meta.get("binding_atoms_indices")
-        return cls(atoms, anchor=anchor, indices=indices)
-
-
-def _pack_motifs(value) -> Optional[BindingMotif | List[BindingMotif]]:
+def pack_motifs(value) -> Optional[BindingMotif | List[BindingMotif]]:
     """
     Normalize a binding_motif value: a single motif stays as it is (also when given as a
     one-element list), several become a list, and an empty one becomes None.
@@ -161,7 +137,7 @@ class Ligand:
         mol = self.mol
         if mol is None or [a.GetSymbol() for a in mol.GetAtoms()] != self.atoms.get_chemical_symbols():
             raise ValueError("mol and atoms must list the same elements in the same order")
-        self.binding_motif = _pack_motifs(self.binding_motif)
+        self.binding_motif = pack_motifs(self.binding_motif)
         # a coarse grid will do: the volume only orders ligands
         self.volume = float(AllChem.ComputeMolVolume(mol, gridSpacing=0.4))
         if self.binding_motif:
@@ -381,44 +357,6 @@ class Ligand:
         for k, v in kwargs.items():
             setattr(lig, k, v)
         return lig
-
-
-    def _type_key(self) -> tuple:
-        """
-        Everything that makes two placed ligands the same JSON ligand type. The metadata
-        holds one set of motifs and binding atoms per type, so the same molecule anchored
-        through different atoms has to make two types.
-        """
-        return (
-            self.name,
-            self.smiles,
-            self.charge,
-            tuple(m._key() for m in self.binding_motifs),
-            tuple(self.binding_atoms or ()),
-        )
-
-
-    def _type_metadata(self) -> dict:
-        """
-        Per-type JSON metadata: identity, binding motifs and resolved binding atoms.
-        """
-        return {
-            "name": self.name,
-            "smiles": self.smiles,
-            "charge": self.charge,
-            "binding_atoms_indices": list(self.binding_atoms or []),
-            "binding_motifs": [asdict(m) for m in self.binding_motifs],
-        }
-
-
-    def _instance_metadata(self) -> dict:
-        """
-        Per-instance plane metadata; ``planes`` is written only when there is more than one.
-        """
-        meta = {"plane": list(self.plane)}
-        if len(self.planes) > 1:
-            meta["planes"] = [list(p) for p in self.planes]
-        return meta
 
 
     def _anchor_region(self, motif: BindingMotif, claimed: set) -> List[int]:
