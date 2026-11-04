@@ -24,8 +24,10 @@ class Assembly:
 
     `atoms` is the only copy of the atoms: whatever is done to them is done there, and the
     `atoms` of `core` and of each ligand are read-only selections of it. Its per-atom array
-    "ligand_id" tells whose each atom is (-1: the core). Atoms deleted from it leave `core`,
-    `octahedra`, `B_ijk` and `ligands` following; deleting only part of a ligand is not
+    "ligand_id" tells whose each atom is (-1: the core); the ids are the ligands' places in
+    `ligands`. After atoms are deleted from it, the next method call, or read of `octahedra`
+    or `B_ijk`, brings `core`, `octahedra`, `B_ijk` and `ligands` up to date, the remaining
+    ligands taking the ids 0, 1, ... in order; deleting only part of a ligand is not
     supported.
     """
     core: Core
@@ -46,35 +48,13 @@ class Assembly:
         self._build_atoms()
 
 
-    def remove_ligand(self, id: int, re_index: bool = True) -> None:
-        idx = next(
-            (i for i, lig in enumerate(self.ligands) if lig.id == id),
-            None,
-        )
-        if idx is None:
+    def remove_ligand(self, id: int) -> None:
+        """Remove the ligand with this id; the ligands after it move up one id."""
+        self._follow_deleted_atoms()
+        if not any(lig.id == id for lig in self.ligands):
             raise ValueError(f"No ligand with id={id} found.")
-
-        self.ligands.pop(idx)
         del self.atoms[self.atoms.arrays["ligand_id"] == id]
-
-        # Re-index remaining ligands
-        if re_index:
-            old_ids = self.atoms.arrays["ligand_id"].copy()
-            new_ids = old_ids.copy()
-            for i, lig in enumerate(self.ligands):
-                new_ids[old_ids == lig.id] = i
-                lig.id = i
-                lig._attach(self, "ligand_id", i)
-            self.atoms.set_array("ligand_id", new_ids)
-
-            # Remove ligand references from octahedra and remap ids. Entries are rebuilt rather
-            # than edited in place: frames loaded together by from_ase share one octahedra dict.
-            if self.octahedra is not None:
-                self.core.octahedra = {
-                    b_abs: {**octa, "Ligand": [lid - 1 if lid > id else lid
-                                               for lid in octa["Ligand"] if lid != id]}
-                    for b_abs, octa in self.octahedra.items()
-                }
+        self._follow_deleted_atoms()
 
 
     def apply_tilt(
@@ -112,9 +92,10 @@ class Assembly:
 
     def check_overlaps(self, cutoff: float = 1.6, verbose: bool = True) -> float:
         """
-        Closest contact (Å) between the core and a ligand or between two ligands. With
-        `verbose`, also lists the pairs closer than `cutoff`.
+        Closest contact (Å) between the core and a ligand or between two ligands, inf without
+        ligands. With `verbose`, also lists the pairs closer than `cutoff`.
         """
+        self._follow_deleted_atoms()
         log = print if verbose else (lambda *a, **k: None)
         box = self.core.box
 
@@ -153,11 +134,9 @@ class Assembly:
                     )
                     n += 1
 
-        log(
-            f"[Log] global min inter-entity distance = {global_min:.3f} Å "
-            f"between {entity_labels[global_pair[0]]} and {entity_labels[global_pair[1]]}"
-            f" (total overlaps: {n})"
-        )
+        pair = (f" between {entity_labels[global_pair[0]]} and {entity_labels[global_pair[1]]}"
+                if global_pair else "")
+        log(f"[Log] global min inter-entity distance = {global_min:.3f} Å{pair} (total overlaps: {n})")
 
         return global_min
 
@@ -229,9 +208,11 @@ class Assembly:
 
     def _follow_deleted_atoms(self) -> None:
         """
-        After atoms were deleted from `atoms`, renumber what holds core indices and drop the
-        cations and ligands that are gone. The indices are mapped rather than rebuilt from
-        positions, which a tilt or strain may have taken beyond what finds the octahedra.
+        After atoms were deleted from `atoms`, renumber what holds core indices, drop the
+        cations and ligands that are gone and give the others the ids 0, 1, ... in order. The
+        indices are mapped rather than rebuilt from positions, which a tilt or strain may have
+        taken beyond what finds the octahedra. `octahedra` is replaced rather than edited:
+        frames loaded together by from_ase share one.
         """
         if len(self.atoms) == self._n_atoms:
             return
@@ -240,13 +221,24 @@ class Assembly:
         core_id = self.atoms.arrays["core_id"]
         kept = core_id[core_id >= 0]
         new = {old: i for i, old in enumerate(kept.tolist())}
-        core = self.core
-        if core.octahedra is not None:
-            core.octahedra = {new[b]: {**octa, "X": [new[x] for x in octa["X"] if x in new]}
-                              for b, octa in core.octahedra.items() if b in new}
-        core.B_ijk = {new[b]: ijk for b, ijk in core.B_ijk.items() if b in new}
         core_id[core_id >= 0] = np.arange(len(kept))
 
+        core = self.core
         if isinstance(core.A, list):
             core.A = [lig for lig in core.A if len(lig.indices)]
         self.ligands = [lig for lig in self.ligands if len(lig.indices)]
+
+        ligand_id = self.atoms.arrays["ligand_id"]
+        old_ids = ligand_id.copy()
+        new_id = {}
+        for i, lig in enumerate(self.ligands):
+            ligand_id[old_ids == lig.id] = i
+            new_id[lig.id] = i
+            lig.id = i
+            lig._attach(self, "ligand_id", i)
+
+        if core.octahedra is not None:
+            core.octahedra = {new[b]: {"X": [new[x] for x in octa["X"] if x in new],
+                                       "Ligand": [new_id[l] for l in octa["Ligand"] if l in new_id]}
+                              for b, octa in core.octahedra.items() if b in new}
+        core.B_ijk = {new[b]: ijk for b, ijk in core.B_ijk.items() if b in new}

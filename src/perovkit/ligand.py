@@ -564,3 +564,7 @@ class LigandSpec:
                     f"every motif of a multi-motif ligand needs a site ('A', 'B' or 'X'); "
                     f"motif(s) {missing} of ligand {self.ligand.name!r} have none"
                 )
+        if self.coverage is None and self.binding_sites is None:
+            raise ValueError("LigandSpec needs a coverage or binding_sites")
+        if self.coverage is not None and self.coverage < 0:
+            raise ValueError(f"coverage must be at least 0; got {self.coverage}")
