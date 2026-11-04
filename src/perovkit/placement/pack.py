@@ -8,6 +8,7 @@ from scipy.spatial import cKDTree
 from tqdm.auto import tqdm
 
 from ..refine import INTRA_SCALE, K_CONTACT, intra_pairs, refine, refine_joint
+from ..utils.box import Box
 from .poses import MultiMotifPose
 from .stretch import stretch_poses
 
@@ -28,7 +29,7 @@ def bend_pose(
     coords: np.ndarray,
     neighbors_coords: List[np.ndarray],
     core_tree,
-    tree_builder: Callable,
+    box: Box,
     cutoff: float,
     max_rmsd: float,
     min_distance: Callable,
@@ -42,7 +43,7 @@ def bend_pose(
     """
     trees = [core_tree]
     if neighbors_coords:
-        trees.append(tree_builder(np.vstack(neighbors_coords))[0])
+        trees.append(box.tree(np.vstack(neighbors_coords))[0])
     best, best_d = None, -float("inf")
     for margin in MARGINS:
         res = refine(pose.ligand.torsion_model(), coords, pose.ligand.binding_groups,
@@ -109,13 +110,13 @@ def bounding_spheres(poses: Sequence, coords_list: List[np.ndarray]) -> Tuple[np
 DENSE_PAIRS = 20000
 
 
-def tree_min_distance(core_tree, tree_builder: Callable, neighbors_coords: List[np.ndarray]) -> Callable:
+def tree_min_distance(core_tree, box: Box, neighbors_coords: List[np.ndarray]) -> Callable:
     """
     Closest contact with the core or any of `neighbors_coords`, as a function of the
     coordinates, from a tree built once: the rotation search evaluates it at every spin and
     variant of a long ligand that has nearly every other ligand as a neighbor.
     """
-    tree = tree_builder(np.vstack(neighbors_coords))[0] if neighbors_coords else None
+    tree = box.tree(np.vstack(neighbors_coords))[0] if neighbors_coords else None
 
     def min_distance(coords: np.ndarray, _neighbors=None) -> float:
         d_core = float(core_tree.query(coords)[0].min())
@@ -196,8 +197,7 @@ def bend_clusters(
     poses: Sequence,
     coords_list: List[np.ndarray],
     core_tree,
-    tree_builder: Callable,
-    mic: Callable,
+    box: Box,
     min_distance: Callable,
     cutoff: float,
     max_rmsd: float,
@@ -230,9 +230,9 @@ def bend_clusters(
     centers, radii = compute_bounding_spheres(coords_list)
     for a in range(n):
         for b in range(a + 1, n):
-            if np.linalg.norm(mic(centers[a] - centers[b])) > radii[a] + radii[b] + cutoff:
+            if np.linalg.norm(box.mic(centers[a] - centers[b])) > radii[a] + radii[b] + cutoff:
                 continue
-            if np.linalg.norm(mic(coords_list[a][:, None] - coords_list[b][None]), axis=-1).min() < cutoff:
+            if np.linalg.norm(box.mic(coords_list[a][:, None] - coords_list[b][None]), axis=-1).min() < cutoff:
                 parent[root(a)] = root(b)
     components: Dict[int, List[int]] = {}
     for i in range(n):
@@ -250,14 +250,14 @@ def bend_clusters(
         if before >= cutoff:
             continue  # nothing to clear: a lone ligand with no contact below the cutoff
         others = [c for j, c in enumerate(coords_list) if j not in members]
-        trees = [core_tree, tree_builder(np.vstack(others))[0] if others else None]
+        trees = [core_tree, box.tree(np.vstack(others))[0] if others else None]
         for stiff, margin in [(k, m) for k in STIFFNESS for m in MARGINS]:
             results = refine_joint(
                 [poses[i].ligand.torsion_model() for i in members],
                 [coords_list[i] for i in members],
                 [poses[i].ligand.binding_groups for i in members],
                 [poses[i].candidate.targets for i in members],
-                trees, cutoff + margin, tree_builder, k_contact=K_CONTACT * stiff,
+                trees, cutoff + margin, box, k_contact=K_CONTACT * stiff,
                 stop_at=cutoff + margin / 2 if stop_at is None else stop_at, stop_rmsd=max_rmsd,
             )
             moved = [(i, r) for i, r in zip(members, results) if r.anchor_rmsd <= max_rmsd]
@@ -279,20 +279,12 @@ def bend_clusters(
 class Contacts:
     """
     Closest contacts of ligands with the core left after displacement and with each other,
-    following the core's periodicity: `tree_builder(points)` gives a tree of the points and
-    their periodic images with the point each image comes from, `mic` and `wrap` take
-    vectors and points to their minimum image and into the box, and
-    `neighbor_map(centers, radii, cutoff)` lists for every ligand those whose spheres come
-    within `cutoff` of its own.
+    following the cell `box` of the core.
     """
 
-    def __init__(self, core_tree, tree_builder: Callable, mic: Callable, wrap: Callable,
-                 neighbor_map: Callable, cutoff: float):
+    def __init__(self, core_tree, box: Box, cutoff: float):
         self.core_tree = core_tree
-        self.tree_builder = tree_builder
-        self.mic = mic
-        self.wrap = wrap
-        self.neighbor_map = neighbor_map
+        self.box = box
         self.cutoff = cutoff
 
     def closest(self, coords: np.ndarray, neighbors_coords: Optional[List[np.ndarray]]) -> float:
@@ -307,11 +299,11 @@ class Contacts:
         neighbors = np.vstack(neighbors_coords)  # (N,3)
         if len(coords) * len(neighbors) > DENSE_PAIRS:
             # wrapped into the box, periodic images one box away hold every minimum image
-            tree, image_of = self.tree_builder(self.wrap(coords))
-            _, k = tree.query(self.wrap(neighbors))
-            diff = self.mic(coords[image_of[k]] - neighbors)
+            tree, image_of = self.box.tree(self.box.wrap(coords))
+            _, k = tree.query(self.box.wrap(neighbors))
+            diff = self.box.mic(coords[image_of[k]] - neighbors)
         else:
-            diff = self.mic(coords[:, None, :] - neighbors[None, :, :])  # (M,N,3)
+            diff = self.box.mic(coords[:, None, :] - neighbors[None, :, :])  # (M,N,3)
         d2 = np.sum(diff * diff, axis=-1)
         return min(d_core, float(np.sqrt(d2.min())))
 
@@ -319,14 +311,14 @@ class Contacts:
         """
         Closest contact of `coords` with the core or any of `neighbors_coords`.
         """
-        return tree_min_distance(self.core_tree, self.tree_builder, neighbors_coords)(coords)
+        return tree_min_distance(self.core_tree, self.box, neighbors_coords)(coords)
 
     def neighbors(self, poses: Sequence, coords_list: List[np.ndarray]) -> Dict[int, List[int]]:
         """
         Ligands within reach of each ligand, over the spheres of bounding_spheres.
         """
         centers, radii = bounding_spheres(poses, coords_list)
-        return self.neighbor_map(centers, radii, self.cutoff)
+        return self.box.neighbor_map(centers, radii, self.cutoff)
 
     def conflicts(
         self,
@@ -432,7 +424,7 @@ def pack(
 
     # relax the stretched shell together, short of the cutoff; single turns clear the rest
     if n_stretched and refine_torsions:
-        bend_clusters(poses, coords_list, contacts.core_tree, contacts.tree_builder, contacts.mic,
+        bend_clusters(poses, coords_list, contacts.core_tree, contacts.box,
                         contacts.exact, cutoff, max_rmsd, stop_at=cutoff - 0.1)
 
     # Rotation optimization loop
@@ -461,7 +453,7 @@ def pack(
 
             search = contacts.closest
             if multi:
-                search = tree_min_distance(contacts.core_tree, contacts.tree_builder, neighbors_coords)
+                search = tree_min_distance(contacts.core_tree, contacts.box, neighbors_coords)
             best_variant, best_coords = turn_pose(
                 poses[i], neighbors_coords, search, rng, cutoff,
                 coarse_step_deg, fine_step_deg, window_deg,
@@ -472,7 +464,7 @@ def pack(
             if refine_torsions and multi and d_new < cutoff:
                 others = [c for j, c in enumerate(coords_list) if j != i]
                 refined = bend_pose(poses[i], best_coords, others, contacts.core_tree,
-                                      contacts.tree_builder, cutoff, max_rmsd, min_distance)
+                                      contacts.box, cutoff, max_rmsd, min_distance)
                 if refined is not None:
                     d_ref = min_distance(refined, others)
                     if d_ref > d_new:
@@ -489,7 +481,7 @@ def pack(
         if not improved and refine_torsions:
             # nobody could move alone: let jammed multi-motif ligands give way together
             improved = bend_clusters(
-                poses, coords_list, contacts.core_tree, contacts.tree_builder, contacts.mic,
+                poses, coords_list, contacts.core_tree, contacts.box,
                 contacts.exact, cutoff, max_rmsd,
             )
 

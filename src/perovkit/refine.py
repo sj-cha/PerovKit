@@ -171,15 +171,15 @@ class _Mutual:
     """
     Verlet list of the contacts between atoms of different ligands, X (N, 3) with the
     atoms of ligand l at starts[l]:starts[l + 1], within `contact` + SKIN through the
-    periodic images of `tree_builder`: pairs (p, q) with the image of q at X[q] + shift.
+    periodic images of `box`: pairs (p, q) with the image of q at X[q] + shift.
     A ligand's pairs are searched again once one of its atoms has moved SKIN / 4: the pairs
     of two ligands date from the later of their searches, so together they have moved at
     most 3/4 SKIN since.
     """
 
-    def __init__(self, starts, contact, tree_builder):
+    def __init__(self, starts, contact, box):
         self.starts = np.asarray(starts, dtype=np.int64)
-        self.contact, self.tree_builder = contact, tree_builder
+        self.contact, self.box = contact, box
         self.owner = np.repeat(np.arange(len(starts) - 1), np.diff(starts))
         self.ref = None
         self.p = self.q = np.zeros(0, dtype=np.int64)
@@ -197,7 +197,7 @@ class _Mutual:
                 return
         atoms = np.flatnonzero(stale[self.owner])
         self.ref[atoms] = X[atoms]
-        tree, image_of = self.tree_builder(X)
+        tree, image_of = self.box.tree(X)
         m = cKDTree(X[atoms]).sparse_distance_matrix(tree, self.contact + SKIN, output_type="ndarray")
         p, j = atoms[m["i"]], m["j"].astype(np.int64)
         q = image_of[j]
@@ -399,7 +399,7 @@ def refine_joint(
     targets: Sequence[np.ndarray],
     trees: Sequence,
     contact: float,
-    tree_builder,
+    box,
     k_anchor: float = 20.0,
     k_contact: float = K_CONTACT,
     intra: float = INTRA_SCALE,
@@ -411,7 +411,7 @@ def refine_joint(
     """
     Refine several ligands at once, so that ligands jammed against each other can all give
     way. Each has the terms of `refine`; atoms of different ligands are also pushed
-    `contact` Å apart, listed through a tree from `tree_builder` (periodic images included).
+    `contact` Å apart, listed through a tree from `box` (periodic images included).
     `stop_at` and `stop_rmsd` end it early as in `refine`, with every ligand meeting them.
     """
     sizes = [6 + m.n_torsions for m in models]
@@ -434,7 +434,7 @@ def refine_joint(
             C=np.array([targets[l].mean(axis=0) for l in members]),
             nb=_Neighbors(model, trees, contact, intra),
         ))
-    mutual = _Mutual(starts, contact, tree_builder)
+    mutual = _Mutual(starts, contact, box)
 
     def fun(P):
         E = 0.0

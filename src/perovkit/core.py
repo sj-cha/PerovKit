@@ -12,6 +12,7 @@ from ase.data import covalent_radii, atomic_numbers
 
 from .io import write_structure
 from .ligand import Ligand, BindingMotif, LigandSpec
+from .utils.box import Box
 from .utils.rotation import rotation_about_axis, rotation_from_u_to_v
 
 @dataclass
@@ -62,6 +63,10 @@ class Core:
     @property
     def is_nanocrystal(self) -> bool:
         return not any(self.atoms.pbc)
+
+    @property
+    def box(self) -> Box:
+        return Box(self.atoms.cell.lengths(), self.atoms.pbc)
 
     @property
     def A_label(self) -> str:
