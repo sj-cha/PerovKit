@@ -84,6 +84,7 @@ class BindingMotif:
         """
         if meta.get("binding_motifs") is not None:
             return _pack_motifs([cls(**m) for m in meta["binding_motifs"]])
+        # older files hold their one motif in flat keys
         atoms = meta.get("binding_motif_atoms")
         if not atoms:
             return None
@@ -236,7 +237,6 @@ class Ligand:
         binding_motif: BindingMotif | List[BindingMotif],
         name: str,
         charge: Optional[int] = None,
-        **kwargs
     ) -> Ligand:
         """
         Build a Ligand from a file. 
@@ -248,7 +248,6 @@ class Ligand:
                 surface; a list gives one motif per binding group.
             name (str): User-defined identifier.
             charge (Optional[int]): Formal charge; if None, tries -1, 0, +1 in order.
-            **kwargs: Forwarded to the Ligand constructor.
 
         Returns:
             A Ligand instance.
@@ -288,8 +287,7 @@ class Ligand:
                    smiles = Chem.MolToSmiles(no_H), 
                    charge=chosen_charge, 
                    binding_motif=binding_motif,
-                   name=name,
-                   **kwargs)
+                   name=name)
     
 
     @classmethod
@@ -300,7 +298,6 @@ class Ligand:
         random_seed: int = 42,
         name: str = None,
         optimize: bool = False,
-        **kwargs
     ) -> Ligand:
         """
         Build a Ligand from a SMILES string.
@@ -313,7 +310,6 @@ class Ligand:
             name (str): User-defined identifier.
             optimize (bool): If True, fully relax with UFF; otherwise set rotatable bonds 
                              to 180° (extended) and relax with torsions fixed.
-            **kwargs: Forwarded to the Ligand constructor.
 
         Returns:
             A Ligand instance.
@@ -372,8 +368,7 @@ class Ligand:
             smiles=smiles, 
             charge=Chem.GetFormalCharge(mol), 
             binding_motif=binding_motif,
-            name=name,
-            **kwargs)
+            name=name)
     
 
     def conformers(self, **kwargs) -> ConformerLibrary:
@@ -457,27 +452,14 @@ class Ligand:
     def _type_metadata(self) -> dict:
         """
         Per-type JSON metadata: identity, binding motifs and resolved binding atoms.
-
-        ``binding_motifs`` is what this version reads back; the flat ``binding_motif_*``
-        keys are kept for single-motif ligands so that older versions can still load them.
         """
-        motifs = self.binding_motifs
-        legacy = motifs[0] if len(motifs) == 1 else None
-        meta = {
+        return {
             "name": self.name,
             "smiles": self.smiles,
             "charge": self.charge,
+            "binding_atoms_indices": list(self.binding_atoms or []),
+            "binding_motifs": [m._to_metadata() for m in self.binding_motifs],
         }
-        if len(motifs) <= 1:
-            meta.update({
-                "binding_motif_atoms": list(legacy.atoms) if legacy else None,
-                "binding_motif_anchor": legacy.anchor if legacy else None,
-                "binding_motif_indices": (list(legacy.indices)
-                                          if legacy and legacy.indices else None),
-            })
-        meta["binding_atoms_indices"] = list(self.binding_atoms or [])
-        meta["binding_motifs"] = [m._to_metadata() for m in motifs]
-        return meta
 
 
     def _instance_metadata(self) -> dict:
@@ -497,9 +479,10 @@ class Ligand:
 
     def _get_volume(self):
         """
-        Compute molecular volume (Å^3).
+        Compute molecular volume (Å^3). The coarse grid is enough for what it is used for:
+        ordering ligands and the metadata.
         """
-        self.volume = float(AllChem.ComputeMolVolume(self.mol))
+        self.volume = float(AllChem.ComputeMolVolume(self.mol, gridSpacing=0.4))
 
 
     def _coordination_numbers(self) -> np.ndarray:
@@ -527,11 +510,6 @@ class Ligand:
                              f"once the earlier motifs took theirs")
 
         first = set(matches[0])
-        # matches sharing atoms with the first one are the same group seen from another atom
-        if self.n_motifs == 1 and any(first.isdisjoint(m) for m in matches[1:]):
-            print(f"[Warning] anchor {anchor!r} matches more than one group in ligand "
-                  f"{self.name or self.smiles}; using the first match {sorted(first)}.")
-
         region = set(first)
         for i in first:
             region.update(n.GetIdx() for n in mol.GetAtomWithIdx(i).GetNeighbors())
@@ -547,18 +525,17 @@ class Ligand:
             binding_atoms += self._resolve_motif(motif, set(binding_atoms))
         self.binding_atoms = binding_atoms
 
-        # One motif warns in _anchor_region; several sharing a SMARTS are checked together
-        if self.n_motifs > 1:
-            anchors = [m.anchor for m in self.binding_motifs if m.indices is None]
-            for anchor in dict.fromkeys(anchors):
-                groups: List[set] = []
-                for match in self.mol.GetSubstructMatches(Chem.MolFromSmarts(anchor)):
-                    if all(g.isdisjoint(match) for g in groups):
-                        groups.append(set(match))
-                if len(groups) > anchors.count(anchor):
-                    print(f"[Warning] anchor {anchor!r} matches {len(groups)} groups in ligand "
-                          f"{self.name or self.smiles}, but only {anchors.count(anchor)} "
-                          f"motif(s) use it; the other groups stay unbound.")
+        # Matches sharing atoms are the same group seen from another atom
+        anchors = [m.anchor for m in self.binding_motifs if m.indices is None]
+        for anchor in dict.fromkeys(anchors):
+            groups: List[set] = []
+            for match in self.mol.GetSubstructMatches(Chem.MolFromSmarts(anchor)):
+                if all(g.isdisjoint(match) for g in groups):
+                    groups.append(set(match))
+            if len(groups) > anchors.count(anchor):
+                print(f"[Warning] anchor {anchor!r} matches {len(groups)} groups in ligand "
+                      f"{self.name or self.smiles}, but only {anchors.count(anchor)} "
+                      f"motif(s) use it; the other groups stay unbound.")
         return self.binding_atoms
 
 
@@ -621,9 +598,8 @@ class Ligand:
                         best_pair = (i, j)
 
             if best_pair is None:
-                raise ValueError(
-                    f"No distinct atom pair found for binding motif {binding_elems}"
-                )
+                raise ValueError(f"No atoms found for binding motif {binding_elems} "
+                                 f"around anchor {motif.anchor!r}")
 
             return list(best_pair)
 
@@ -632,7 +608,7 @@ class Ligand:
 
             elem_indices = [i for i in region if symbols[i] == elem]
             if len(elem_indices) == 0:
-                raise ValueError(f"No atoms found for binding element {elem!r} "
+                raise ValueError(f"No atoms found for binding motif {binding_elems} "
                                  f"around anchor {motif.anchor!r}")
 
             elem_cn = cn[np.asarray(elem_indices, dtype=int)]
@@ -708,8 +684,6 @@ class Ligand:
         mask = np.ones(len(coords0), dtype=bool)
         mask[binding_idx] = False
         others = coords0[mask]
-
-        assert len(others) > 0, "No other atoms to orient ligand"
 
         # Rotate to maximize z-projection
         thetas = np.linspace(0.0, 2.0 * np.pi, n_angles, endpoint=False)
@@ -800,7 +774,6 @@ class LigandSpec:
         adsorb (bool): If True, adsorb the ligand on top of the surface site instead
             of replacing it (the surface atom is kept). Use `anchor_offset` to control
             the spacing.
-        name (Optional[str]): User-defined identifier.
     """
     ligand: Ligand
     site: Optional[str] = None
@@ -808,7 +781,6 @@ class LigandSpec:
     binding_sites: Optional[list[int]] = None
     anchor_offset: float = 0.0
     adsorb: bool = False
-    name: Optional[str] = None
 
     def __post_init__(self):
         if self.site is not None and self.site not in ("A", "B", "X"):
@@ -835,5 +807,3 @@ class LigandSpec:
                     f"every motif of a multi-motif ligand needs a site ('A', 'B' or 'X'); "
                     f"motif(s) {missing} of ligand {self.ligand.name!r} have none"
                 )
-        if self.name is None:
-            self.name = self.ligand.name
