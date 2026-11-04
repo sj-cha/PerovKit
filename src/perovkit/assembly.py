@@ -14,12 +14,14 @@ from scipy.spatial import cKDTree
 
 from .core import Core, BindingSite
 from .ligand import Ligand, LigandSpec, BindingMotif
-from .constellation import ConstellationSampler
 from .io import write_structure
+from .placement.pack import Contacts, intramolecular_contacts, pack
+from .placement.poses import FitPose, SitePose, place_about_normal
+from .placement.sampler import ConstellationSampler
+from .placement.sites import motif_pools, select_constellations
 from .refine import INTRA_SCALE
-from .placement import (SitePose, FitPose, Contacts, pack, place_about_normal, motif_pools,
-                        select_constellations, intramolecular_contacts)
-from .utils.geometry import farthest_point_sampling, per_face_farthest_point_sampling, build_neighbor_map
+from .utils.box import build_neighbor_map
+from .utils.sampling import farthest_point_sampling, per_face_farthest_point_sampling
 
 
 @dataclass

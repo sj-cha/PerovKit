@@ -1,288 +1,21 @@
 from __future__ import annotations
 from collections import Counter
 import dataclasses
-from dataclasses import dataclass
 import itertools
-import math
 import random
 from typing import Callable, Dict, Iterator, List, Optional, Sequence, Tuple
 
-import numba
 import numpy as np
-
 from scipy.spatial import cKDTree
 
-from .conformers import ConformerLibrary, _uff_energy, _uff_polish, embed_at
-from .core import BindingSite
-from .refine import TorsionModel, refine, stretch
-
-
-def rotations_about_axis(axis: np.ndarray, thetas: np.ndarray) -> np.ndarray:
-    """
-    Rodrigues rotation matrices about one unit axis for many angles: (n_theta, 3, 3).
-    """
-    x, y, z = axis
-    K = np.array([[0, -z, y], [z, 0, -x], [-y, x, 0]], dtype=float)
-    s = np.sin(thetas)[:, None, None]
-    c = np.cos(thetas)[:, None, None]
-    return np.eye(3) + s * K + (1.0 - c) * (K @ K)
-
-
-def site_normals(sites: Sequence[BindingSite]) -> np.ndarray:
-    """Unit normal of every site's plane: (n_sites, 3)."""
-    return np.array([np.asarray(s.plane, dtype=float) / np.linalg.norm(s.plane) for s in sites])
-
-
-def mean_normal(sites: Sequence[BindingSite]) -> np.ndarray:
-    """Unit mean of the sites' normals."""
-    n = site_normals(sites).mean(axis=0)
-    return n / np.linalg.norm(n)
-
-
-def assign_faces(sites: Sequence[BindingSite]) -> List[tuple]:
-    """
-    The face each site counts toward when spreading ligands over a nanocrystal.
-
-    A site on a face counts toward it. A site on an edge or corner lies on two or three
-    faces at once: along each edge (or among the corners of one kind) the sites are dealt
-    to those faces in turn, so that every face gets its share instead of all edges going
-    to one axis. On a slab every site keeps its plane.
-    """
-    faces: List[Optional[tuple]] = [None] * len(sites)
-    shared: Dict[tuple, List[int]] = {}
-    for i, s in enumerate(sites):
-        plane = tuple(int(v) for v in s.plane)
-        if sum(v != 0 for v in plane) <= 1:
-            faces[i] = plane
-        else:
-            shared.setdefault(plane, []).append(i)
-    for plane, idx in shared.items():
-        options = [tuple(v if a == ax else 0 for a, v in enumerate(plane))
-                   for ax in range(3) if plane[ax] != 0]
-        for k, i in enumerate(sorted(idx, key=lambda i: tuple(sites[i].position))):
-            faces[i] = options[k % len(options)]
-    return faces
-
-
-@dataclass
-class Fit:
-    """
-    Rigid placement of one conformer onto a constellation.
-
-    Coordinates are ``(x - center) @ rotation.T + pivot``, then turned by ``theta`` about
-    ``axis`` through ``pivot`` when the fit leaves that spin free (two anchors, or anchors
-    on one line). Other poses keep their coordinates in ``xyz``. ``origin`` says where a
-    fit came from: "fit", "stretched" (a template with its chains stood up), "refined",
-    "unstuck" (chains stretched just until they clear the core) or "embedded".
-    """
-    conformer: int
-    rotation: np.ndarray
-    center: np.ndarray
-    pivot: np.ndarray
-    axis: Optional[np.ndarray]
-    theta: float
-    rmsd: float
-    alignment: float
-    footprint: float
-    energy: float
-    cost: float
-    xyz: Optional[np.ndarray] = None
-    origin: str = "fit"
-
-    def coords(self, lib: ConformerLibrary) -> np.ndarray:
-        if self.xyz is not None:
-            return self.xyz.copy()
-        x = (lib.coords[self.conformer] - self.center) @ self.rotation.T
-        if self.axis is not None and self.theta != 0.0:
-            x = x @ rotations_about_axis(self.axis, np.array([self.theta]))[0].T
-        return x + self.pivot
-
-
-@dataclass
-class Candidate:
-    """
-    A constellation accepted for one ligand, with its feasible fits, best first.
-    """
-    sites: List[BindingSite]
-    targets: np.ndarray
-    fits: List[Fit]
-
-    @property
-    def atom_indices(self) -> List[int]:
-        return [i for s in self.sites for i in s.atom_indices]
-
-
-def fit_conformers(
-    lib: ConformerLibrary,
-    targets: np.ndarray,
-    normals: np.ndarray,
-    sigma_rmsd: float = 0.25,
-    energy_scale: float = 5.0,
-    w_align: float = 2.0,
-    w_foot: float = 1.0,
-    foot_scale: float = 2.0,
-    n_spin: int = 72,
-) -> Dict[str, np.ndarray]:
-    """
-    Kabsch-fit every conformer's anchors to `targets` at once.
-
-    The cost of a conformer is ``fit + orient``, with
-    ``fit = (rmsd / sigma_rmsd)^2 + energy / energy_scale`` and
-    ``orient = w_align * (1 - alignment) + w_foot * (footprint / foot_scale)^2``.
-    Alignment is the mean cosine between motif directions and site normals; footprint is
-    the spread (Å, RMS) of the body atoms across the mean normal, small when the ligand
-    stands up rather than lying on the surface. When the fit leaves a spin free, the
-    spin minimizing ``orient`` is taken.
-
-    Returns:
-        Dict of per-conformer arrays: rotation (C, 3, 3), center (C, 3), rmsd, alignment,
-        footprint, fit, cost (C,), plus the pivot (3,) and spin axis (3,) or None.
-    """
-    P = lib.anchors
-    center = P.mean(axis=1)
-    pivot = targets.mean(axis=0)
-    Pc = P - center[:, None]
-    Tc = targets - pivot
-
-    H = np.einsum("cni,nj->cij", Pc, Tc)
-    U, _, Vt = np.linalg.svd(H)
-    V = np.transpose(Vt, (0, 2, 1))
-    d = np.sign(np.linalg.det(V @ np.transpose(U, (0, 2, 1))))
-    D = np.tile(np.eye(3), (len(P), 1, 1))
-    D[:, 2, 2] = np.where(d == 0, 1.0, d)
-    R = V @ D @ np.transpose(U, (0, 2, 1))
-
-    mapped = Pc @ R.transpose(0, 2, 1)
-    rmsd = np.sqrt(np.mean(np.sum((mapped - Tc) ** 2, axis=-1), axis=1))
-
-    sv = np.linalg.svd(Tc, compute_uv=False)
-    axis = None
-    if len(targets) == 2 or sv[1] < 0.05 * sv[0]:
-        axis = Tc[-1] - Tc[0] if len(targets) == 2 else np.linalg.svd(Tc)[2][0]
-        axis = axis / np.linalg.norm(axis)
-
-    has_dir = np.linalg.norm(lib.directions, axis=-1) > 0          # (C, n)
-    n_dir = np.maximum(has_dir.sum(axis=1), 1)
-    dirs = lib.directions @ R.transpose(0, 2, 1)
-
-    # lateral spread across the mean normal n: trace(cov) - n.cov.n of the body atoms
-    nbar = normals.mean(axis=0)
-    nbar = nbar / np.linalg.norm(nbar)
-    body = (lib.coords[:, lib.body] - center[:, None]) @ R.transpose(0, 2, 1)
-    body -= body.mean(axis=1, keepdims=True)
-    cov = (body.transpose(0, 2, 1) @ body) / body.shape[1]
-    spread = np.trace(cov, axis1=1, axis2=2)
-
-    if axis is not None:
-        thetas = np.linspace(0.0, 2.0 * np.pi, n_spin, endpoint=False)
-        spins = rotations_about_axis(axis, thetas)                    # (S, 3, 3)
-        # cos[c, s, n] = normal_n . (spin_s @ dir_cn), with the normals turned back instead
-        back = normals @ spins                                        # (S, n, 3)
-        cos = (dirs.transpose(1, 0, 2) @ back.transpose(1, 2, 0)).transpose(1, 2, 0)   # (C, S, n)
-        align = cos.sum(axis=-1) / n_dir[:, None]
-        u = np.einsum("sji,j->si", spins, nbar)                       # spin^T n
-        lat2 = spread[:, None] - np.einsum("si,cij,sj->cs", u, cov, u)
-        orient = w_align * (1.0 - align) + w_foot * lat2 / foot_scale ** 2
-        best = np.argmin(orient, axis=1)
-        idx = np.arange(len(P))
-        R = spins[best] @ R
-        alignment, lat2, orient = align[idx, best], lat2[idx, best], orient[idx, best]
-    else:
-        alignment = np.einsum("cnj,nj->cn", dirs, normals).sum(axis=-1) / n_dir
-        lat2 = spread - np.einsum("i,cij,j->c", nbar, cov, nbar)
-        orient = w_align * (1.0 - alignment) + w_foot * lat2 / foot_scale ** 2
-
-    fit = (rmsd / sigma_rmsd) ** 2 + lib.energies / energy_scale
-    return dict(rotation=R, center=center, pivot=pivot, axis=axis, rmsd=rmsd,
-                alignment=alignment, footprint=np.sqrt(np.maximum(lat2, 0.0)),
-                fit=fit, cost=fit + orient)
-
-
-@numba.njit(cache=True)
-def _grid_clearance(x, n_poses, lo, h, shape, table, points, labels, blocked, bound, out):
-    m = x.shape[0] // n_poses
-    for s in range(n_poses):
-        best = np.inf
-        for p in range(s * m, (s + 1) * m):
-            c0 = int(np.floor((x[p, 0] - lo[0]) / h))
-            c1 = int(np.floor((x[p, 1] - lo[1]) / h))
-            c2 = int(np.floor((x[p, 2] - lo[2]) / h))
-            if c0 < 0 or c1 < 0 or c2 < 0 or c0 >= shape[0] or c1 >= shape[1] or c2 >= shape[2]:
-                continue
-            row = (c0 * shape[1] + c1) * shape[2] + c2
-            for k in range(table.shape[1]):
-                a = table[row, k]
-                if a < 0:
-                    break
-                if blocked[labels[a]]:
-                    continue
-                dx = x[p, 0] - points[a, 0]
-                dy = x[p, 1] - points[a, 1]
-                dz = x[p, 2] - points[a, 2]
-                d = np.sqrt(dx * dx + dy * dy + dz * dz)
-                if d < bound and d < best:
-                    best = d
-        out[s] = best
-
-
-@numba.njit(cache=True)
-def _over_sites(x, sites, normals, radii, out):
-    """
-    out[s]: whether pose s of x (S, m, 3) lies over any of `sites` (K, 3): an atom on the
-    outer side of the site's plane (unit `normals`) within its radius of the site laterally.
-    """
-    for s in range(x.shape[0]):
-        hit = False
-        for k in range(sites.shape[0]):
-            for a in range(x.shape[1]):
-                dx = x[s, a, 0] - sites[k, 0]
-                dy = x[s, a, 1] - sites[k, 1]
-                dz = x[s, a, 2] - sites[k, 2]
-                h = dx * normals[k, 0] + dy * normals[k, 1] + dz * normals[k, 2]
-                if h <= 0.0:
-                    continue
-                lx = dx - h * normals[k, 0]
-                ly = dy - h * normals[k, 1]
-                lz = dz - h * normals[k, 2]
-                if lx * lx + ly * ly + lz * lz < radii[a] * radii[a]:
-                    hit = True
-                    break
-            if hit:
-                break
-        out[s] = hit
-
-
-class CoreGrid:
-    """
-    Cells `h` Å wide over the core, each listing the core atoms (periodic images included)
-    within `bound` of some point of the cell, so that the nearest core atom within `bound`
-    of a point is among a handful of candidates.
-    """
-
-    def __init__(self, points: np.ndarray, labels: np.ndarray, bound: float, h: float = 1.0):
-        self.points = np.ascontiguousarray(points, dtype=float)
-        self.labels = np.asarray(labels, dtype=np.int64)
-        self.bound, self.h = float(bound), float(h)
-        self.lo = self.points.min(axis=0) - bound
-        self.shape = (np.ceil((self.points.max(axis=0) + bound - self.lo) / h).astype(np.int64) + 1)
-        centers = self.lo + (np.indices(self.shape).reshape(3, -1).T + 0.5) * h
-        lists = cKDTree(self.points).query_ball_point(centers, r=bound + h * math.sqrt(3.0) / 2.0)
-        lens = np.fromiter(map(len, lists), dtype=np.int64, count=len(lists))
-        self.table = np.full((len(lists), max(1, int(lens.max()))), -1, dtype=np.int64)
-        rows = np.repeat(np.arange(len(lists)), lens)
-        cols = np.arange(len(rows)) - np.repeat(np.cumsum(lens) - lens, lens)
-        self.table[rows, cols] = np.concatenate([np.asarray(l, dtype=np.int64) for l in lists if l])
-
-    def clearance(self, coords: np.ndarray, blocked: np.ndarray) -> np.ndarray:
-        """
-        Per-pose distance to the nearest core atom whose label is not `blocked`: (S,) for
-        (S, m, 3), inf where none is within `bound`.
-        """
-        out = np.empty(coords.shape[0])
-        _grid_clearance(np.ascontiguousarray(coords, dtype=float).reshape(-1, 3), coords.shape[0],
-                        self.lo, self.h, self.shape, self.table, self.points, self.labels,
-                        blocked, self.bound, out)
-        return out
+from ..conformers import ConformerLibrary, embed_at, uff_energy, uff_polish
+from ..core import BindingSite
+from ..refine import refine, stretch
+from ..torsion import TorsionModel
+from ..utils.rotation import rotations_about_axis
+from .fitting import Candidate, Fit, fit_conformers, mean_normal, site_normals
+from .grid import CoreGrid, _over_sites
+from .sites import assign_faces
 
 
 class ConstellationSampler:
@@ -860,16 +593,16 @@ class ConstellationSampler:
         if res is not None:
             held = [i for g in groups for i in g]
             held += np.flatnonzero(core.query(res.coords)[0] < self.overlap_cutoff + 0.5).tolist()
-            y, e = _uff_polish(mol, res.coords, held)
+            y, e = uff_polish(mol, res.coords, held)
             poses = [(y, e), (res.coords, None)]
         for y, e in poses:
             if self._core_clearance(y[None], excluded)[0] >= self.overlap_cutoff:
-                energy = (_uff_energy(mol, y) if e is None else e) - lib.reference_energy
+                energy = (uff_energy(mol, y) if e is None else e) - lib.reference_energy
                 cand = Candidate(sites=cand.sites, targets=cand.targets,
                                  fits=[dataclasses.replace(fit, xyz=y, origin="stretched",
                                                            energy=energy)])
                 return lib.with_template(mol, groups, y, energy), cand
-        energy = _uff_energy(mol, x) - lib.reference_energy
+        energy = uff_energy(mol, x) - lib.reference_energy
         return lib.with_template(mol, groups, x, energy, stretched=False), cand
 
 

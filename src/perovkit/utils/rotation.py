@@ -49,3 +49,13 @@ def rotation_from_u_to_v(u: np.ndarray, v: np.ndarray) -> np.ndarray:
     theta = np.arccos(c)
 
     return rotation_about_axis(axis, theta)
+
+def rotations_about_axis(axis: np.ndarray, thetas: np.ndarray) -> np.ndarray:
+    """
+    Rodrigues rotation matrices about one unit axis for many angles: (n_theta, 3, 3).
+    """
+    x, y, z = axis
+    K = np.array([[0, -z, y], [z, 0, -x], [-y, x, 0]], dtype=float)
+    s = np.sin(thetas)[:, None, None]
+    c = np.cos(thetas)[:, None, None]
+    return np.eye(3) + s * K + (1.0 - c) * (K @ K)
