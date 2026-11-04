@@ -51,7 +51,7 @@ class Core(Part):
     binding_sites: List[BindingSite] = field(default_factory=list)
 
     def __post_init__(self, build_surface: bool):
-        if isinstance(self.A, list):
+        if self.has_organic_A:
             self.A = self._build_A_ligands(self.A[0])
         if build_surface:
             self._build_surface()
@@ -78,11 +78,13 @@ class Core(Part):
         return {"A": self.A_label, "B": self.B, "X": self.X}
 
     @property
+    def has_organic_A(self) -> bool:
+        """Whether the A sites hold molecular cations (Ligands) rather than an element."""
+        return isinstance(self.A, list)
+
+    @property
     def A_label(self) -> str:
-        if isinstance(self.A, list):
-            lig = self.A[0]
-            return lig.name if lig.name is not None else lig.atoms.get_chemical_formula()
-        return self.A
+        return self.A[0].name if self.has_organic_A else self.A
 
 
     @classmethod
@@ -204,7 +206,7 @@ class Core(Part):
         Center and atom indices of every A-site cation.
         """
         positions = self.atoms.get_positions()
-        if isinstance(self.A, list):
+        if self.has_organic_A:
             return [(positions[lig.indices].mean(axis=0), lig.indices) for lig in self.A]
 
         symbols = np.array(self.atoms.get_chemical_symbols())
@@ -237,7 +239,7 @@ class Core(Part):
         keep[np.concatenate([cations[i][1] for i in chosen])] = False
         self.atoms = self.atoms[keep]
 
-        if isinstance(self.A, list):
+        if self.has_organic_A:
             self.A = self._build_A_ligands(self.A[0])
 
 
@@ -410,7 +412,8 @@ class Core(Part):
             nx, ny, nz = self.supercell or (0, 0, 0)
             filename = f"{self.A_label}{self.B}{self.X}3_{nx}x{ny}x{nz}.{fmt}"
 
-        write_structure(self.atoms, filename, fmt, box=self.is_nanocrystal, vacuum=vacuum, **kwargs)
+        write_structure(self.atoms, filename, fmt, center_in_box=self.is_nanocrystal, vacuum=vacuum,
+                        **kwargs)
 
 
     def _surface_planes(self, points: np.ndarray) -> np.ndarray:
@@ -437,10 +440,9 @@ class Core(Part):
         """
         positions = self.atoms.get_positions()
         symbols = np.array(self.atoms.get_chemical_symbols())
-        organic = isinstance(self.A, list)
 
         by_plane = defaultdict(lambda: defaultdict(list))
-        for elem in [self.X] if organic else [self.A, self.X]:
+        for elem in [self.X] if self.has_organic_A else [self.A, self.X]:
             elem_atoms = np.flatnonzero(symbols == elem)
             planes = self._surface_planes(positions[elem_atoms])
             for i, plane in zip(elem_atoms.tolist(), planes.tolist()):
@@ -452,7 +454,7 @@ class Core(Part):
                  for elem, indices in elems.items()
                  for i in indices]
 
-        if organic:
+        if self.has_organic_A:
             a_sites = self._A_sites()
             planes = self._surface_planes(np.array([center for center, _ in a_sites]))
             sites.extend(BindingSite(index=idx.tolist(), symbol=self.A_label, plane=tuple(plane),
@@ -496,13 +498,14 @@ class BindingSite:
         plane (Tuple[int, int, int]): Miller index (h, k, l) indicating the surface plane.
         position (np.ndarray): Site position (Å): the atom position for a single-atom
             site, or the molecule center for a molecular site.
-        passivated (bool): Whether a ligand is attached to this site.
+        available (bool): Whether a ligand may still bind here: False once one binds
+            to it, or a multi-motif ligand lies over it or close enough to cover it.
     """
     index: int | List[int]
     symbol: str
     plane: Tuple[int, int, int]
     position: np.ndarray
-    passivated: bool = False
+    available: bool = True
 
     @property
     def atom_indices(self) -> List[int]:

@@ -43,7 +43,7 @@ def apply_strain(
             if anchor0 is not None:
                 pos_new[lig.indices] += affine(anchor0) - anchor0
 
-    for cation in core.A if isinstance(core.A, list) else []:
+    for cation in core.A if core.has_organic_A else []:
         g = cation.indices
         c0 = pos0[g].mean(axis=0)
         pos_new[g] = pos0[g] + (affine(c0) - c0)

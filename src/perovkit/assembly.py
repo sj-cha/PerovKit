@@ -48,12 +48,12 @@ class Assembly:
         self._build_atoms()
 
 
-    def remove_ligand(self, id: int) -> None:
+    def remove_ligand(self, ligand_id: int) -> None:
         """Remove the ligand with this id; the ligands after it move up one id."""
         self._follow_deleted_atoms()
-        if not any(lig.id == id for lig in self.ligands):
-            raise ValueError(f"No ligand with id={id} found.")
-        del self.atoms[self.atoms.arrays["ligand_id"] == id]
+        if not any(lig.id == ligand_id for lig in self.ligands):
+            raise ValueError(f"No ligand with id={ligand_id} found.")
+        del self.atoms[self.atoms.arrays["ligand_id"] == ligand_id]
         self._follow_deleted_atoms()
 
 
@@ -160,7 +160,8 @@ class Assembly:
         if filename is None:
             filename = f"{self.atoms.get_chemical_formula()}.{fmt}"
 
-        write_structure(self.atoms, filename, fmt, box=self.core.is_nanocrystal, vacuum=vacuum, **kwargs)
+        write_structure(self.atoms, filename, fmt, center_in_box=self.core.is_nanocrystal,
+                        vacuum=vacuum, **kwargs)
         if write_json:
             self.to_json(f"{filename}.json", sort=fmt == "vasp")
 
@@ -224,7 +225,7 @@ class Assembly:
         core_id[core_id >= 0] = np.arange(len(kept))
 
         core = self.core
-        if isinstance(core.A, list):
+        if core.has_organic_A:
             core.A = [lig for lig in core.A if len(lig.indices)]
         self.ligands = [lig for lig in self.ligands if len(lig.indices)]
 

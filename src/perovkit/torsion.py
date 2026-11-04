@@ -82,7 +82,7 @@ def _euler_many(angles: np.ndarray):
     return Rz @ Ry @ Rx, np.stack([Rz @ Ry @ dRx, Rz @ dRy @ Rx, dRz @ Ry @ Rx])
 
 
-def _dihedral(p: np.ndarray) -> float:
+def dihedral(p: np.ndarray) -> float:
     """
     Dihedral angle (radians) of four points, positive for a right-handed turn of p[3]
     about the axis p[1] -> p[2].

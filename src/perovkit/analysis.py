@@ -60,14 +60,14 @@ def _mic_vectors(frames: list, i: np.ndarray, j: np.ndarray) -> np.ndarray:
     return np.stack([_mic(v, c, p) for v, c, p in zip(vecs, cells, pbcs)])
 
 
-def _octahedra(structure, B_sites) -> Tuple[list, bool, dict, dict, set]:
+def _read(structure, B_indices) -> Tuple[list, bool, dict, dict, set]:
     """
     The frames, whether they are a trajectory, the octahedra and lattice coordinates of the
-    first, and the B atoms to consider: those of `B_sites`, all by default.
+    first, and the B atoms to consider: those of `B_indices`, all by default.
     """
     frames, is_traj = _as_frames(structure)
     octahedra = frames[0].octahedra
-    b_set = set(B_sites) if B_sites is not None else set(octahedra.keys())
+    b_set = set(B_indices) if B_indices is not None else set(octahedra.keys())
     return frames, is_traj, octahedra, frames[0].B_ijk, b_set
 
 
@@ -132,13 +132,13 @@ def compute_angles(structure,
     return out if is_traj else out[0]
 
 
-def compute_B_X_B_angles(structure, B_sites: Optional[List[int]] = None) -> pd.DataFrame:
+def compute_B_X_B_angles(structure, B_indices: Optional[List[int]] = None) -> pd.DataFrame:
     """
-    B-X-B angles (deg) at every X shared by two B sites of `B_sites` (all B by default).
+    B-X-B angles (deg) at every X shared by two B atoms of `B_indices` (all B by default).
 
     Returns a DataFrame with columns B1, B2, X, B1_ijk, B2_ijk, angles.
     """
-    frames, is_traj, octahedra, B_ijk, b_set = _octahedra(structure, B_sites)
+    frames, is_traj, octahedra, B_ijk, b_set = _read(structure, B_indices)
 
     # Build reverse map: X_index -> list of B indices that contain it
     x_to_b = {}
@@ -165,13 +165,13 @@ def compute_B_X_B_angles(structure, B_sites: Optional[List[int]] = None) -> pd.D
     return _table(results, ['B1', 'B2', 'X'])
 
 
-def compute_X_B_X_angles(structure, B_sites: Optional[List[int]] = None) -> pd.DataFrame:
+def compute_X_B_X_angles(structure, B_indices: Optional[List[int]] = None) -> pd.DataFrame:
     """
-    X-B-X angles (deg) inside the octahedron of every B in `B_sites` (all B by default).
+    X-B-X angles (deg) inside the octahedron of every B in `B_indices` (all B by default).
 
     Returns a DataFrame with columns B, X1, X2, B_ijk, angles.
     """
-    frames, is_traj, octahedra, B_ijk, b_set = _octahedra(structure, B_sites)
+    frames, is_traj, octahedra, B_ijk, b_set = _read(structure, B_indices)
 
     # One row for each pair of X atoms in an octahedron
     results = []
@@ -192,13 +192,13 @@ def compute_X_B_X_angles(structure, B_sites: Optional[List[int]] = None) -> pd.D
     return _table(results, ['B', 'X1', 'X2'])
 
 
-def compute_B_X_distances(structure, B_sites: Optional[List[int]] = None) -> pd.DataFrame:
+def compute_B_X_distances(structure, B_indices: Optional[List[int]] = None) -> pd.DataFrame:
     """
-    B-X bond lengths (Å) of the octahedron of every B in `B_sites` (all B by default).
+    B-X bond lengths (Å) of the octahedron of every B in `B_indices` (all B by default).
 
     Returns a DataFrame with columns B, X, B_ijk, distances.
     """
-    frames, is_traj, octahedra, B_ijk, b_set = _octahedra(structure, B_sites)
+    frames, is_traj, octahedra, B_ijk, b_set = _read(structure, B_indices)
 
     results = [
         {'B': b_idx, 'X': x_idx, 'B_ijk': B_ijk.get(b_idx)}
@@ -212,7 +212,7 @@ def compute_B_X_distances(structure, B_sites: Optional[List[int]] = None) -> pd.
     return _table(results, ['B', 'X'])
 
 
-def compute_bond_angle_variance(structure, B_sites: Optional[List[int]] = None,
+def compute_bond_angle_variance(structure, B_indices: Optional[List[int]] = None,
                                 linear_threshold: float = 130.0) -> pd.DataFrame:
     """
     Bond angle variance (deg^2) of every octahedron: sum of (angle - 90)^2 / (n - 1) over
@@ -222,7 +222,7 @@ def compute_bond_angle_variance(structure, B_sites: Optional[List[int]] = None,
     Returns a DataFrame with columns B, B_ijk, bond_angle_variance.
     """
     frames, is_traj = _as_frames(structure)
-    df = compute_X_B_X_angles(structure, B_sites)
+    df = compute_X_B_X_angles(structure, B_indices)
 
     if is_traj:
         columns = ['B', 'B_ijk', 'bond_angle_variance']
@@ -251,14 +251,14 @@ def compute_bond_angle_variance(structure, B_sites: Optional[List[int]] = None,
     return variance_df
 
 
-def compute_distortion_index(structure, B_sites: Optional[List[int]] = None) -> pd.DataFrame:
+def compute_distortion_index(structure, B_indices: Optional[List[int]] = None) -> pd.DataFrame:
     """
     Distortion index of every octahedron: mean |d - <d>| / <d> over its B-X bond lengths d.
 
     Returns a DataFrame with columns B, B_ijk, distortion_index.
     """
     frames, _ = _as_frames(structure)
-    df = compute_B_X_distances(structure, B_sites)
+    df = compute_B_X_distances(structure, B_indices)
     if df.empty:
         return pd.DataFrame()
 
@@ -276,7 +276,7 @@ def compute_distortion_index(structure, B_sites: Optional[List[int]] = None) -> 
     return pd.DataFrame(results)
 
 
-def compute_quadratic_elongation(structure, B_sites: Optional[List[int]] = None) -> pd.DataFrame:
+def compute_quadratic_elongation(structure, B_indices: Optional[List[int]] = None) -> pd.DataFrame:
     """
     Quadratic elongation of every complete (6-X) octahedron: mean (d / l_0)^2, with l_0 the
     center-to-vertex distance of a regular octahedron of the same volume. For a trajectory the
@@ -284,7 +284,7 @@ def compute_quadratic_elongation(structure, B_sites: Optional[List[int]] = None)
 
     Returns a DataFrame with columns B, B_ijk, quadratic_elongation.
     """
-    frames, is_traj, octahedra, B_ijk, b_set = _octahedra(structure, B_sites)
+    frames, is_traj, octahedra, B_ijk, b_set = _read(structure, B_indices)
 
     sites = [(b_idx, entry['X']) for b_idx, entry in octahedra.items()
              if b_idx in b_set and len(entry['X']) == 6]

@@ -10,7 +10,7 @@ def write_structure(
     atoms: Atoms,
     filename: str,
     fmt: str,
-    box: bool = False,
+    center_in_box: bool = False,
     vacuum: float = 20.0,
     **kwargs,
 ) -> None:
@@ -21,7 +21,7 @@ def write_structure(
         atoms: The structure; it is left as it is.
         filename: Output path.
         fmt: "vasp", or a format of ase.io.write; plain "xyz" gets the formula as a comment.
-        box: For "vasp", center the atoms in a periodic orthorhombic cell first, as a
+        center_in_box: For "vasp", center the atoms in a periodic orthorhombic cell first, as a
             molecule or a nanocrystal needs.
         vacuum: How much wider (Å) that cell is than the atoms along each axis.
         **kwargs: Forwarded to the writer. "vasp" always sorts the atoms by element.
@@ -30,7 +30,7 @@ def write_structure(
     path.parent.mkdir(parents=True, exist_ok=True)
 
     if fmt == "vasp":
-        if box:
+        if center_in_box:
             pos = atoms.get_positions()
             cell_diag = pos.max(axis=0) - pos.min(axis=0) + vacuum
             center = pos.mean(axis=0)
