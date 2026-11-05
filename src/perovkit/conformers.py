@@ -5,11 +5,35 @@ from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import numpy as np
 from rdkit import Chem
-from rdkit.Chem import AllChem
+from rdkit.Chem import AllChem, rdMolTransforms
 from rdkit.Geometry import Point3D
+
+from .torsion import ROTATABLE
 
 if TYPE_CHECKING:
     from .ligand import Ligand
+
+
+def extended(mol: Chem.Mol) -> Optional[np.ndarray]:
+    """
+    Coordinates of the mol's conformer with every rotatable bond anti (180°), bonds and
+    angles relaxed with UFF while those torsions stay put; None without rotatable bonds.
+    """
+    m = Chem.Mol(mol)
+    conf = m.GetConformer()
+    quads = []
+    for i, j in m.GetSubstructMatches(ROTATABLE):
+        a = next(n.GetIdx() for n in m.GetAtomWithIdx(i).GetNeighbors() if n.GetIdx() != j)
+        d = next(n.GetIdx() for n in m.GetAtomWithIdx(j).GetNeighbors() if n.GetIdx() != i)
+        rdMolTransforms.SetDihedralDeg(conf, a, i, j, d, 180.0)
+        quads.append((a, i, j, d))
+    if not quads:
+        return None
+    ff = AllChem.UFFGetMoleculeForceField(m)
+    for q in quads:
+        ff.UFFAddTorsionConstraint(*q, False, 180.0, 180.0, 1.0e5)
+    ff.Minimize(maxIts=200)
+    return m.GetConformer().GetPositions()
 
 
 @dataclass
@@ -91,7 +115,8 @@ class ConformerLibrary:
         """
         Embed conformers with ETKDG and, optionally, minimize them with UFF.
 
-        The ligand's current geometry is kept as conformer 0. UFF is used because RDKit's
+        Conformer 0 is the ligand's current geometry with every rotatable bond anti (left out
+        without rotatable bonds), the next the geometry itself. UFF is used because RDKit's
         implementation has no electrostatic term: MMFF in vacuum folds zwitterions into an
         intramolecular salt bridge, which would hide the extended conformers that bridge
         two surface sites.
@@ -114,7 +139,12 @@ class ConformerLibrary:
         if not ligand.binding_atoms:
             raise ValueError("ConformerLibrary needs a ligand with binding motifs")
 
-        mol = Chem.Mol(ligand.mol)  # conformer 0 holds the current geometry
+        mol = Chem.Mol(ligand.mol)  # its conformer holds the current geometry
+        anti = extended(mol)
+        if anti is not None:
+            current = Chem.Conformer(mol.GetConformer())
+            mol.GetConformer().SetPositions(anti)
+            mol.AddConformer(current, assignId=True)
         params = AllChem.ETKDGv3()
         params.randomSeed = random_seed
         params.pruneRmsThresh = prune_rms

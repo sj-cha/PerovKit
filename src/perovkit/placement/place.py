@@ -39,7 +39,7 @@ def place_ligands(
     max_anchor_rmsd: float = 0.5,   # Å
     refine_torsions: bool = True,
     stretch_tails: bool = True,
-    n_workers: int = 32,   # at most the CPUs available
+    n_workers: int = 8,   # at most the CPUs available
     **sampler_options,
 ) -> Assembly:
     """
@@ -94,7 +94,7 @@ def place_ligands(
     multi_motif_poses = [p for p in poses if isinstance(p, MultiMotifPose)]
     if multi_motif_poses:
         dev = np.concatenate([
-            np.linalg.norm(box.mic(p.ligand.anchor_positions - p.candidate.targets), axis=1)
+            np.linalg.norm(box.mic(p.ligand.anchor_positions - p.targets), axis=1)
             for p in multi_motif_poses
         ])
         bent = sum(p.sources[p.variant] != "fit" for p in multi_motif_poses)

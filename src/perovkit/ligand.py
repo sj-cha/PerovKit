@@ -8,11 +8,11 @@ import numpy as np
 from ase import Atoms
 from ase.io import read
 from rdkit import Chem
-from rdkit.Chem import AllChem, rdDetermineBonds, rdMolTransforms
+from rdkit.Chem import AllChem, rdDetermineBonds
 
 from .conformers import ConformerLibrary
 from .io.structure import write_structure
-from .torsion import ROTATABLE, TorsionModel
+from .torsion import TorsionModel
 from .utils.rotation import rotation_about_axis, rotation_from_u_to_v
 from .utils.selection import Part, PartAtoms
 
@@ -230,7 +230,6 @@ class Ligand(Part):
         binding_motifs: BindingMotif | List[BindingMotif] = None,
         random_seed: int = 42,
         name: str = None,
-        optimize: bool = False,
     ) -> Ligand:
         """
         Build a Ligand from a SMILES string.
@@ -241,11 +240,10 @@ class Ligand(Part):
                 surface; a list gives one motif per binding group.
             random_seed (int): Random seed for ETKDG embedding.
             name (str): User-defined identifier; the chemical formula by default.
-            optimize (bool): If True, fully relax with UFF; otherwise set rotatable bonds 
-                             to 180° (extended) and relax with torsions fixed.
 
         Returns:
-            A Ligand instance.
+            A Ligand instance, embedded with ETKDG and relaxed with UFF. Its chains are
+            stretched at placement, not here.
         """
         mol = Chem.AddHs(Chem.MolFromSmiles(smiles))
         params = AllChem.ETKDGv3()
@@ -260,24 +258,7 @@ class Ligand(Part):
         if conf_id < 0:
             raise ValueError("RDKit failed to generate a conformer for ligand.")
 
-        if optimize:
-            AllChem.UFFOptimizeMolecule(mol, confId=conf_id, maxIters=1000)
-        else:
-            # Set all rotatable bond dihedrals to 180°
-            conf = mol.GetConformer()
-            torsion_indices = []
-            for i, j in mol.GetSubstructMatches(ROTATABLE):
-                neighbor_i = next(n.GetIdx() for n in mol.GetAtomWithIdx(i).GetNeighbors() if n.GetIdx() != j)
-                neighbor_j = next(n.GetIdx() for n in mol.GetAtomWithIdx(j).GetNeighbors() if n.GetIdx() != i)
-                quad = (neighbor_i, i, j, neighbor_j)
-                rdMolTransforms.SetDihedralDeg(conf, *quad, 180.0)
-                torsion_indices.append(quad)
-
-            # Relax bonds/angles while keeping torsions fixed at 180°
-            ff = AllChem.UFFGetMoleculeForceField(mol)
-            for a, b, c, d in torsion_indices:
-                ff.UFFAddTorsionConstraint(a, b, c, d, False, 180.0, 180.0, 1.0e5)
-            ff.Minimize(maxIts=200)
+        AllChem.UFFOptimizeMolecule(mol, confId=conf_id, maxIters=1000)
 
         atoms = Atoms(positions=mol.GetConformer().GetPositions(),
                       symbols=[atom.GetSymbol() for atom in mol.GetAtoms()])
