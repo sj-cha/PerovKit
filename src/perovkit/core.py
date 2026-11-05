@@ -102,9 +102,8 @@ class Core(Part):
         A_site_disorder: str = "balanced",
     ) -> Core:
         """
-        Build an ABX3 core periodic along the axes given by `pbc` (as in ASE, one bool for
-        all three or one per axis): an AX-terminated nanocrystal for False, a slab periodic in
-        x, y with vacuum along z for (True, True, False).
+        Build an ABX3 core: an AX-terminated nanocrystal for pbc=False, a slab periodic in x
+        and y with vacuum along z for pbc=True, which is (True, True, False).
 
         Args:
             A (str | Ligand): A-site species. A chemical symbol for an inorganic cation, 
@@ -112,7 +111,7 @@ class Core(Part):
             B, X (str): Chemical symbols for B- and X-site species.
             a (float): Cubic lattice constant (Å).
             supercell (Sequence[int]): Number of repeating unit cells along x, y, z.
-            pbc (bool | Sequence[bool]): Periodicity along x, y, z: False or (True, True, False).
+            pbc (bool | Sequence[bool]): False, or True or (True, True, False); nothing else.
             vacuum (float): Vacuum thickness (Å) along z (slab only).
             charge_neutral (bool): Remove surface A cations to ensure charge neutrality, corners
                                    first, then others at random (nanocrystal only).
@@ -127,9 +126,12 @@ class Core(Part):
         Returns:
             A Core instance.
         """
-        periodic = np.broadcast_to(np.asarray(pbc, dtype=bool), 3)
-        if periodic.any() and periodic.tolist() != [True, True, False]:
-            raise ValueError(f"pbc must be False (nanocrystal) or (True, True, False) (slab); got {pbc}")
+        flags = np.ravel(pbc)
+        if not all(isinstance(p, (bool, np.bool_)) for p in flags) or flags.tolist() not in (
+                [False], [True], [True, True, False]) or (len(flags) == 1 and not np.isscalar(pbc)):
+            raise ValueError(f"pbc must be False (nanocrystal), or True or (True, True, False) "
+                             f"(slab); got {pbc!r}")
+        periodic = np.array([True, True, False]) if flags[0] else np.zeros(3, dtype=bool)
         if len(supercell) != 3 or min(supercell) <= 0:
             raise ValueError(f"supercell must be three positive integers (nx, ny, nz); got {supercell}")
         if A_site_disorder not in ("balanced", "random", "none"):
