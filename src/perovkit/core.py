@@ -372,27 +372,6 @@ class Core(Part):
         return place_ligands(self, ligand_specs, **kwargs)
 
 
-    def place_ligands_manually(self, ligand_specs: Sequence[LigandSpec], **kwargs) -> Assembly:
-        """
-        Place ligands on a copy of this core, which is left as it is, without the
-        rotation search: cations shifted by cat_x/y/z_move (Å) and turned by cat_z_rotate
-        (degrees) about the surface normal, anions by the an_* values. Single-motif
-        ligands only.
-
-        Args:
-            ligand_specs: The ligands with their coverages or sites.
-            **kwargs: cat_x_move, cat_y_move, cat_z_move, cat_z_rotate, an_x_move,
-                an_y_move, an_z_move, an_z_rotate (all 0), ligand_ids (None: every
-                ligand; else only those ids, counted from 0 in placement order, are
-                shifted and turned), random_seed (42), verbose (True).
-
-        Returns:
-            Assembly: the core with its ligands.
-        """
-        from .placement import place_ligands_manually
-        return place_ligands_manually(self, ligand_specs, **kwargs)
-
-
     def to(
         self, 
         fmt: str, 
