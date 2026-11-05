@@ -63,10 +63,6 @@ class Candidate:
     targets: np.ndarray
     fits: List[Fit]
 
-    @property
-    def atom_indices(self) -> List[int]:
-        return [i for s in self.sites for i in s.atom_indices]
-
 
 class ConformerFits(NamedTuple):
     """

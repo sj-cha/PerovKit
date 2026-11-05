@@ -21,7 +21,7 @@ from .sites import assign_faces
 
 if TYPE_CHECKING:
     from rdkit import Chem
-    from ..ligand import LigandSpec
+    from ..ligand import Ligand
 
 
 @numba.njit(cache=True)
@@ -58,8 +58,8 @@ class _TypeSetup:
     learned so far (the sampler keeps it under `key`, the id of the ligand's own library),
     the torsion model that rescues fits clashing with the core (None: they are rejected), its
     binding groups and RDKit mol, the radii with which its atoms shadow the surface (zero for
-    atoms that cast none: a surface site lies under one ligand at most), the offset (Å) of
-    its anchors along the site normals, and whether it displaces its site atoms.
+    atoms that cast none: a surface site lies under one ligand at most), and per motif the
+    offset (Å) of its anchor along the site normal and whether it displaces its site atoms.
     """
     lib: ConformerLibrary
     key: int
@@ -67,8 +67,8 @@ class _TypeSetup:
     groups: List[List[int]]
     mol: Chem.Mol
     radii: np.ndarray
-    offset: float
-    displaces: bool
+    offsets: np.ndarray
+    displaces: List[bool]
 
 
 class _Start(NamedTuple):
@@ -168,20 +168,21 @@ class ConstellationSampler:
         self.occupancy: Dict[tuple, float] = {}
 
 
-    def _setup(self, spec: LigandSpec, refine_torsions: bool) -> _TypeSetup:
-        lig = spec.ligand
+    def _setup(self, lig: Ligand, refine_torsions: bool) -> _TypeSetup:
         lib = lig.conformers()
         tm = lig.torsion_model()
+        motifs = lig.binding_motifs
         # only frame atoms shadow sites: torsion-turned atoms can move out of the way
         return _TypeSetup(lib=self._libraries.get(id(lib), lib), key=id(lib),
                           model=tm if refine_torsions else None, groups=lig.binding_groups,
                           mol=lig.mol, radii=np.where(tm.frame, tm.radii, 0.0),
-                          offset=float(spec.anchor_offset), displaces=not spec.adsorb)
+                          offsets=np.array([m.anchor_offset for m in motifs]),
+                          displaces=[not m.adsorb for m in motifs])
 
 
     def sample(
         self,
-        spec: LigandSpec,
+        lig: Ligand,
         pools: List[List[BindingSite]],
         n_target: int,
         refine_torsions: bool,
@@ -196,7 +197,7 @@ class ConstellationSampler:
         other faces take up the shortfall.
 
         Args:
-            spec (LigandSpec): The multi-motif ligand, its anchor offset and whether it adsorbs.
+            lig (Ligand): The multi-motif ligand.
             pools (List[List[BindingSite]]): Candidate sites of each motif.
             n_target (int): Number of ligands wanted.
             refine_torsions (bool): Whether fits that clash with the core are refined in
@@ -205,7 +206,7 @@ class ConstellationSampler:
         Returns:
             The accepted candidates and a count of the reasons seeds were rejected.
         """
-        setup = self._setup(spec, refine_torsions)
+        setup = self._setup(lig, refine_torsions)
         accepted: List[Candidate] = []
         failures: Counter = Counter()
         seeds = pools[0]
@@ -259,15 +260,15 @@ class ConstellationSampler:
 
     def fit_sites(
         self,
-        spec: LigandSpec,
+        lig: Ligand,
         sites: List[BindingSite],
         refine_torsions: bool,
     ) -> Tuple[Optional[Candidate], str]:
         """
-        Evaluate one given constellation for `spec` and accept it if a fit clears the core;
+        Evaluate one given constellation for `lig` and accept it if a fit clears the core;
         returns (candidate or None, rejection reason).
         """
-        setup = self._setup(spec, refine_torsions)
+        setup = self._setup(lig, refine_torsions)
         seed = sites[0]
         rel = np.array([self.box.mic(s.position - seed.position) for s in sites])
         cand, reason, stuck = self._evaluate(setup, sites, seed.position + rel)
@@ -288,10 +289,10 @@ class ConstellationSampler:
         covers it with its radius: a broad multipodal ligand lying on the surface would
         otherwise let its neighbors start inside it.
         """
-        for s in cand.sites:
+        for s, displaces in zip(cand.sites, setup.displaces):
             s.available = False
-        if setup.displaces:
-            self.displaced.update(cand.atom_indices)
+            if displaces:
+                self.displaced.update(s.atom_indices)
         x = cand.fits[0].coords(setup.lib)
         self.placed.append(x)
         self._lig_tree = self.box.tree(np.vstack(self.placed))
@@ -448,7 +449,7 @@ class ConstellationSampler:
         """
         lib = setup.lib
         normals = site_normals(sites)
-        targets = positions + setup.offset * normals
+        targets = positions + setup.offsets[:, None] * normals
         res = fit_conformers(lib, targets, normals, w_align=self.w_align,
                              w_foot=self.w_foot, foot_scale=self.foot_scale)
 
@@ -585,7 +586,7 @@ class ConstellationSampler:
                 return None
             self._n_embedded += 1
             normals = site_normals(sites)
-            targets = positions + setup.offset * normals
+            targets = positions + setup.offsets[:, None] * normals
             res = fit_conformers(lib, targets, normals, w_align=self.w_align,
                                  w_foot=self.w_foot, foot_scale=self.foot_scale)
             c = int(np.argmin(res.cost))
@@ -650,14 +651,13 @@ class ConstellationSampler:
         return cand
 
 
-    def _excluded(self, sites: List[BindingSite], displaces: bool) -> np.ndarray:
+    def _excluded(self, sites: List[BindingSite], displaces: List[bool]) -> np.ndarray:
         """
-        Core atoms a pose at `sites` may overlap: those already displaced, and its own sites'
-        atoms when it displaces them.
+        Core atoms a pose at `sites` may overlap: those already displaced, and the atoms of
+        its own sites that its motifs displace (`displaces`, one per site).
         """
         excluded = set(self.displaced)
-        if displaces:
-            excluded.update(i for s in sites for i in s.atom_indices)
+        excluded.update(i for s, d in zip(sites, displaces) if d for i in s.atom_indices)
         return np.fromiter(excluded, dtype=int, count=len(excluded))
 
 

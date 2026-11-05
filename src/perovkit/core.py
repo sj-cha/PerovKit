@@ -9,7 +9,7 @@ from ase import Atoms
 from ase.data import covalent_radii, atomic_numbers
 
 from .io.structure import write_structure
-from .ligand import Ligand, LigandSpec
+from .ligand import Ligand
 from .utils.box import Box
 from .utils.rotation import rotation_about_axis, rotation_from_u_to_v
 from .utils.selection import Part, PartAtoms
@@ -352,14 +352,27 @@ class Core(Part):
         apply_strain(structure=self, strain=strain, strain_ligands=False)
 
 
-    def place_ligands(self, ligand_specs: Sequence[LigandSpec], **kwargs) -> Assembly:
+    def place_ligands(
+        self,
+        ligands: Sequence[Ligand],
+        coverage: Sequence[float | Sequence],
+        **kwargs,
+    ) -> Assembly:
         """
         Place ligands on a copy of this core, which is left as it is: sites by coverage
         (or as given), then turns about the surface normals until no atoms of different
-        ligands, or of a ligand and the core, are within `overlap_cutoff`.
+        ligands, or of a ligand and the core, are within `overlap_cutoff`. Where and how
+        each ligand binds, replacing its site atoms or adsorbing on them, its
+        BindingMotif(s) say.
 
         Args:
-            ligand_specs: The ligands with their coverages or sites.
+            ligands: The ligands to place.
+            coverage: One entry per ligand. Up to 1, the fraction of the free sites to take;
+                above 1, a number of ligands (its whole part); a list, the sites to take by
+                atom index (any atom of a molecular A-site), for a multi-motif ligand groups
+                of one index per motif, in motif order. For a multi-motif ligand the fraction
+                is of the most ligands the free sites can host, each sublattice serving its
+                free sites divided by the motifs that need it.
             **kwargs: Options of the placement: max_iters (10), overlap_cutoff (1.6 Å),
                 coarse_step_deg (18), fine_step_deg (2), window_deg (12),
                 active_radius_factor (sqrt(2)/2), random_seed (42), verbose (True),
@@ -371,7 +384,7 @@ class Core(Part):
             Assembly: the core with its ligands.
         """
         from .placement import place_ligands
-        return place_ligands(self, ligand_specs, **kwargs)
+        return place_ligands(self, ligands, coverage, **kwargs)
 
 
     def to(

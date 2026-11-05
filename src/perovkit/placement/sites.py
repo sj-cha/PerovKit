@@ -1,13 +1,14 @@
 from __future__ import annotations
 from collections import Counter
 import math
+from numbers import Real
 import random
 from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
 from ..core import BindingSite, Core
-from ..ligand import Ligand, LigandSpec
+from ..ligand import Ligand
 from ..utils.sampling import farthest_point_sampling, per_face_farthest_point_sampling
 from .fitting import Candidate
 
@@ -47,33 +48,34 @@ def assign_faces(sites: Sequence[BindingSite]) -> List[tuple]:
 
 def take_sites(
     core: Core,
-    spec: LigandSpec,
+    lig: Ligand,
+    coverage: float | Sequence[int],
     sites: List[BindingSite],
     rng: random.Random,
     displaced: List[int],
     log: Callable,
 ) -> List[Tuple[Ligand, BindingSite]]:
     """
-    Take free sites for a single-motif spec, those it names or else as many as its
-    coverage asks for, spread by farthest-point sampling. The sublattice is `spec.site`,
-    or else A for a cation and X otherwise. Returns a copy of the ligand for each site;
-    the surface atoms the ligands replace are added to `displaced`.
+    Take free sites for a single-motif ligand on the sublattice of its motif: those
+    `coverage` lists, or else as many as it asks for, spread by farthest-point sampling.
+    Returns a copy of the ligand for each site; the surface atoms the ligands replace are
+    added to `displaced`.
     """
-    lig = spec.ligand
-    sublattice = spec.site if spec.site is not None else ("A" if lig.charge > 0 else "X")
+    motif = lig.binding_motifs[0]
+    sublattice = motif.site
     symbol = core.site_symbols[sublattice]
     available = [s for s in sites if s.symbol == symbol and s.available]
 
-    if spec.binding_site_indices is not None:
+    if not isinstance(coverage, Real):
         chosen_sites = []
-        for idx in spec.binding_site_indices:
+        for idx in coverage:
             site = next((s for s in available if idx in s.atom_indices), None)
             if site is None:
                 print(f"[Warning] Requested binding site index {idx} not available for ligand {lig.name}.")
             elif site not in chosen_sites:
                 chosen_sites.append(site)
     else:
-        n_target = _n_target(spec.coverage, len(available))
+        n_target = _n_target(coverage, len(available))
         if n_target > len(available):
             print(f"[Warning] Requested {n_target} sites for ligand, "
                   f"but only {len(available)} available.")
@@ -92,20 +94,19 @@ def take_sites(
     for site in chosen_sites:
         clone = lig.clone()
         clone.planes = [site.plane]
-        clone._anchor_offset = float(spec.anchor_offset)
         site.available = False
         taken.append((clone, site))
         # Replace mode removes the surface atom(s); adsorb mode keeps them.
-        if not spec.adsorb:
+        if not motif.adsorb:
             displaced.extend(site.atom_indices)
 
-    mode = "Adsorbed" if spec.adsorb else "Placed"
+    mode = "Adsorbed" if motif.adsorb else "Placed"
     log(f"[Log] {mode} total {len(chosen_sites)} {sublattice}-site ligands.")
     return taken
 
 
 def motif_pools(
-    spec: LigandSpec,
+    lig: Ligand,
     binding_sites: List[BindingSite],
     symbol_map: Dict[str, str],
 ) -> Tuple[List[List[BindingSite]], Dict[str, List[BindingSite]]]:
@@ -113,12 +114,13 @@ def motif_pools(
     Candidate sites of every motif, and the sites of every sublattice the motifs need.
     """
     by_sublattice = {sublattice: [s for s in binding_sites if s.symbol == symbol_map[sublattice]]
-                     for sublattice in {m.site for m in spec.ligand.binding_motifs}}
-    return [by_sublattice[m.site] for m in spec.ligand.binding_motifs], by_sublattice
+                     for sublattice in {m.site for m in lig.binding_motifs}}
+    return [by_sublattice[m.site] for m in lig.binding_motifs], by_sublattice
 
 
 def select_constellations(
-    spec: LigandSpec,
+    lig: Ligand,
+    coverage: float | Sequence[Sequence[int]],
     pools: List[List[BindingSite]],
     by_sublattice: Dict[str, List[BindingSite]],
     sampler: ConstellationSampler,
@@ -126,10 +128,10 @@ def select_constellations(
     refine_torsions: bool = True,
 ) -> List[Tuple[Ligand, Candidate]]:
     """
-    Choose the constellations of one multi-motif LigandSpec and clone a ligand for each.
+    Choose the constellations of one multi-motif ligand and clone it for each.
 
-    With ``spec.binding_site_indices`` every entry lists one site atom index per motif, in
-    motif order. Otherwise ``spec.coverage`` is a fraction of the most ligands the free sites
+    A list `coverage` gives the constellations, each one site atom index per motif, in
+    motif order. Otherwise `coverage` is a fraction of the most ligands the free sites
     can host (or, above 1, a count), spread so that every face holds about the same
     fraction of its sites (see ConstellationSampler.sample), and seeds are tried until it
     is met or the surface is exhausted; a shortfall is reported with the reasons seeds were
@@ -137,12 +139,11 @@ def select_constellations(
     scarcer sublattice. With `refine_torsions`, constellations whose fits all clash with
     the core get a torsion-space refinement first.
     """
-    lig = spec.ligand
     shadowed = sampler.n_shadowed
     chosen: List[Candidate] = []
 
-    if spec.binding_site_indices is not None:
-        for group in spec.binding_site_indices:
+    if not isinstance(coverage, Real):
+        for group in coverage:
             group = list(group) if isinstance(group, (list, tuple)) else [group]
             if len(group) != lig.n_motifs:
                 print(f"[Warning] Binding site group {group} for ligand {lig.name} needs one "
@@ -154,7 +155,7 @@ def select_constellations(
                 print(f"[Warning] Binding site group {group} is not available for ligand "
                       f"{lig.name}. Skipped.")
                 continue
-            cand, reason = sampler.fit_sites(spec, sites, refine_torsions)
+            cand, reason = sampler.fit_sites(lig, sites, refine_torsions)
             if cand is None:
                 print(f"[Warning] Binding site group {group} rejected for ligand {lig.name}: {reason}.")
                 continue
@@ -164,12 +165,12 @@ def select_constellations(
         need = Counter(m.site for m in lig.binding_motifs)
         capacity = min(sum(s.available for s in by_sublattice[sublattice]) // k
                        for sublattice, k in need.items())
-        n_target = _n_target(spec.coverage, capacity)
+        n_target = _n_target(coverage, capacity)
         if n_target > capacity:
             print(f"[Warning] Requested {n_target} ligands {lig.name}, but the free sites "
                   f"host at most {capacity}.")
             n_target = capacity
-        chosen, failures = sampler.sample(spec, pools, n_target, refine_torsions)
+        chosen, failures = sampler.sample(lig, pools, n_target, refine_torsions)
         if len(sampler.occupancy) > 1:
             occ = list(sampler.occupancy.values())
             log(f"[Log] {lig.name} occupancy per face: {min(occ):.2f}-{max(occ):.2f} "
@@ -179,7 +180,7 @@ def select_constellations(
             print(f"[Warning] Placed {len(chosen)} of {n_target} requested {lig.name} ligands; "
                   f"rejected seeds: {reasons or 'none left to try'}.")
 
-    mode = "Adsorbed" if spec.adsorb else "Placed"
+    mode = "Adsorbed" if all(m.adsorb for m in lig.binding_motifs) else "Placed"
     log(f"[Log] {mode} total {len(chosen)} {lig.name} ligands with {lig.n_motifs} motifs "
         f"({'/'.join(m.site for m in lig.binding_motifs)} sites); {sampler.n_shadowed - shadowed} "
         f"free sites under them taken out of use.")

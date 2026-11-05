@@ -65,14 +65,14 @@ class Pose:
 
 class SitePose(Pose):
     """
-    Single-motif ligand on one site, its anchor on the site (or `anchor_offset` above it),
-    spinning about the site normal; in refinement it keeps its anchor and tilt.
+    Single-motif ligand on one site, its anchor on the site (or its motif's `anchor_offset`
+    above it), spinning about the site normal; in refinement it keeps its anchor and tilt.
     """
     random_start = True
 
     def __init__(self, ligand: Ligand, normal: np.ndarray, site_pos: np.ndarray):
         n = normal / np.linalg.norm(normal)
-        anchor = site_pos + n * float(ligand._anchor_offset)
+        anchor = site_pos + n * ligand.binding_motifs[0].anchor_offset
         # the oriented ligand (body along +z) turned onto the normal
         R = rotation_from_u_to_v(np.array([0.0, 0.0, 1.0]), normal)
         super().__init__(ligand, site_pos, n, [ligand.atoms.get_positions() @ R.T + anchor], ["site"],

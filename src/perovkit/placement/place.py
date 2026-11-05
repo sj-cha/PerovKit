@@ -1,6 +1,7 @@
 from __future__ import annotations
 from copy import deepcopy
 import math
+from numbers import Real
 import random
 from typing import List, Sequence
 
@@ -8,7 +9,7 @@ import numpy as np
 
 from ..assembly import Assembly
 from ..core import Core
-from ..ligand import Ligand, LigandSpec
+from ..ligand import Ligand
 from ..refine import INTRA_SCALE
 from .pack import Contacts, intramolecular_contacts, pack
 from .poses import FitPose, SitePose
@@ -16,18 +17,18 @@ from .sampler import ConstellationSampler
 from .sites import motif_pools, select_constellations, take_sites
 
 
-def _in_order(ligand_specs: Sequence[LigandSpec]) -> List[LigandSpec]:
-    # Multi-motif ligands need site combinations, so they choose first
-    return sorted(ligand_specs, key=lambda spec: (
-        0 if spec.ligand.n_motifs > 1 else 1,
-        0 if spec.ligand.charge > 0 else 1,
-        -spec.ligand.volume,
-    ))
+def _in_order(ligands: Sequence[Ligand], coverage: Sequence) -> List[tuple]:
+    """(ligand, coverage) pairs, multi-motif ligands first: they need site combinations."""
+    def key(pair):
+        lig = pair[0]
+        return 0 if lig.n_motifs > 1 else 1, 0 if lig.charge > 0 else 1, -lig.volume
+    return sorted(zip(ligands, coverage), key=key)
 
 
 def place_ligands(
     core: Core,
-    ligand_specs: Sequence[LigandSpec],
+    ligands: Sequence[Ligand],
+    coverage: Sequence,
     max_iters: int = 10,
     overlap_cutoff: float = 1.6,   # Å
     coarse_step_deg: int = 18,
@@ -43,14 +44,22 @@ def place_ligands(
     **sampler_options,
 ) -> Assembly:
     """
-    Implements Core.place_ligands, which documents the options.
+    Implements Core.place_ligands, which documents the arguments.
     """
+    if len(coverage) != len(ligands):
+        raise ValueError(f"{len(ligands)} ligands but {len(coverage)} coverages; give one per ligand")
+    for lig, cov in zip(ligands, coverage):
+        if not lig.binding_motifs:
+            raise ValueError(f"ligand {lig.name!r} has no BindingMotif to bind it to the surface")
+        if isinstance(cov, Real) and cov < 0:
+            raise ValueError(f"coverage must be at least 0; got {cov} for ligand {lig.name!r}")
+
     log = print if verbose else (lambda *a, **k: None)
     rng = random.Random(random_seed)
     box = core.box
     sites = deepcopy(core.binding_sites)
     core_positions = core.atoms.get_positions()
-    specs = _in_order(ligand_specs)
+    requests = _in_order(ligands, coverage)
 
     displaced: List[int] = []
     poses: List[SitePose | FitPose] = []
@@ -58,14 +67,12 @@ def place_ligands(
     sampler = ConstellationSampler(core_positions, box, rng, sites, overlap_cutoff=overlap_cutoff,
                                    max_rmsd=max_anchor_rmsd, **sampler_options)
 
-    for spec in specs:
-        if spec.ligand.n_motifs > 1:
-            pools, by_sublattice = motif_pools(spec, sites, core.site_symbols)
-            for lig_cloned, cand in select_constellations(spec, pools, by_sublattice, sampler, log,
+    for lig, cov in requests:
+        if lig.n_motifs > 1:
+            pools, by_sublattice = motif_pools(lig, sites, core.site_symbols)
+            for lig_cloned, cand in select_constellations(lig, cov, pools, by_sublattice, sampler, log,
                                                           refine_torsions=refine_torsions):
                 poses.append(FitPose(lig_cloned, cand))
-                if not spec.adsorb:
-                    displaced.extend(cand.atom_indices)
             continue
 
         # sites under a multi-motif ligand cannot take one more
@@ -73,13 +80,14 @@ def place_ligands(
         if n_blocked:
             log(f"[Log] Left out {n_blocked} free sites covered by multi-motif ligands.")
 
-        for lig_cloned, site in take_sites(core, spec, sites, rng, displaced, log):
+        for lig_cloned, site in take_sites(core, lig, cov, sites, rng, displaced, log):
             poses.append(SitePose(lig_cloned, np.array(site.plane, dtype=float),
                                   np.array(site.position, dtype=float)))
 
     if not poses:
         raise RuntimeError("No ligands to place.")
 
+    displaced.extend(sampler.displaced)   # the site atoms multi-motif ligands replace
     core_tree, _ = box.tree(np.delete(core_positions, displaced, axis=0))
     contacts = Contacts(core_tree, box, overlap_cutoff)
     coords_list = pack(
@@ -89,7 +97,7 @@ def place_ligands(
         refine_torsions=refine_torsions, stretch_tails=stretch_tails, n_workers=n_workers,
         log=log, verbose=verbose,
     )
-    assembly = _assemble(core, specs, [p.ligand for p in poses], coords_list, displaced)
+    assembly = _assemble(core, requests, [p.ligand for p in poses], coords_list, displaced)
 
     fit_poses = [p for p in poses if isinstance(p, FitPose)]
     if fit_poses:
@@ -108,7 +116,7 @@ def place_ligands(
 
 def _assemble(
     core: Core,
-    specs: List[LigandSpec],
+    requests: List[tuple],
     ligands: List[Ligand],
     coords_list: List[np.ndarray],
     displaced: List[int],
@@ -148,8 +156,10 @@ def _assemble(
     stripped.B_ijk = {int(new[b]): ijk for b, ijk in core.B_ijk.items() if keep[b]}
     _assign_to_octahedra(stripped, ligands)
 
-    return Assembly(core=stripped, ligands=list(ligands),
-                    ligand_coverage={spec.ligand.name: spec.coverage for spec in specs})
+    # as plain Python numbers, which JSON takes; None for a ligand given its sites
+    coverage = {lig.name: np.asarray(cov).item() if isinstance(cov, Real) else None
+                for lig, cov in requests}
+    return Assembly(core=stripped, ligands=list(ligands), ligand_coverage=coverage)
 
 
 def _assign_to_octahedra(core: Core, ligands: List[Ligand]) -> None:
@@ -163,15 +173,11 @@ def _assign_to_octahedra(core: Core, ligands: List[Ligand]) -> None:
     ligand_ids = []
 
     for lig in ligands:
-        if lig.n_motifs > 1:
-            # every motif bound to an X or B site belongs to the octahedron there
-            for motif, pos in zip(lig.binding_motifs, lig.anchor_positions):
-                if motif.site in ("X", "B"):
-                    anchor_positions.append(pos)
-                    ligand_ids.append(int(lig.id))
-        elif lig.charge <= 0 and lig.anchor_pos is not None:
-            anchor_positions.append(np.asarray(lig.anchor_pos, dtype=float))
-            ligand_ids.append(int(lig.id))
+        # every motif bound to an X or B site belongs to the octahedron there
+        for motif, pos in zip(lig.binding_motifs, lig.anchor_positions):
+            if motif.site in ("X", "B"):
+                anchor_positions.append(pos)
+                ligand_ids.append(int(lig.id))
 
     if anchor_positions:
         # the nearest B, minimum images along the periodic axes
