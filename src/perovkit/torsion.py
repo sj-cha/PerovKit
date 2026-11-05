@@ -1,7 +1,7 @@
 from __future__ import annotations
 from dataclasses import dataclass
 import math
-from typing import Sequence
+from typing import Optional, Sequence
 
 from ase.data import vdw_radii
 import numba
@@ -148,6 +148,16 @@ class TorsionModel:
         """
         return ~self.masks[self.tails].any(axis=0)
 
+    @property
+    def heavy_tails(self) -> np.ndarray:
+        """
+        (k,) tail torsions that move a heavy atom: they turn a chain, not just the hydrogens
+        of a methyl or ammonium group (the bond's own atom j turns in place).
+        """
+        moved = self.masks.copy()
+        moved[np.arange(self.n_torsions), self.bonds[:, 1]] = False
+        return self.tails & (moved & self.heavy).any(axis=1)
+
     @classmethod
     def build(cls, mol: Chem.Mol, binding: Sequence[int]) -> TorsionModel:
         """Torsions of `mol` rooted at its first binding atom, with `binding` its binding atoms."""
@@ -176,8 +186,6 @@ class TorsionModel:
             if mask[root]:
                 i, j = j, i
                 mask = side(j, i)
-            if not heavy[mask].any():
-                continue  # methyl and ammonium rotors move hydrogens only
             found.append((topo[root, i], i, j, mask))
         found.sort(key=lambda f: -f[0])  # deepest first, see forward()
 
@@ -199,19 +207,23 @@ class TorsionModel:
     def n_torsions(self) -> int:
         return len(self.bonds)
 
-    def forward(self, params: np.ndarray, x0: np.ndarray, center: np.ndarray):
+    def forward(self, params: np.ndarray, x0: np.ndarray, center: np.ndarray,
+                frame: Optional[np.ndarray] = None):
         """
         Coordinates for params = (translation (3), Euler angles (3), torsion changes (k)).
 
         Torsions apply deepest first: each later (shallower) one moves its side, deeper
         bonds included, rigidly, so the derivative of every torsion is a rotation about its
-        bond as it lies in the final coordinates.
+        bond as it lies in the final coordinates. The Euler angles turn about the lab axes,
+        or about the rows of `frame` (a rotation matrix) when given.
         """
         x = np.array(x0, dtype=float)[None]
         _turn_torsions(x, np.ascontiguousarray(params[None, 6:], dtype=float),
                        self._bonds, self._flat_moving, self._starts)
         x = x[0]
         R, dR = _euler(*params[3:6])
+        if frame is not None:
+            R, dR = frame.T @ R @ frame, tuple(frame.T @ d @ frame for d in dR)
         xt = x - center
         return xt @ R.T + center + params[:3], xt, dR
 
@@ -230,15 +242,19 @@ class TorsionModel:
             g[6:] = out[0]
         return g
 
-    def forward_many(self, P: np.ndarray, X0: np.ndarray, C: np.ndarray):
+    def forward_many(self, P: np.ndarray, X0: np.ndarray, C: np.ndarray,
+                     frames: Optional[np.ndarray] = None):
         """
         forward() for L poses of this ligand at once: params P (L, 6 + k), starting
-        coordinates X0 (L, n, 3) and centers C (L, 3).
+        coordinates X0 (L, n, 3), centers C (L, 3) and optional frames (L, 3, 3).
         """
         X = np.array(X0, dtype=float)
         _turn_torsions(X, np.ascontiguousarray(P[:, 6:], dtype=float),
                        self._bonds, self._flat_moving, self._starts)
         R, dR = _euler_many(P[:, 3:6])
+        if frames is not None:
+            Ft = frames.transpose(0, 2, 1)
+            R, dR = Ft @ R @ frames, Ft[None] @ dR @ frames[None]
         Xt = X - C[:, None]
         return np.matmul(Xt, R.transpose(0, 2, 1)) + C[:, None] + P[:, None, :3], Xt, dR
 

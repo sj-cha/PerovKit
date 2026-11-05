@@ -6,8 +6,6 @@ import numpy as np
 from scipy.spatial import cKDTree
 
 from ..refine import CONTACT_MARGINS, stretch
-from .fitting import mean_normal
-from .poses import FitPose
 
 
 _WORKER_CORE = None
@@ -58,8 +56,8 @@ def available_cpus() -> int:
 
 def stretch_poses(poses: Sequence, core_tree, cutoff: float, n_workers: int = 1) -> int:
     """
-    Put a stretched copy of each multi-motif pose's best variant first: its dangling
-    chains anti and raised along the mean normal of its sites, its anchors untouched.
+    Put a stretched copy of each pose's best variant first: its dangling chains anti and
+    raised along the pose's `up`, its anchors and orientation untouched.
 
     Stretching sees only the core, so the ligands are independent and, with `n_workers`
     above 1, go to that many processes (no more than the CPUs available); each builds the
@@ -69,12 +67,11 @@ def stretch_poses(poses: Sequence, core_tree, cutoff: float, n_workers: int = 1)
         How many poses now start stretched: they had chains to stretch and the result
         clears the core, or site selection had already stretched them.
     """
-    fit_poses = [p for p in poses if isinstance(p, FitPose)]
-    done = sum(p.sources[p.variant] == "stretched" for p in fit_poses)
-    todo = [p for p in fit_poses
-            if p.sources[p.variant] != "stretched" and p.ligand.torsion_model().tails.any()]
+    done = sum(p.sources[p.variant] == "stretched" for p in poses)
+    todo = [p for p in poses
+            if p.sources[p.variant] != "stretched" and p.ligand.torsion_model().heavy_tails.any()]
     jobs = [(p.ligand.torsion_model(), p.variants[0], p.ligand.binding_groups,
-             p.candidate.targets, mean_normal(p.candidate.sites), cutoff + CONTACT_MARGINS[0]) for p in todo]
+             p.targets, p.up, cutoff + CONTACT_MARGINS[0]) for p in todo]
     n_workers = min(n_workers, available_cpus(), len(jobs))
     if n_workers > 1:
         with ProcessPoolExecutor(max_workers=n_workers,

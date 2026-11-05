@@ -8,19 +8,20 @@ from tqdm.auto import tqdm
 
 from ..refine import CONTACT_MARGINS, INTRA_SCALE, K_CONTACT, intra_pairs, refine, refine_joint
 from ..utils.box import Box
-from .poses import FitPose
+from .poses import FitPose, Pose
 from .stretch import stretch_poses
 
 
 def bend_pose(
-    pose: FitPose,
+    pose: Pose,
     coords: np.ndarray,
     neighbors_coords: List[np.ndarray],
     contacts: Contacts,
     max_rmsd: float,
 ) -> Tuple[Optional[np.ndarray], float]:
     """
-    Refine a multi-motif ligand in torsion space against the core and `neighbors_coords`.
+    Refine a ligand in torsion space against the core and `neighbors_coords`; one with a
+    spin axis (a single-motif ligand) keeps its anchor and tilt and turns only about it.
 
     Returns the refined coordinates whose closest contact is farthest, and that contact,
     stopping at the first margin that clears the cutoff; (None, -inf) when every attempt
@@ -33,7 +34,7 @@ def bend_pose(
     best, best_d = None, -float("inf")
     for margin in CONTACT_MARGINS:
         res = refine(pose.ligand.torsion_model(), coords, pose.ligand.binding_groups,
-                     pose.candidate.targets, trees, contact_distance=cutoff + margin,
+                     pose.targets, trees, contact_distance=cutoff + margin, spin_axis=pose.spin_axis,
                      stop_at=cutoff + margin / 2, stop_rmsd=max_rmsd)
         if res.anchor_rmsd > max_rmsd:
             continue
@@ -173,12 +174,11 @@ def bend_clusters(
     stop_at: Optional[float] = None,
 ) -> bool:
     """
-    Refine jammed multi-motif ligands together, for when no ligand can clear its contacts
-    alone.
+    Refine jammed ligands together, for when no ligand can clear its contacts alone.
 
     Ligands closer than the cutoff form a contact graph. In every connected component with a
-    contact below the cutoff (a single ligand touching the core included), the multi-motif
-    members are refined jointly against the core and all other ligands and pushed apart
+    contact below the cutoff (a single ligand touching the core included), the members that
+    can bend are refined jointly against the core and all other ligands and pushed apart
     from each other, with the margins of CONTACT_MARGINS and then stiffer contacts (2x and 4x).
     Members whose anchors end farther than `max_rmsd` from their sites keep their poses;
     the others take theirs if the closest contact of the component improves. Each
@@ -214,7 +214,7 @@ def bend_clusters(
 
     improved = False
     for comp in components.values():
-        members = [i for i in comp if isinstance(poses[i], FitPose)]
+        members = [i for i in comp if poses[i].can_bend]
         if not members:
             continue
         before = min(min_distance(coords_list, i) for i in members)
@@ -227,9 +227,10 @@ def bend_clusters(
                 [poses[i].ligand.torsion_model() for i in members],
                 [coords_list[i] for i in members],
                 [poses[i].ligand.binding_groups for i in members],
-                [poses[i].candidate.targets for i in members],
+                [poses[i].targets for i in members],
                 trees, cutoff + margin, box, k_contact=K_CONTACT * stiff,
                 stop_at=cutoff + margin / 2 if stop_at is None else stop_at, stop_rmsd=max_rmsd,
+                spin_axes=[poses[i].spin_axis for i in members],
             )
             moved = [(i, r) for i, r in zip(members, results) if r.anchor_rmsd <= max_rmsd]
             if not moved:
@@ -358,15 +359,15 @@ def pack(
     Pack the ligands of `poses` until no atoms of two ligands, or of a ligand and the core,
     are closer than the cutoff of `contacts`.
 
-    The dangling chains of multi-motif ligands are first stretched (`stretch_tails`, in
-    `n_workers` processes) and, if any were, relaxed together. Then, up to `max_iters`
-    times, the ligands in conflict and those whose sites lie within `active_radius` of
-    theirs turn one by one, in random order, to the spin (and fit variant) that clears their
-    neighbors best (turn_pose: a scan every `coarse_step_deg`, then every
-    `fine_step_deg` within `window_deg` of the best). With `refine_torsions`, a multi-motif
-    ligand that turning cannot clear is refined in torsion space, and ligands that none can
-    clear alone are refined together (bend_clusters); anchors may end `max_rmsd` Å
-    (RMS) from their sites.
+    The dangling chains of the ligands are first stretched (`stretch_tails`, in `n_workers`
+    processes) and, if any were, relaxed together. Then, up to `max_iters` times, the
+    ligands in conflict and those whose sites lie within `active_radius` of theirs turn one
+    by one, in random order, to the spin (and fit variant) that clears their neighbors best
+    (turn_pose: a scan every `coarse_step_deg`, then every `fine_step_deg` within
+    `window_deg` of the best). With `refine_torsions`, a ligand that turning cannot clear
+    is refined in torsion space, and ligands that none can clear alone are refined together
+    (bend_clusters); anchors may end `max_rmsd` Å (RMS) from their sites, while a
+    single-motif ligand keeps its anchor and tilt and turns only about its normal.
 
     Returns:
         The coordinates of every ligand.
@@ -379,13 +380,12 @@ def pack(
     # Where each ligand binds: its site, or the centroid of its sites
     site_positions = np.array([p.center for p in poses])
 
-    # stand up multi-motif tails first: coiled conformers tangle with their neighbors
+    # stand up tails first: coiled conformers tangle with their neighbors
     n_stretched = 0
     if stretch_tails:
         n_stretched = stretch_poses(poses, contacts.core_tree, cutoff, n_workers)
         if n_stretched:
-            n_multi = sum(isinstance(p, FitPose) for p in poses)
-            log(f"[Log] Stretched the tails of {n_stretched} of {n_multi} multi-motif ligands.")
+            log(f"[Log] Stretched the tails of {n_stretched} of {len(poses)} ligands.")
 
     # starting poses; multi-motif ligands keep the spin of their fit
     thetas = np.array([2.0 * math.pi * rng.random() if p.random_start else 0.0
@@ -414,9 +414,9 @@ def pack(
         for i in tqdm(active, desc=f"Optimizing ligand (iter {iteration})", disable=not verbose):
             neighbors_coords = [coords_list[j] for j in neighbor_map.get(i, [])]
 
-            # multi-motif ligands need exact contacts, neighbors included even near the core
-            multi = isinstance(poses[i], FitPose)
-            if multi:
+            # ligands that may bend need exact contacts, neighbors included even near the core
+            bends = poses[i].can_bend
+            if bends:
                 min_distance = tree_min_distance(contacts.core_tree, contacts.box, neighbors_coords)
                 d_old = min_distance(coords_list[i])
             else:
@@ -427,8 +427,8 @@ def pack(
             )
             d_new = min_distance(best_coords)
 
-            # if turning fails, a multi-motif ligand may bend, against every other ligand
-            if refine_torsions and multi and d_new < cutoff:
+            # if turning fails, the ligand may bend, against every other ligand
+            if refine_torsions and bends and d_new < cutoff:
                 others = [c for j, c in enumerate(coords_list) if j != i]
                 refined, d_ref = bend_pose(poses[i], best_coords, others, contacts, max_rmsd)
                 if refined is not None and d_ref > d_new:
@@ -438,12 +438,12 @@ def pack(
                 coords_list[i] = best_coords
                 poses[i].variant = best_variant
                 improved = True
-                if multi:
+                if bends:
                     # a refined variant may reach farther: let the ligands still to move see it
                     neighbor_map = contacts.neighbors(poses, coords_list)
 
         if not improved and refine_torsions:
-            # nobody could move alone: let jammed multi-motif ligands give way together
+            # nobody could move alone: let jammed ligands give way together
             improved = bend_clusters(poses, coords_list, contacts, max_rmsd)
 
         if not improved:

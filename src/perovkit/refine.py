@@ -232,15 +232,39 @@ def _anchor_rmsd(x, groups, targets) -> float:
     return float(np.sqrt(np.mean(np.sum((anchors - targets) ** 2, axis=1))))
 
 
-def _minimize(fun, n, bounds, max_iters, done):
+def _spin_frame(axis: np.ndarray) -> np.ndarray:
     """
-    L-BFGS-B that also stops at the first iterate `done` accepted; `done` holds the
-    parameters of the last evaluation and whether that point was good enough.
+    Rotation matrix whose rows are two unit axes across `axis` and the unit `axis`: in it
+    the last Euler angle turns about `axis` (see TorsionModel.forward).
+    """
+    n = axis / np.linalg.norm(axis)
+    e1 = np.cross(n, [1.0, 0.0, 0.0] if abs(n[0]) < 0.9 else [0.0, 1.0, 0.0])
+    e1 /= np.linalg.norm(e1)
+    return np.array([e1, np.cross(n, e1), n])
+
+
+def _held(model: TorsionModel, spin_axis: Optional[np.ndarray]) -> np.ndarray:
+    """
+    Parameters held at zero for a ligand with a spin axis: its translation and the two
+    Euler angles across the axis, so that it keeps its place and tilt; none without one.
+    """
+    held = np.zeros(6 + model.n_torsions, dtype=bool)
+    if spin_axis is not None:
+        held[:5] = True
+    return held
+
+
+def _minimize(fun, held, max_iters, done):
+    """
+    L-BFGS-B from zero with the `held` parameters kept there, that also stops at the first
+    iterate `done` accepted; `done` holds the parameters of the last evaluation and whether
+    that point was good enough.
     """
     def callback(intermediate_result):
         if done["ok"] and np.array_equal(done["x"], intermediate_result.x):
             raise StopIteration
-    return minimize(fun, np.zeros(n), jac=True, method="L-BFGS-B", bounds=bounds,
+    bounds = [(0.0, 0.0) if h else (None, None) for h in held] if held.any() else None
+    return minimize(fun, np.zeros(len(held)), jac=True, method="L-BFGS-B", bounds=bounds,
                     callback=callback, options={"maxiter": max_iters})
 
 
@@ -258,6 +282,7 @@ def refine(
     max_iters: int = 400,
     pull: Optional[tuple] = None,
     frozen: Optional[np.ndarray] = None,
+    spin_axis: Optional[np.ndarray] = None,
     stop_at: Optional[float] = None,
     stop_rmsd: float = float("inf"),
 ) -> Refinement:
@@ -285,6 +310,9 @@ def refine(
         pull: Optional (direction, atom mask, k): lowers the energy by k per Å that the
             masked atoms move along the unit direction.
         frozen (np.ndarray): Optional (6 + k,) mask of parameters held at zero.
+        spin_axis (np.ndarray): Optional surface normal: the ligand then keeps its place and
+            tilt and turns only about it (the translation and the two Euler angles across it
+            are held at zero).
         stop_at, stop_rmsd: Stop as soon as every contact with the fixed atoms is at least
             `stop_at` Å, no intramolecular pair is tangled and the anchors are within
             `stop_rmsd` (RMS, Å): the pose is good enough, and the remaining iterations
@@ -294,9 +322,10 @@ def refine(
     groups = [np.asarray(g, dtype=int) for g in groups]
     done = {"ok": False, "x": None}
     nb = _Neighbors(model, trees, contact_distance, intra)
+    frame = None if spin_axis is None else _spin_frame(spin_axis)
 
     def fun(params):
-        x, xt, dR = model.forward(params, coords, center)
+        x, xt, dR = model.forward(params, coords, center, frame)
         E, G, min_distance, tangled, rmsd = _terms(x[None], groups, targets[None], nb,
                                                    k_anchor, k_contact)
         G = G[0]
@@ -313,11 +342,11 @@ def refine(
         g[6:] += w_torsion * np.sin(phi)
         return E, g
 
-    bounds = None
+    held = _held(model, spin_axis)
     if frozen is not None:
-        bounds = [(0.0, 0.0) if f else (None, None) for f in frozen]
-    res = _minimize(fun, 6 + model.n_torsions, bounds, max_iters, done)
-    x, _, _ = model.forward(res.x, coords, center)
+        held |= np.asarray(frozen, dtype=bool)
+    res = _minimize(fun, held, max_iters, done)
+    x, _, _ = model.forward(res.x, coords, center, frame)
     return Refinement(coords=x, anchor_rmsd=_anchor_rmsd(x, groups, targets))
 
 
@@ -396,13 +425,17 @@ def refine_joint(
     max_iters: int = 400,
     stop_at: Optional[float] = None,
     stop_rmsd: float = float("inf"),
+    spin_axes: Optional[Sequence[Optional[np.ndarray]]] = None,
 ) -> List[Refinement]:
     """
     Refine several ligands at once, so that ligands jammed against each other can all give
     way. Each has the terms of `refine`; atoms of different ligands are also pushed
     `contact_distance` Å apart, listed through a tree from `box` (periodic images included).
     `stop_at` and `stop_rmsd` end it early as in `refine`, with every ligand meeting them.
+    `spin_axes` gives each ligand a spin axis as in `refine`, or None.
     """
+    spin_axes = [None] * len(models) if spin_axes is None else list(spin_axes)
+    frames = [None if a is None else _spin_frame(a) for a in spin_axes]
     sizes = [6 + m.n_torsions for m in models]
     offsets = np.concatenate([[0], np.cumsum(sizes)])
     groups = [[np.asarray(g, dtype=int) for g in gs] for gs in groups]
@@ -421,6 +454,8 @@ def refine_joint(
             X0=np.array([coords[l] for l in members]),
             T=np.array([targets[l] for l in members]),
             C=np.array([targets[l].mean(axis=0) for l in members]),
+            # one ligand type: all of them have a spin axis or none does
+            F=None if frames[members[0]] is None else np.array([frames[l] for l in members]),
             nb=_Neighbors(model, trees, contact_distance, intra),
         ))
     mutual = _Mutual(starts, contact_distance, box)
@@ -432,7 +467,7 @@ def refine_joint(
         state = []
         for b in batches:
             Pb = P[b["params"]]
-            Xb, Xt, dR = b["model"].forward_many(Pb, b["X0"], b["C"])
+            Xb, Xt, dR = b["model"].forward_many(Pb, b["X0"], b["C"], b["F"])
             e, G, c, t, rmsd = _terms(Xb, b["groups"], b["T"], b["nb"],
                                       k_anchor, k_contact)
             min_distance, tangled = min(min_distance, c), tangled or t
@@ -456,9 +491,11 @@ def refine_joint(
                       and worst <= stop_rmsd)
         return E, grad
 
-    res = _minimize(fun, int(offsets[-1]), None, max_iters, done)
+    held = np.concatenate([_held(m, a) for m, a in zip(models, spin_axes)])
+    res = _minimize(fun, held, max_iters, done)
     out = []
     for l, model in enumerate(models):
-        x, _, _ = model.forward(res.x[offsets[l]:offsets[l + 1]], coords[l], targets[l].mean(axis=0))
+        x, _, _ = model.forward(res.x[offsets[l]:offsets[l + 1]], coords[l], targets[l].mean(axis=0),
+                                frames[l])
         out.append(Refinement(coords=x, anchor_rmsd=_anchor_rmsd(x, groups[l], targets[l])))
     return out
