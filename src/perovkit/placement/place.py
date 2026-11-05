@@ -2,7 +2,7 @@ from __future__ import annotations
 from copy import deepcopy
 import math
 import random
-from typing import List, Optional, Sequence
+from typing import List, Sequence
 
 import numpy as np
 
@@ -11,7 +11,7 @@ from ..core import Core
 from ..ligand import Ligand, LigandSpec
 from ..refine import INTRA_SCALE
 from .pack import Contacts, intramolecular_contacts, pack
-from .poses import FitPose, SitePose, place_about_normal
+from .poses import FitPose, SitePose
 from .sampler import ConstellationSampler
 from .sites import motif_pools, select_constellations, take_sites
 
@@ -104,59 +104,6 @@ def place_ligands(
             f"contact {min_distance:.2f} Å ({n_close} pairs within {INTRA_SCALE:g}x their vdW radii).")
 
     return assembly
-
-
-def place_ligands_manually(
-    core: Core,
-    ligand_specs: Sequence[LigandSpec],
-    cat_x_move: float = 0.0,
-    cat_y_move: float = 0.0,
-    cat_z_move: float = 0.0,
-    cat_z_rotate: float = 0.0,
-    an_x_move: float = 0.0,
-    an_y_move: float = 0.0,
-    an_z_move: float = 0.0,
-    an_z_rotate: float = 0.0,
-    ligand_ids: Optional[Sequence[int]] = None,
-    random_seed: int = 42,
-    verbose: bool = True,
-) -> Assembly:
-    """
-    Place every ligand at its site without the rotation search, cations shifted by
-    cat_x/y/z_move (Å) and turned by cat_z_rotate (degrees), anions by the an_* values.
-    With `ligand_ids`, only those ligands (ids count from 0 in placement order) are
-    shifted and turned; the rest sit at their sites unmoved.
-    """
-    specs = _in_order(ligand_specs)
-    if any(spec.ligand.n_motifs > 1 for spec in specs):
-        raise NotImplementedError("Manual placement supports single-motif ligands only.")
-
-    log = print if verbose else (lambda *a, **k: None)
-    rng = random.Random(random_seed)
-    sites = deepcopy(core.binding_sites)
-    displaced: List[int] = []
-    placed = [pair for spec in specs
-              for pair in take_sites(core, spec, sites, rng, displaced, log)]
-    if not placed:
-        raise RuntimeError("No ligands to place.")
-
-    moved = set(range(len(placed))) if ligand_ids is None else {int(i) for i in ligand_ids}
-    unknown = sorted(moved - set(range(len(placed))))
-    if unknown:
-        print(f"[Warning] No ligands with ids {unknown}; ids run from 0 to {len(placed) - 1}.")
-
-    cation = np.array([cat_x_move, cat_y_move, cat_z_move], dtype=float), math.radians(cat_z_rotate)
-    anion = np.array([an_x_move, an_y_move, an_z_move], dtype=float), math.radians(an_z_rotate)
-    unmoved = np.zeros(3), 0.0
-
-    coords_list = []
-    for i, (lig, site) in enumerate(placed):
-        shift, theta = (cation if lig.charge > 0 else anion) if i in moved else unmoved
-        coords = place_about_normal(lig.atoms.get_positions(), np.array(site.plane, dtype=float),
-                                    np.array(site.position, dtype=float), lig._anchor_offset, theta)
-        coords_list.append(coords + shift)
-
-    return _assemble(core, specs, [lig for lig, _ in placed], coords_list, displaced)
 
 
 def _assemble(

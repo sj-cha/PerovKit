@@ -1,5 +1,6 @@
 from __future__ import annotations
 from dataclasses import dataclass, field
+import math
 from typing import Dict, List, Sequence, Tuple, Optional
 
 import numpy as np
@@ -11,6 +12,7 @@ from .core import Core
 from .io.metadata import read_assemblies, write_metadata
 from .io.structure import write_structure
 from .ligand import Ligand
+from .utils.rotation import rotation_about_axis
 
 
 @dataclass
@@ -19,8 +21,7 @@ class Assembly:
     A Core with ligands on its surface: a nanocrystal, or a slab when the Core is periodic
     (Core.build_core(..., pbc=(True, True, False))). KD-tree searches follow the core's pbc:
     minimum-image distances along its periodic axes. A slab keeps its cell.
-    Made by Core.place_ligands and Core.place_ligands_manually, or read back with
-    from_file and from_ase.
+    Made by Core.place_ligands, or read back with from_file and from_ase.
 
     `atoms` is the only copy of the atoms: whatever is done to them is done there, and the
     `atoms` of `core` and of each ligand are read-only selections of it. Its per-atom array
@@ -55,6 +56,37 @@ class Assembly:
             raise ValueError(f"No ligand with id={ligand_id} found.")
         del self.atoms[self.atoms.arrays["ligand_id"] == ligand_id]
         self._follow_deleted_atoms()
+
+
+    def move_ligands(
+        self,
+        ligand_ids: int | Sequence[int],
+        shift: Sequence[float] = (0.0, 0.0, 0.0),
+        rotate: float = 0.0,
+    ) -> None:
+        """
+        Move placed ligands by hand: each turns by `rotate` degrees about the normal of its
+        sites (their mean for a multi-motif ligand) through the centroid of its anchors,
+        then shifts by `shift` (Å, along x, y and z). Their octahedra stay as they were;
+        check_overlaps tells whether they now touch anything.
+        """
+        self._follow_deleted_atoms()
+        ids = [ligand_ids] if np.isscalar(ligand_ids) else list(dict.fromkeys(ligand_ids))
+        unknown = [i for i in ids if not 0 <= i < len(self.ligands)]
+        if unknown:
+            raise ValueError(f"No ligands with ids {unknown}; ids run from 0 to "
+                             f"{len(self.ligands) - 1}.")
+        ligands = [self.ligands[int(i)] for i in ids]
+        if rotate and any(not lig.planes for lig in ligands):
+            raise ValueError("A ligand without site planes has no normal to turn about.")
+        for lig in ligands:
+            x = self.atoms.positions[lig.indices]
+            if rotate:
+                normal = np.mean([np.asarray(p, dtype=float) / np.linalg.norm(p) for p in lig.planes],
+                                 axis=0)
+                center = lig.anchor_positions.mean(axis=0)
+                x = (x - center) @ rotation_about_axis(normal, math.radians(rotate)).T + center
+            self.atoms.positions[lig.indices] = x + np.asarray(shift, dtype=float)
 
 
     def apply_tilt(
