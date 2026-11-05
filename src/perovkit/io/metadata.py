@@ -35,7 +35,8 @@ def ligand_type_key(lig: Ligand) -> tuple:
     holds one set of motifs and binding atoms per type, so the same molecule anchored
     through different atoms has to make two types.
     """
-    motifs = tuple((tuple(m.atoms), m.anchor, tuple(m.indices) if m.indices else None, m.site)
+    motifs = tuple((tuple(m.atoms), m.anchor, tuple(m.indices) if m.indices else None, m.site,
+                    m.adsorb, m.anchor_offset)
                    for m in lig.binding_motifs)
     return lig.name, lig.smiles, lig.charge, motifs, tuple(lig.binding_atoms or ())
 

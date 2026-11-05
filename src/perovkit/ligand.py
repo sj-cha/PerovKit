@@ -1,6 +1,6 @@
 from __future__ import annotations
 import copy
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from itertools import product
 from typing import Optional, Tuple, List
 
@@ -32,15 +32,25 @@ class BindingMotif:
         indices (list[int]): Explicit binding atom indices, one per entry of ``atoms``.
             When given they are used as-is and ``anchor`` is not required.
         site (str): Sublattice this group binds to, one of "A", "B" or "X". Required for
-            every motif of a ligand with more than one; for a single motif it may be left
-            to ``LigandSpec.site`` or the ligand charge.
+            every motif of a ligand with more than one; a single motif left without one
+            gets it from the ligand charge (positive -> A-site, otherwise X-site).
+        adsorb (bool): If True the group adsorbs on top of its site, which keeps its surface
+            atom(s); otherwise it replaces them.
+        anchor_offset (float): Distance (Å) of the anchor from its site along the surface
+            normal. Defaults to 3.0 for an adsorbing group, about a Cs-O/N bond or an
+            N-H...Br hydrogen bond, and to 0 otherwise.
     """
     atoms: list[str]
     anchor: Optional[str] = None
     indices: Optional[list[int]] = None
     site: Optional[str] = None
+    adsorb: bool = False
+    anchor_offset: Optional[float] = None
 
     def __post_init__(self):
+        if self.anchor_offset is None:
+            self.anchor_offset = 3.0 if self.adsorb else 0.0
+        self.anchor_offset = float(self.anchor_offset)
         if not 1 <= len(self.atoms) <= 2:
             raise NotImplementedError(
                 f"Binding motifs with more than 2 atoms are not yet supported; "
@@ -115,7 +125,6 @@ class Ligand(Part):
             (see ``binding_groups`` for the split).
         planes (List[Tuple[int, int, int]]): Miller index of the surface each motif is bound
             to; ``plane`` is the first one.
-        _anchor_offset (float): Offset (Å) applied along the axis perpendicular to the plane.
     """
     atoms: Atoms = PartAtoms()
     mol: Chem.Mol = _SyncedMol()
@@ -127,7 +136,6 @@ class Ligand(Part):
     volume: float = None
     binding_atoms: List[int] = field(default_factory=list)
     planes: List[Tuple[int, int, int]] = field(default_factory=list)
-    _anchor_offset: float = 0.0
 
     def __post_init__(self):
         mol = self.mol
@@ -136,6 +144,15 @@ class Ligand(Part):
         if self.name is None:
             self.name = self.atoms.get_chemical_formula()
         self.binding_motifs = pack_motifs(self.binding_motifs)
+        if len(self.binding_motifs) == 1 and self.binding_motifs[0].site is None:
+            # on a copy: the motif given may be shared with other ligands
+            self.binding_motifs = [replace(self.binding_motifs[0], site="A" if self.charge > 0 else "X")]
+        missing = [k for k, m in enumerate(self.binding_motifs) if m.site is None]
+        if missing:
+            raise ValueError(
+                f"every motif of a multi-motif ligand needs a site ('A', 'B' or 'X'); "
+                f"motif(s) {missing} of ligand {self.name!r} have none"
+            )
         # a coarse grid will do: the volume only orders ligands
         self.volume = float(AllChem.ComputeMolVolume(mol, gridSpacing=0.4))
         if self.binding_motifs:
@@ -475,65 +492,3 @@ class Ligand(Part):
             filename = f"{self.name}.{fmt}"
 
         write_structure(self.atoms, filename, fmt, center_in_box=True, vacuum=vacuum, **kwargs)
-
-
-@dataclass
-class LigandSpec:
-    """
-    Pairs a Ligand with placement parameters.
-
-    Attributes:
-        ligand (Ligand): The ligand to attach.
-        site (Optional[str]): Which sublattice to target, one of "A", "B", or "X". If None,
-            the target is the motif's own ``site`` or, failing that, follows from the ligand
-            charge (positive -> A-site, otherwise X-site). Ligands with several motifs take
-            the site of each motif and leave this None.
-        coverage (Optional[float]): Fractional coverage of available binding sites; above 1,
-            a number of ligands. For a multi-motif ligand the fraction is of the most ligands
-            the free sites can host, each sublattice serving its free sites divided by the
-            motifs that need it.
-        binding_site_indices (Optional[list[int]]): Atom indices of the surface sites to use
-            (any atom of a molecular A-site). For a multi-motif ligand, a list of groups with
-            one index per motif, in motif order.
-        anchor_offset (float): Offset (Å) along the binding axis. When `adsorb` is
-            True this sets the spacing between the surface species and the adsorbate.
-        adsorb (bool): If True, adsorb the ligand on top of the surface site instead
-            of replacing it (the surface atom is kept). Use `anchor_offset` to control
-            the spacing.
-    """
-    ligand: Ligand
-    site: Optional[str] = None
-    coverage: Optional[float] = None
-    binding_site_indices: Optional[list[int]] = None
-    anchor_offset: float = 0.0
-    adsorb: bool = False
-
-    def __post_init__(self):
-        if self.site is not None and self.site not in ("A", "B", "X"):
-            raise ValueError(
-                f"site must be one of 'A', 'B', 'X' (or None); got {self.site!r}"
-            )
-        motifs = self.ligand.binding_motifs
-        if len(motifs) == 1 and motifs[0].site is not None:
-            if self.site is None:
-                self.site = motifs[0].site
-            elif self.site != motifs[0].site:
-                raise ValueError(
-                    f"LigandSpec.site={self.site!r} contradicts the motif's site={motifs[0].site!r}"
-                )
-        elif len(motifs) > 1:
-            if self.site is not None:
-                raise ValueError(
-                    "LigandSpec.site applies to single-motif ligands; give each BindingMotif "
-                    "of a multi-motif ligand its own site instead"
-                )
-            missing = [k for k, m in enumerate(motifs) if m.site is None]
-            if missing:
-                raise ValueError(
-                    f"every motif of a multi-motif ligand needs a site ('A', 'B' or 'X'); "
-                    f"motif(s) {missing} of ligand {self.ligand.name!r} have none"
-                )
-        if self.coverage is None and self.binding_site_indices is None:
-            raise ValueError("LigandSpec needs a coverage or binding_site_indices")
-        if self.coverage is not None and self.coverage < 0:
-            raise ValueError(f"coverage must be at least 0; got {self.coverage}")
