@@ -18,18 +18,20 @@ from .utils.rotation import rotation_about_axis
 @dataclass
 class Assembly:
     """
-    A Core with ligands on its surface: a nanocrystal, or a slab when the Core is periodic
-    (Core.build_core(..., pbc=(True, True, False))). KD-tree searches follow the core's pbc:
-    minimum-image distances along its periodic axes. A slab keeps its cell.
-    Made by Core.place_ligands, or read back with from_file and from_ase.
+    A core with its ligands, a nanocrystal or a slab. Made by Core.place_ligands, or read
+    with from_file.
 
-    `atoms` is the only copy of the atoms: whatever is done to them is done there, and the
-    `atoms` of `core` and of each ligand are read-only selections of it. Its per-atom array
-    "ligand_id" tells whose each atom is (-1: the core); the ids are the ligands' places in
-    `ligands`. After atoms are deleted from it, the next method call, or read of `octahedra`
-    or `B_ijk`, brings `core`, `octahedra`, `B_ijk` and `ligands` up to date, the remaining
-    ligands taking the ids 0, 1, ... in order; deleting only part of a ligand is not
-    supported.
+    `atoms` holds every atom: the `atoms` of `core` and of each ligand are read-only views
+    of it, and its "ligand_id" array gives each atom's ligand (-1 for the core). Whole
+    ligands deleted from `atoms` are followed, and the rest are renumbered 0, 1, ...
+
+    Attributes:
+        core (Core): The core.
+        ligands (List[Ligand]): The ligands, in id order.
+        ligand_coverage (Dict[str, float]): Requested coverage of each ligand name.
+        atoms (Atoms): Every atom of the assembly.
+        octahedra (Dict[int, dict]): As in Core, with the ids of the bound ligands.
+        B_ijk (Dict[int, Tuple[int, int, int]]): As in Core.
     """
     core: Core
     ligands: List[Ligand] = field(default_factory=list)
@@ -50,7 +52,12 @@ class Assembly:
 
 
     def remove_ligand(self, ligand_id: int) -> None:
-        """Remove the ligand with this id; the ligands after it move up one id."""
+        """
+        Remove a ligand; the ligands after it move up one id.
+
+        Args:
+            ligand_id (int): Id of the ligand to remove.
+        """
         self._follow_deleted_atoms()
         if not any(lig.id == ligand_id for lig in self.ligands):
             raise ValueError(f"No ligand with id={ligand_id} found.")
@@ -65,10 +72,13 @@ class Assembly:
         rotate: float = 0.0,
     ) -> None:
         """
-        Move placed ligands by hand: each turns by `rotate` degrees about the normal of its
-        sites (their mean for a multi-motif ligand) through the centroid of its anchors,
-        then shifts by `shift` (Å, along x, y and z). Their octahedra stay as they were;
-        check_overlaps tells whether they now touch anything.
+        Move ligands by hand, in place: turn each about the normal of its site(s) through
+        its anchors, then shift it. check_overlaps tells whether they now touch anything.
+
+        Args:
+            ligand_ids (int | Sequence[int]): Ligands to move.
+            shift (Sequence[float]): Translation (Å) along x, y and z.
+            rotate (float): Turn (deg) about the site normal.
         """
         self._follow_deleted_atoms()
         ids = [ligand_ids] if np.isscalar(ligand_ids) else list(dict.fromkeys(ligand_ids))
@@ -97,7 +107,16 @@ class Assembly:
         order: str = "xyz",
         move_ligands: bool = True,
     ):
-        from .tilt import apply_tilt 
+        """
+        Tilt the octahedra by a Glazer pattern, in place.
+
+        Args:
+            glazer (str): Glazer notation, e.g. "a+b-c-".
+            angles (Tuple[float, float, float]): Tilt angles (deg) about x, y and z.
+            order (str): Order of the rotations, e.g. "xyz".
+            move_ligands (bool): Turn each ligand with the octahedron it is bound to.
+        """
+        from .tilt import apply_tilt
         self._follow_deleted_atoms()
         apply_tilt(
             structure=self,
@@ -113,6 +132,14 @@ class Assembly:
         strain: Sequence[float],          # (ex, ey, ez)
         strain_ligands: bool = True,
     ):
+        """
+        Strain the assembly along x, y and z, in place.
+
+        Args:
+            strain (Sequence[float]): Fractional strains (ex, ey, ez).
+            strain_ligands (bool): Strain the ligands too; otherwise they move rigidly with
+                their anchors.
+        """
         from .strain import apply_strain
         self._follow_deleted_atoms()
         apply_strain(
@@ -124,8 +151,14 @@ class Assembly:
 
     def check_overlaps(self, cutoff: float = 1.6, verbose: bool = True) -> float:
         """
-        Closest contact (Å) between the core and a ligand or between two ligands, inf without
-        ligands. With `verbose`, also lists the pairs closer than `cutoff`.
+        Closest contact between the core and a ligand, or between two ligands.
+
+        Args:
+            cutoff (float): Pairs closer than this (Å) are listed when verbose.
+            verbose (bool): Print the close pairs and the closest contact.
+
+        Returns:
+            float: Closest distance (Å); inf without ligands.
         """
         self._follow_deleted_atoms()
         log = print if verbose else (lambda *a, **k: None)
@@ -182,9 +215,15 @@ class Assembly:
         **kwargs
     ) -> None:      
         """
-        Write the structure and, with `write_json`, its metadata to `filename`.json.
-        `fmt` defaults to "vasp" for a slab and "xyz" for a nanocrystal; a nanocrystal
-        written as vasp is boxed with `vacuum` Å around it.
+        Write the assembly to a file, and its metadata to `filename`.json.
+
+        Args:
+            fmt (str, optional): File format; "vasp" for a slab and "xyz" for a
+                nanocrystal by default.
+            filename (str, optional): Output path; named after the formula by default.
+            write_json (bool): Also write the metadata, which from_file needs.
+            vacuum (float): Vacuum (Å) around a nanocrystal written as VASP.
+            **kwargs: Passed to the ASE writer.
         """
         if fmt is None:
             fmt = "vasp" if self.core.is_slab else "xyz"
@@ -205,11 +244,32 @@ class Assembly:
 
     @classmethod
     def from_file(cls, filename: str, json_filename: str) -> Assembly:
+        """
+        Read an assembly written by `to`.
+
+        Args:
+            filename (str): Structure file.
+            json_filename (str): Its metadata file.
+
+        Returns:
+            Assembly: The assembly.
+        """
         return cls.from_ase(read(filename), json_filename)
 
 
     @classmethod
     def from_ase(cls, atoms: Atoms | List[Atoms], json_filename: str) -> Assembly | List[Assembly]:
+        """
+        Assemblies from ASE Atoms of an assembly written by `to`, e.g. the frames of an MD
+        trajectory.
+
+        Args:
+            atoms (Atoms | List[Atoms]): One structure, or a list of frames.
+            json_filename (str): Metadata file of the assembly.
+
+        Returns:
+            Assembly | List[Assembly]: One assembly, or one per frame.
+        """
         return read_assemblies(cls, atoms, json_filename)
 
 

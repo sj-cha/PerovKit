@@ -94,13 +94,12 @@ def compute_distances(structure,
     Minimum-image distances between atom pairs.
 
     Args:
-        structure: Assembly or ASE Atoms, or a list of them (a trajectory).
-        pairs: (n, 2) atom indices (i, j).
+        structure (Assembly | Atoms | List): A structure, or a list of frames.
+        pairs (array_like): (n, 2) atom indices (i, j).
         vector (bool): Return the vectors r_j - r_i instead of their lengths.
 
     Returns:
-        (n,) distances or (n, 3) vectors for a single structure;
-        (n_frames, n) or (n_frames, n, 3) for a trajectory.
+        np.ndarray: (n,) distances or (n, 3) vectors; (n_frames, ...) for a list of frames.
     """
     frames, is_traj = _as_frames(structure)
     pairs = np.asarray(pairs, dtype=int).reshape(-1, 2)
@@ -113,14 +112,14 @@ def compute_angles(structure,
                    triplets
                    ) -> np.ndarray:
     """
-    Angles (deg) at the middle atom j of (i, j, k) triplets, minimum image.
+    Minimum-image angles at the middle atom j of (i, j, k) triplets.
 
     Args:
-        structure: Assembly or ASE Atoms, or a list of them (a trajectory).
-        triplets: (n, 3) atom indices (i, j, k).
+        structure (Assembly | Atoms | List): A structure, or a list of frames.
+        triplets (array_like): (n, 3) atom indices (i, j, k).
 
     Returns:
-        (n,) for a single structure; (n_frames, n) for a trajectory.
+        np.ndarray: (n,) angles (deg); (n_frames, n) for a list of frames.
     """
     frames, is_traj = _as_frames(structure)
     t = np.asarray(triplets, dtype=int).reshape(-1, 3)
@@ -134,9 +133,16 @@ def compute_angles(structure,
 
 def compute_B_X_B_angles(structure, B_indices: Optional[List[int]] = None) -> pd.DataFrame:
     """
-    B-X-B angles (deg) at every X shared by two B atoms of `B_indices` (all B by default).
+    B-X-B angles at every X shared by two octahedra.
 
-    Returns a DataFrame with columns B1, B2, X, B1_ijk, B2_ijk, angles.
+    Args:
+        structure (Core | Assembly | List[Assembly]): A structure, or a list of frames
+            (Assembly.from_ase).
+        B_indices (List[int], optional): B atoms to include; all by default.
+
+    Returns:
+        pd.DataFrame: Columns B1, B2, X, B1_ijk, B2_ijk and angles (deg);
+            for a list of frames, each value is an array over the frames.
     """
     frames, is_traj, octahedra, B_ijk, b_set = _read(structure, B_indices)
 
@@ -167,9 +173,16 @@ def compute_B_X_B_angles(structure, B_indices: Optional[List[int]] = None) -> pd
 
 def compute_X_B_X_angles(structure, B_indices: Optional[List[int]] = None) -> pd.DataFrame:
     """
-    X-B-X angles (deg) inside the octahedron of every B in `B_indices` (all B by default).
+    X-B-X angles inside every octahedron.
 
-    Returns a DataFrame with columns B, X1, X2, B_ijk, angles.
+    Args:
+        structure (Core | Assembly | List[Assembly]): A structure, or a list of frames
+            (Assembly.from_ase).
+        B_indices (List[int], optional): B atoms to include; all by default.
+
+    Returns:
+        pd.DataFrame: Columns B, X1, X2, B_ijk and angles (deg);
+            for a list of frames, each value is an array over the frames.
     """
     frames, is_traj, octahedra, B_ijk, b_set = _read(structure, B_indices)
 
@@ -194,9 +207,16 @@ def compute_X_B_X_angles(structure, B_indices: Optional[List[int]] = None) -> pd
 
 def compute_B_X_distances(structure, B_indices: Optional[List[int]] = None) -> pd.DataFrame:
     """
-    B-X bond lengths (Å) of the octahedron of every B in `B_indices` (all B by default).
+    B-X bond lengths of every octahedron.
 
-    Returns a DataFrame with columns B, X, B_ijk, distances.
+    Args:
+        structure (Core | Assembly | List[Assembly]): A structure, or a list of frames
+            (Assembly.from_ase).
+        B_indices (List[int], optional): B atoms to include; all by default.
+
+    Returns:
+        pd.DataFrame: Columns B, X, B_ijk and distances (Å);
+            for a list of frames, each value is an array over the frames.
     """
     frames, is_traj, octahedra, B_ijk, b_set = _read(structure, B_indices)
 
@@ -215,11 +235,19 @@ def compute_B_X_distances(structure, B_indices: Optional[List[int]] = None) -> p
 def compute_bond_angle_variance(structure, B_indices: Optional[List[int]] = None,
                                 linear_threshold: float = 130.0) -> pd.DataFrame:
     """
-    Bond angle variance (deg^2) of every octahedron: sum of (angle - 90)^2 / (n - 1) over
-    its n cis X-B-X angles, i.e. those below `linear_threshold`. For a trajectory the cis
-    angles are picked in every frame.
+    Bond angle variance of every octahedron: sum of (angle - 90)^2 / (n - 1) over its n
+    cis X-B-X angles.
 
-    Returns a DataFrame with columns B, B_ijk, bond_angle_variance.
+    Args:
+        structure (Core | Assembly | List[Assembly]): A structure, or a list of frames
+            (Assembly.from_ase).
+        B_indices (List[int], optional): B atoms to include; all by default.
+        linear_threshold (float): X-B-X angles (deg) at or above this are trans and left
+            out, frame by frame.
+
+    Returns:
+        pd.DataFrame: Columns B, B_ijk and bond_angle_variance (deg^2);
+            for a list of frames, each value is an array over the frames.
     """
     frames, is_traj = _as_frames(structure)
     df = compute_X_B_X_angles(structure, B_indices)
@@ -255,7 +283,14 @@ def compute_distortion_index(structure, B_indices: Optional[List[int]] = None) -
     """
     Distortion index of every octahedron: mean |d - <d>| / <d> over its B-X bond lengths d.
 
-    Returns a DataFrame with columns B, B_ijk, distortion_index.
+    Args:
+        structure (Core | Assembly | List[Assembly]): A structure, or a list of frames
+            (Assembly.from_ase).
+        B_indices (List[int], optional): B atoms to include; all by default.
+
+    Returns:
+        pd.DataFrame: Columns B, B_ijk and distortion_index;
+            for a list of frames, each value is an array over the frames.
     """
     frames, _ = _as_frames(structure)
     df = compute_B_X_distances(structure, B_indices)
@@ -278,11 +313,18 @@ def compute_distortion_index(structure, B_indices: Optional[List[int]] = None) -
 
 def compute_quadratic_elongation(structure, B_indices: Optional[List[int]] = None) -> pd.DataFrame:
     """
-    Quadratic elongation of every complete (6-X) octahedron: mean (d / l_0)^2, with l_0 the
-    center-to-vertex distance of a regular octahedron of the same volume. For a trajectory the
-    volume needs a convex hull per frame, so this one is slow on long trajectories.
+    Quadratic elongation of every complete (6-X) octahedron: mean (d / l_0)^2, with l_0
+    the center-to-vertex distance of the regular octahedron of the same volume. Slow on
+    long trajectories (one convex hull per frame).
 
-    Returns a DataFrame with columns B, B_ijk, quadratic_elongation.
+    Args:
+        structure (Core | Assembly | List[Assembly]): A structure, or a list of frames
+            (Assembly.from_ase).
+        B_indices (List[int], optional): B atoms to include; all by default.
+
+    Returns:
+        pd.DataFrame: Columns B, B_ijk and quadratic_elongation;
+            for a list of frames, each value is an array over the frames.
     """
     frames, is_traj, octahedra, B_ijk, b_set = _read(structure, B_indices)
 

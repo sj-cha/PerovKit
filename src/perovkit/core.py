@@ -20,20 +20,19 @@ if TYPE_CHECKING:
 @dataclass
 class Core(Part):
     """
-    ABX3 perovskite core. 
-    Currently only supports cubic phase for inorganic perovskites.
+    Cubic ABX3 perovskite core, a nanocrystal or a slab. Make one with build_core.
 
     Attributes:
-        A (str | List[Ligand]): Chemical symbol of the A-site, or its organic cations.
-        B, X (str): Chemical symbols of the B- and X-site species.
-        atoms (ASE Atoms): ASE Atoms object of Core; in an Assembly, a read-only selection of its atoms.
+        A (str | List[Ligand]): A-site element, or the organic A-site cations.
+        B (str): B-site element.
+        X (str): X-site element.
+        atoms (Atoms): Atoms of the core (read-only inside an Assembly).
         a (float): Cubic lattice constant (Å).
-        supercell (Tuple[int, int, int]): Number of repeating unit cells along x, y, z (nx, ny, nz).
-        vacuum (float): Vacuum thickness (Å) along a z-direction (used for slabs).
-        octahedra (Dict[int, Dict[str, List[int]]]): Map B-atom index -> {"X": [...], "Ligand": [...]}.
-        B_ijk (Dict[int, Tuple[int, int, int]]): Map B-atom index -> integer lattice coordinates.
-        build_surface (bool): Whether to find the binding sites and octahedra on initialization.
-        binding_sites (List[BindingSite]): List of surface binding sites.
+        supercell (Tuple[int, int, int]): Unit cells along x, y and z.
+        vacuum (float): Vacuum (Å) along z of a slab.
+        octahedra (Dict[int, dict]): B atom index -> {"X": X indices, "Ligand": ligand ids}.
+        B_ijk (Dict[int, Tuple[int, int, int]]): B atom index -> lattice coordinates.
+        binding_sites (List[BindingSite]): Surface sites that ligands bind to.
     """
     A: str | List[Ligand]
     B: str
@@ -102,29 +101,25 @@ class Core(Part):
         A_site_disorder: str = "balanced",
     ) -> Core:
         """
-        Build an ABX3 core: an AX-terminated nanocrystal for pbc=False, a slab periodic in x
-        and y with vacuum along z for pbc=True, which is (True, True, False).
+        Build a cubic ABX3 nanocrystal (AX-terminated) or slab.
 
         Args:
-            A (str | Ligand): A-site species. A chemical symbol for an inorganic cation, 
-                              or a Ligand instance for an organic cation.
-            B, X (str): Chemical symbols for B- and X-site species.
+            A (str | Ligand): A-site element, or an organic cation as a Ligand.
+            B (str): B-site element.
+            X (str): X-site element.
             a (float): Cubic lattice constant (Å).
-            supercell (Sequence[int]): Number of repeating unit cells along x, y, z.
-            pbc (bool | Sequence[bool]): False, or True or (True, True, False); nothing else.
-            vacuum (float): Vacuum thickness (Å) along z (slab only).
-            charge_neutral (bool): Remove surface A cations to ensure charge neutrality, corners
-                                   first, then others at random (nanocrystal only).
-            random_seed (Optional[int]): Seed for choosing which surface A cations to remove
-                                         (nanocrystal only) and for `A_site_disorder`.
-            A_site_disorder (str): Orientation of organic A cations, each about its own center
-                                   and with a random spin about its axis (+z of the Ligand as
-                                   it was passed). "balanced": random axes, half of them the
-                                   opposite of the other half, which leaves no net dipole
-                                   along them. "random": random axes. "none": all as passed.
+            supercell (Sequence[int]): Unit cells along x, y and z.
+            pbc (bool | Sequence[bool]): False for a nanocrystal; True or (True, True, False)
+                for a slab periodic in x and y.
+            vacuum (float): Vacuum (Å) along z of a slab.
+            charge_neutral (bool): Remove surface A cations, corners first, until a
+                nanocrystal is neutral.
+            random_seed (int, optional): Seed for the removed cations and A_site_disorder.
+            A_site_disorder (str): Orientation of organic A cations: "balanced" (random, no
+                net dipole), "random" or "none" (as given).
 
         Returns:
-            A Core instance.
+            Core: The new core.
         """
         flags = np.ravel(pbc)
         if not all(isinstance(p, (bool, np.bool_)) for p in flags) or flags.tolist() not in (
@@ -290,12 +285,12 @@ class Core(Part):
         random_seed: Optional[int] = None,
     ):
         """
-        Randomly displace every atom by a fraction of its covalent radius.
+        Displace every atom in a random direction, in place.
 
         Args:
-            bound (Sequence[float]): Bounds on the displacement as a fraction of the covalent
-                radius (e.g. [0.0, 0.1] for up to 10%).
-            random_seed (Optional[int]): Seed; None draws from numpy's global generator.
+            bound (Sequence[float]): (low, high) displacement as a fraction of each atom's
+                covalent radius, e.g. (0.0, 0.1).
+            random_seed (int, optional): Seed; None uses numpy's global generator.
         """
         if random_seed is not None:
             rng = np.random.default_rng(random_seed)
@@ -327,12 +322,12 @@ class Core(Part):
         order: str = "xyz"
     ):
         """
-        Apply a Glazer octahedral tilt.
+        Tilt the octahedra by a Glazer pattern, in place.
 
         Args:
-            glazer: Glazer notation string (e.g. "a+b-c-").
-            angles: Tilt angles (deg) about x, y, z axes.
-            order: Rotation order (e.g. "xyz").
+            glazer (str): Glazer notation, e.g. "a+b-c-".
+            angles (Tuple[float, float, float]): Tilt angles (deg) about x, y and z.
+            order (str): Order of the rotations, e.g. "xyz".
         """
         from .tilt import apply_tilt
         apply_tilt(structure=self, glazer=glazer, angles=angles, order=order)
@@ -343,10 +338,10 @@ class Core(Part):
         strain: Sequence[float]
     ):
         """
-        Apply an axial strain.
+        Strain the core along x, y and z, in place.
 
         Args:
-            strain (Sequence[float]): (ex, ey, ez) fractional strains along each axis.
+            strain (Sequence[float]): Fractional strains (ex, ey, ez).
         """
         from .strain import apply_strain
         apply_strain(structure=self, strain=strain, strain_ligands=False)
@@ -359,30 +354,36 @@ class Core(Part):
         **kwargs,
     ) -> Assembly:
         """
-        Place ligands on a copy of this core, which is left as it is: sites by coverage
-        (or as given), then turns about the surface normals until no atoms of different
-        ligands, or of a ligand and the core, are within `overlap_cutoff`. Where and how
-        each ligand binds, replacing its site atoms or adsorbing on them, its
-        BindingMotif(s) say.
+        Place ligands on a copy of this core.
+
+        Sites are chosen by coverage, then the ligands turn and bend until no atoms of two
+        ligands, or of a ligand and the core, are closer than `overlap_cutoff`. How each
+        ligand binds is set by its BindingMotif(s).
 
         Args:
-            ligands: The ligands to place, or one Ligand.
-            coverage: One entry per ligand, or the entry of one Ligand as it is. Up to 1,
-                the fraction of the free sites to take; above 1, a number of ligands (its
-                whole part); a list, the sites to take by atom index (any atom of a
-                molecular A-site), for a multi-motif ligand groups of one index per motif,
-                in motif order. For a multi-motif ligand the fraction is of the most
-                ligands the free sites can host, each sublattice serving its free sites
-                divided by the motifs that need it.
-            **kwargs: Options of the placement: max_iters (10), overlap_cutoff (1.6 Å),
-                coarse_step_deg (18), fine_step_deg (2), window_deg (12),
-                active_radius_factor (sqrt(2)/2), random_seed (42), verbose (True),
-                refine_torsions (True), stretch_tails (True), n_workers (8, at most the
-                CPUs available); for multi-motif ligands also max_anchor_rmsd (0.5 Å) and
-                any option of ConstellationSampler (e.g. n_refine, max_templates).
+            ligands (Ligand | Sequence[Ligand]): One ligand, or a list of them.
+            coverage (float | Sequence): One entry per ligand (the entry itself for one
+                Ligand): up to 1, a fraction of the free sites; above 1, a number of
+                ligands; a list, the site atom indices to take (for a multi-motif ligand,
+                groups of one index per motif).
+            **kwargs: Placement options:
+                max_iters (int): Rounds of the turning search. Default 10.
+                overlap_cutoff (float): Closest allowed contact (Å). Default 1.6.
+                coarse_step_deg, fine_step_deg, window_deg (int): Spin scan step, then a
+                    finer step within this window of the best. Defaults 18, 2, 12.
+                active_radius_factor (float): Ligands within this many lattice constants
+                    of a clashing one turn with it. Default sqrt(2)/2.
+                random_seed (int): Seed. Default 42.
+                verbose (bool): Print the placement log. Default True.
+                refine_torsions (bool): Bend ligands that turning cannot clear. Default True.
+                stretch_tails (bool): Stretch dangling chains before packing. Default True.
+                n_workers (int): Processes for the stretch. Default 8.
+                max_anchor_rmsd (float): Largest anchor deviation (Å) of a multi-motif
+                    ligand from its sites. Default 0.5.
+                Other options go to ConstellationSampler (e.g. n_refine, max_templates).
 
         Returns:
-            Assembly: the core with its ligands.
+            Assembly: The core with its ligands.
         """
         from .placement import place_ligands
         return place_ligands(self, ligands, coverage, **kwargs)
@@ -396,12 +397,14 @@ class Core(Part):
         **kwargs,
     ):
         """
-        Write the structure to file.
+        Write the core to a file.
 
         Args:
-            fmt: File format
-            filename: Output path
-            vacuum: Vacuum padding (Å) for nanocrystal VASP output.
+            fmt (str): File format, e.g. "xyz" or "vasp".
+            filename (str, optional): Output path; by default named after the composition
+                and supercell.
+            vacuum (float): Vacuum (Å) around a nanocrystal written as VASP.
+            **kwargs: Passed to the ASE writer.
         """
         if filename is None:
             nx, ny, nz = self.supercell or (0, 0, 0)

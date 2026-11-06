@@ -20,25 +20,21 @@ from .utils.selection import Part, PartAtoms
 @dataclass
 class BindingMotif:
     """
-    Specification of how a ligand anchors to a surface.
-
-    A ligand holds one motif per independent binding group; a zwitterion, for example,
-    has one for its cationic and one for its anionic end.
+    How one binding group of a ligand anchors to the surface. A ligand has one motif per
+    binding group, e.g. two for a zwitterion.
 
     Attributes:
-        atoms (list[str]): Element symbols of the binding atoms (1 or 2), e.g. ["O", "O"].
-        anchor (str): SMARTS of the binding group, e.g. "P" for a phosphonate. The binding
-            atoms are searched among the atoms of its first match and their bonded neighbors.
-        indices (list[int]): Explicit binding atom indices, one per entry of ``atoms``.
-            When given they are used as-is and ``anchor`` is not required.
-        site (str): Sublattice this group binds to, one of "A", "B" or "X". Required for
-            every motif of a ligand with more than one; a single motif left without one
-            gets it from the ligand charge (positive -> A-site, otherwise X-site).
-        adsorb (bool): If True the group adsorbs on top of its site, which keeps its surface
-            atom(s); otherwise it replaces them.
-        anchor_offset (float): Distance (Å) of the anchor from its site along the surface
-            normal. Defaults to 3.0 for an adsorbing group, about a Cs-O/N bond or an
-            N-H...Br hydrogen bond, and to 0 otherwise.
+        atoms (list[str]): Elements of the binding atoms (1 or 2), e.g. ["O", "O"].
+        anchor (str, optional): SMARTS of the binding group, e.g. "C(=O)[O-]"; the binding
+            atoms are taken from its first match and their neighbors.
+        indices (list[int], optional): Binding atom indices, one per element of `atoms`,
+            used instead of `anchor`.
+        site (str, optional): Sublattice it binds to: "A", "B" or "X". Required with several
+            motifs; a single motif without one takes A for a cation, X otherwise.
+        adsorb (bool): Adsorb on top of the site, keeping its surface atom(s), instead of
+            replacing them.
+        anchor_offset (float, optional): Height (Å) of the anchor above its site. Default
+            3.0 when adsorbing, else 0.
     """
     atoms: list[str]
     anchor: Optional[str] = None
@@ -109,23 +105,19 @@ class _SyncedMol:
 @dataclass
 class Ligand(Part):
     """
-    Surface-passivating ligand molecule.
+    Ligand molecule. Make one with from_smiles or from_file.
 
     Attributes:
-        atoms (ASE Atoms): ASE Atoms object; in an Assembly, a read-only selection of its atoms.
-        mol (Chem.Mol): RDKit Mol object; its conformer follows ``atoms`` positions.
-        smiles (str): SMILES string of the ligand without explicit hydrogens.
-        charge (int): Formal charge of the ligand.
-        binding_motifs (List[BindingMotif]): How the ligand anchors to a surface, one motif
-            per binding group; from_smiles and from_file take them as ``binding_motif``,
-            one motif or a list.
-        name (str): User-defined identifier; the chemical formula when none is given.
-        id (int): Ligand ID assigned after placement.
-        volume (float): Molecular volume (Å^3).
-        binding_atoms (List[int]): Local indices of atoms used as anchors, motif after motif
-            (see ``binding_groups`` for the split).
-        planes (List[Tuple[int, int, int]]): Miller index of the surface each motif is bound
-            to; ``plane`` is the first one.
+        atoms (Atoms): Atoms of the ligand (read-only inside an Assembly).
+        mol (Chem.Mol): RDKit molecule; its conformer follows `atoms`.
+        smiles (str): SMILES string.
+        charge (int): Formal charge.
+        binding_motifs (List[BindingMotif]): One motif per binding group.
+        name (str): Name; the chemical formula by default.
+        id (int): Index in its Assembly, after placement.
+        binding_atoms (List[int]): Indices of the binding atoms, motif after motif.
+        planes (List[Tuple[int, int, int]]): Miller index of the surface under each motif,
+            after placement.
     """
     atoms: Atoms = PartAtoms()
     mol: Chem.Mol = _SyncedMol()
@@ -206,18 +198,17 @@ class Ligand(Part):
         charge: Optional[int] = None,
     ) -> Ligand:
         """
-        Build a Ligand from a file. 
-        Currently only XYZ files are supported.
+        Read a ligand from an XYZ file.
 
         Args:
             filename (str): Path to the XYZ file.
-            binding_motif (BindingMotif | List[BindingMotif]): How the ligand anchors to a
-                surface; a list gives one motif per binding group.
-            name (str): User-defined identifier.
-            charge (Optional[int]): Formal charge; if None, tries -1, 0, +1 in order.
+            binding_motif (BindingMotif | List[BindingMotif]): One motif, or one per
+                binding group.
+            name (str): Name of the ligand.
+            charge (int, optional): Formal charge; by default -1, 0 and +1 are tried.
 
         Returns:
-            A Ligand instance.
+            Ligand: The ligand.
         """
         atoms = read(filename)
         mol = Chem.MolFromXYZFile(str(filename))
@@ -250,18 +241,17 @@ class Ligand(Part):
         name: str = None,
     ) -> Ligand:
         """
-        Build a Ligand from a SMILES string.
+        Build a ligand from SMILES, embedded with ETKDG and relaxed with UFF.
 
         Args:
-            smiles (str): SMILES string of the ligand.
-            binding_motif (BindingMotif | List[BindingMotif]): How the ligand anchors to a
-                surface; a list gives one motif per binding group.
-            random_seed (int): Random seed for ETKDG embedding.
-            name (str): User-defined identifier; the chemical formula by default.
+            smiles (str): SMILES string.
+            binding_motif (BindingMotif | List[BindingMotif], optional): One motif, or one
+                per binding group; an A-site cation needs none.
+            random_seed (int): Seed for the embedding.
+            name (str, optional): Name; the chemical formula by default.
 
         Returns:
-            A Ligand instance, embedded with ETKDG and relaxed with UFF. Its chains are
-            stretched at placement, not here.
+            Ligand: The ligand.
         """
         mol = Chem.AddHs(Chem.MolFromSmiles(smiles))
         params = AllChem.ETKDGv3()
@@ -482,12 +472,13 @@ class Ligand(Part):
         **kwargs
     ) -> None:
         """
-        Write the ligand to file.
+        Write the ligand to a file.
 
         Args:
-            fmt (str): File format.
-            filename (str): Output path.
-            vacuum (float): Vacuum padding (Å) for VASP output.
+            fmt (str): File format, e.g. "xyz" or "vasp".
+            filename (str, optional): Output path; `name.fmt` by default.
+            vacuum (float): Vacuum (Å) around the ligand for VASP.
+            **kwargs: Passed to the ASE writer.
         """
         if filename is None:
             filename = f"{self.name}.{fmt}"
