@@ -1,4 +1,4 @@
-from typing import Dict, List, Tuple
+from typing import Tuple
 
 import numpy as np
 from scipy.spatial import cKDTree
@@ -40,18 +40,7 @@ class Box:
         point each comes from.
         """
         pts = np.asarray(points, dtype=float)
-        tree = cKDTree((pts + self.shifts[:, None]).reshape(-1, 3))
+        # most are searched a few times and rebuilt: quicker to build, no slower to search
+        tree = cKDTree((pts + self.shifts[:, None]).reshape(-1, 3),
+                       balanced_tree=False, compact_nodes=False)
         return tree, np.tile(np.arange(len(pts)), len(self.shifts))
-
-    def neighbor_map(self, centers: np.ndarray, radii: np.ndarray, cutoff: float) -> Dict[int, List[int]]:
-        """For every sphere, the others that come within `cutoff` of it, in increasing order."""
-        if not len(centers):
-            return {}
-        tree, image_of = self.tree(centers)
-        reach = radii + float(np.max(radii)) + cutoff
-        neighbor_map: Dict[int, List[int]] = {}
-        for i, hits in enumerate(tree.query_ball_point(centers, r=reach)):
-            js = np.unique(image_of[hits])
-            d = np.linalg.norm(self.mic(centers[js] - centers[i]), axis=1)
-            neighbor_map[i] = [int(j) for j in js[(js != i) & (d <= radii[i] + radii[js] + cutoff)]]
-        return neighbor_map
