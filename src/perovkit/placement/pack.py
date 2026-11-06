@@ -6,18 +6,13 @@ from typing import Callable, List, Optional, Sequence, Tuple
 import numpy as np
 from scipy.sparse import coo_matrix
 from scipy.sparse.csgraph import connected_components
-from scipy.spatial import cKDTree
 from tqdm.auto import tqdm
 
-from ..kernels import _best_spin, _closest, make_cells
+from ..kernels import _best_spin, _closest, _contacts, make_cells
 from ..refine import CONTACT_MARGINS, INTRA_SCALE, K_CONTACT, refine, refine_joint
 from ..utils.box import Box
 from .poses import MultiMotifPose, Pose
 from .stretch import stretch_poses
-
-
-# Å beyond the cutoff: contacts between ligands are searched this far, farther ones never matter
-CONTACT_REACH = 1.0
 
 
 def bend_pose(
@@ -224,27 +219,20 @@ class Contacts:
                 ligands: Optional[Sequence[int]] = None) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """
         Closest contact with the core and the other ligands of every ligand, or only of
-        `ligands`, from one search over all atoms. Contacts with ligands count up to
-        CONTACT_REACH beyond the cutoff.
+        `ligands`, from one search over all atoms; contacts count up to `reach`.
 
         Returns:
             (contact per ligand, inf where not asked for; both ligands of every pair closer
             than the cutoff)
         """
-        owner = np.repeat(np.arange(len(coords_list)), [len(c) for c in coords_list])
-        x = np.vstack(coords_list)
-        own = np.arange(len(x)) if ligands is None else np.flatnonzero(np.isin(owner, ligands))
-        tree, image_of = self.box.tree(x)
-        found = cKDTree(x[own]).sparse_distance_matrix(tree, self.cutoff + CONTACT_REACH,
-                                                       output_type="ndarray")
-        a, b = owner[own[found["i"]]], owner[image_of[found["j"]]]
-        other = a != b
-        a, b, d = a[other], b[other], found["v"][other]
-        dists = np.full(len(coords_list), np.inf)
-        np.minimum.at(dists, owner[own], self.core_tree.query(x[own])[0])
-        np.minimum.at(dists, a, d)
-        close = d < self.cutoff
-        return dists, a[close], b[close]
+        n = len(coords_list)
+        owner = np.repeat(np.arange(n), [len(c) for c in coords_list])
+        searched = np.ones(n, dtype=bool)
+        if ligands is not None:
+            searched[:] = False
+            searched[list(ligands)] = True
+        return _contacts(np.vstack(coords_list), owner, searched, n, self.core_cells,
+                         self.box.shifts, self.cutoff, self.reach)
 
     def around(self, neighbors_coords: List[np.ndarray]) -> tuple:
         """

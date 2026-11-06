@@ -186,6 +186,54 @@ def _closest(x, core, neighbors, bound):
 
 
 @numba.njit(cache=True)
+def _contacts(x, owner, searched, n_ligands, core, shifts, cutoff, reach):
+    """
+    Closest contact of every ligand in `searched` with `core` and with the other ligands,
+    their images at `shifts` included, and the ligands of each atom pair closer than `cutoff`.
+    Contacts count up to `reach`; a ligand not searched gets inf. x (N, 3) holds all atoms,
+    `owner` the ligand of each.
+    """
+    N = x.shape[0]
+    points, lo, h, shape, head, following = make_cells(_images(x, shifts), reach)
+    closest = np.full(n_ligands, np.inf)
+    for l in range(n_ligands):
+        if searched[l]:
+            closest[l] = reach * reach
+    cutoff2 = cutoff * cutoff
+    n = 0
+    first, second = np.empty(1024, dtype=np.int64), np.empty(1024, dtype=np.int64)
+    for p in range(N):
+        op = owner[p]
+        if not searched[op]:
+            continue
+        ax, ay, az = x[p, 0], x[p, 1], x[p, 2]
+        best = closest_squared(ax, ay, az, closest[op], core)
+        c0, c1, c2 = int(np.floor((ax - lo[0]) / h)), int(np.floor((ay - lo[1]) / h)), int(np.floor((az - lo[2]) / h))
+        for i in range(max(c0 - 1, 0), min(c0 + 2, shape[0])):
+            for j in range(max(c1 - 1, 0), min(c1 + 2, shape[1])):
+                for k in range(max(c2 - 1, 0), min(c2 + 2, shape[2])):
+                    b = head[(i * shape[1] + j) * shape[2] + k]
+                    while b >= 0:
+                        oq = owner[b % N]
+                        if oq != op:
+                            dx, dy, dz = ax - points[b, 0], ay - points[b, 1], az - points[b, 2]
+                            d2 = dx * dx + dy * dy + dz * dz
+                            if d2 < best:
+                                best = d2
+                            if d2 < cutoff2:
+                                if n == first.shape[0]:
+                                    first, second = doubled(first), doubled(second)
+                                first[n], second[n] = op, oq
+                                n += 1
+                        b = following[b]
+        closest[op] = best
+    for l in range(n_ligands):
+        if searched[l]:
+            closest[l] = math.sqrt(closest[l])
+    return closest, first[:n], second[:n]
+
+
+@numba.njit(cache=True)
 def _over_sites(x, sites, normals, radii, out):
     """
     out[s]: whether pose s of x (S, m, 3) lies over any of `sites` (K, 3): an atom on the
