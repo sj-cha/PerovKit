@@ -22,8 +22,9 @@ class Assembly:
     with from_file.
 
     `atoms` holds every atom: the `atoms` of `core` and of each ligand are read-only views
-    of it, and its "ligand_id" array gives each atom's ligand (-1 for the core). Whole
-    ligands deleted from `atoms` are followed, and the rest are renumbered 0, 1, ...
+    of it, though constraints set on them reach it, and its "ligand_id" array gives each
+    atom's ligand (-1 for the core). Whole ligands deleted from `atoms` are followed, and
+    the rest are renumbered 0, 1, ...
 
     Attributes:
         core (Core): The core.
