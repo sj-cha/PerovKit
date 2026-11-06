@@ -354,8 +354,8 @@ class Core(Part):
 
     def place_ligands(
         self,
-        ligands: Sequence[Ligand],
-        coverage: Sequence[float | Sequence],
+        ligands: Ligand | Sequence[Ligand],
+        coverage: float | Sequence,
         **kwargs,
     ) -> Assembly:
         """
@@ -366,13 +366,14 @@ class Core(Part):
         BindingMotif(s) say.
 
         Args:
-            ligands: The ligands to place.
-            coverage: One entry per ligand. Up to 1, the fraction of the free sites to take;
-                above 1, a number of ligands (its whole part); a list, the sites to take by
-                atom index (any atom of a molecular A-site), for a multi-motif ligand groups
-                of one index per motif, in motif order. For a multi-motif ligand the fraction
-                is of the most ligands the free sites can host, each sublattice serving its
-                free sites divided by the motifs that need it.
+            ligands: The ligands to place, or one Ligand.
+            coverage: One entry per ligand, or the entry of one Ligand as it is. Up to 1,
+                the fraction of the free sites to take; above 1, a number of ligands (its
+                whole part); a list, the sites to take by atom index (any atom of a
+                molecular A-site), for a multi-motif ligand groups of one index per motif,
+                in motif order. For a multi-motif ligand the fraction is of the most
+                ligands the free sites can host, each sublattice serving its free sites
+                divided by the motifs that need it.
             **kwargs: Options of the placement: max_iters (10), overlap_cutoff (1.6 Å),
                 coarse_step_deg (18), fine_step_deg (2), window_deg (12),
                 active_radius_factor (sqrt(2)/2), random_seed (42), verbose (True),

@@ -27,8 +27,8 @@ def _in_order(ligands: Sequence[Ligand], coverage: Sequence) -> List[tuple]:
 
 def place_ligands(
     core: Core,
-    ligands: Sequence[Ligand],
-    coverage: Sequence,
+    ligands: Ligand | Sequence[Ligand],
+    coverage: float | Sequence,
     max_iters: int = 10,
     overlap_cutoff: float = 1.6,   # Å
     coarse_step_deg: int = 18,
@@ -46,6 +46,10 @@ def place_ligands(
     """
     Implements Core.place_ligands, which documents the arguments.
     """
+    if isinstance(ligands, Ligand):   # one ligand given as it is, and so its coverage
+        ligands, coverage = [ligands], [coverage]
+    elif isinstance(coverage, Real):
+        raise ValueError("with a list of ligands, give a list of coverages, one per ligand")
     if len(coverage) != len(ligands):
         raise ValueError(f"{len(ligands)} ligands but {len(coverage)} coverages; give one per ligand")
     for lig, cov in zip(ligands, coverage):

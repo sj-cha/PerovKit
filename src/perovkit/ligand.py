@@ -76,14 +76,14 @@ class BindingMotif:
             raise ValueError(f"BindingMotif: indices must be distinct, got {self.indices}")
 
 def pack_motifs(value) -> List[BindingMotif]:
-    """A binding_motifs value as a list: one motif, several, or none for None."""
+    """A binding_motif value as a list: one motif, several, or none for None."""
     if value is None:
         return []
     if isinstance(value, BindingMotif):
         return [value]
     motifs = list(value)
     if not all(isinstance(m, BindingMotif) for m in motifs):
-        raise TypeError("binding_motifs must be a BindingMotif or a list of them")
+        raise TypeError("binding_motif must be a BindingMotif or a list of them")
     return motifs
 
 
@@ -117,7 +117,8 @@ class Ligand(Part):
         smiles (str): SMILES string of the ligand without explicit hydrogens.
         charge (int): Formal charge of the ligand.
         binding_motifs (List[BindingMotif]): How the ligand anchors to a surface, one motif
-            per binding group; a single motif may be given as it is.
+            per binding group; from_smiles and from_file take them as ``binding_motif``,
+            one motif or a list.
         name (str): User-defined identifier; the chemical formula when none is given.
         id (int): Ligand ID assigned after placement.
         volume (float): Molecular volume (Å^3).
@@ -200,7 +201,7 @@ class Ligand(Part):
     def from_file(
         cls,
         filename: str,
-        binding_motifs: BindingMotif | List[BindingMotif],
+        binding_motif: BindingMotif | List[BindingMotif],
         name: str,
         charge: Optional[int] = None,
     ) -> Ligand:
@@ -210,7 +211,7 @@ class Ligand(Part):
 
         Args:
             filename (str): Path to the XYZ file.
-            binding_motifs (BindingMotif | List[BindingMotif]): How the ligand anchors to a
+            binding_motif (BindingMotif | List[BindingMotif]): How the ligand anchors to a
                 surface; a list gives one motif per binding group.
             name (str): User-defined identifier.
             charge (Optional[int]): Formal charge; if None, tries -1, 0, +1 in order.
@@ -236,7 +237,7 @@ class Ligand(Part):
                    mol=m,
                    smiles=Chem.MolToSmiles(Chem.RemoveHs(m)),
                    charge=q,
-                   binding_motifs=binding_motifs,
+                   binding_motifs=binding_motif,
                    name=name)
 
 
@@ -244,7 +245,7 @@ class Ligand(Part):
     def from_smiles(
         cls,
         smiles: str,
-        binding_motifs: BindingMotif | List[BindingMotif] = None,
+        binding_motif: BindingMotif | List[BindingMotif] = None,
         random_seed: int = 42,
         name: str = None,
     ) -> Ligand:
@@ -253,7 +254,7 @@ class Ligand(Part):
 
         Args:
             smiles (str): SMILES string of the ligand.
-            binding_motifs (BindingMotif | List[BindingMotif]): How the ligand anchors to a
+            binding_motif (BindingMotif | List[BindingMotif]): How the ligand anchors to a
                 surface; a list gives one motif per binding group.
             random_seed (int): Random seed for ETKDG embedding.
             name (str): User-defined identifier; the chemical formula by default.
@@ -285,7 +286,7 @@ class Ligand(Part):
             mol=mol,
             smiles=smiles,
             charge=Chem.GetFormalCharge(mol),
-            binding_motifs=binding_motifs,
+            binding_motifs=binding_motif,
             name=name)
 
 
