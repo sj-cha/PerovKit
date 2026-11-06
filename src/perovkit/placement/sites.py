@@ -90,6 +90,7 @@ def take_sites(
             chosen_indices = farthest_point_sampling(coords, n_target, rng)
         chosen_sites = [available[i] for i in chosen_indices]
 
+    lig.torsion_model()   # shared by the clones
     taken = []
     for site in chosen_sites:
         clone = lig.clone()
