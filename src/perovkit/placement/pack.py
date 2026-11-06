@@ -28,7 +28,7 @@ def bend_pose(
 ) -> Tuple[Optional[np.ndarray], float]:
     """
     Refine a ligand in torsion space against the core and `neighbors_coords`; one with a
-    spin axis (a single-motif ligand) keeps its anchor and tilt and turns only about it.
+    spin axis (a single-motif ligand) keeps its tilt and turns only about it.
 
     Returns the refined coordinates whose closest contact is farthest, and that contact,
     stopping at the first margin that clears the cutoff; (None, -inf) when every attempt
@@ -42,7 +42,7 @@ def bend_pose(
     for margin in CONTACT_MARGINS:
         res = refine(pose.ligand.torsion_model(), coords, pose.ligand.binding_groups,
                      pose.targets, trees, contact_distance=cutoff + margin, spin_axis=pose.spin_axis,
-                     stop_at=cutoff + margin / 2, stop_rmsd=max_rmsd)
+                     stop_at=cutoff + margin / 2, stop_rmsd=max_rmsd, interior=contacts.interior)
         if res.anchor_rmsd > max_rmsd:
             continue
         d = min(float(tree.query(res.coords)[0].min()) for tree in trees)
@@ -214,7 +214,7 @@ def bend_clusters(
                 [poses[i].targets for i in members],
                 trees, cutoff + margin, box, k_contact=K_CONTACT * stiff,
                 stop_at=cutoff + margin / 2 if stop_at is None else stop_at, stop_rmsd=max_rmsd,
-                spin_axes=[poses[i].spin_axis for i in members],
+                spin_axes=[poses[i].spin_axis for i in members], interior=contacts.interior,
             )
             moved = [(i, r) for i, r in zip(members, results) if r.anchor_rmsd <= max_rmsd]
             if not moved:
@@ -235,13 +235,18 @@ def bend_clusters(
 class Contacts:
     """
     Closest contacts of ligands with the core left after displacement and with each other,
-    following the cell `box` of the core.
+    following the cell `box` of the core. `interior` holds the corners of the core without
+    its outer `depth` Å, along the axes where it has a surface: no place for ligand atoms.
     """
 
-    def __init__(self, core_tree, box: Box, cutoff: float):
+    def __init__(self, core_tree, box: Box, cutoff: float, depth: float):
         self.core_tree = core_tree
         self.box = box
         self.cutoff = cutoff
+        x = np.asarray(core_tree.data)
+        lo, hi = x.min(axis=0) + depth, x.max(axis=0) - depth
+        lo[box.axes], hi[box.axes] = -np.inf, np.inf
+        self.interior = (lo, hi)
 
     def quick(self, coords: np.ndarray, neighbors_coords: Optional[List[np.ndarray]]) -> float:
         """
@@ -345,8 +350,8 @@ def pack(
     (turn_pose: a scan every `coarse_step_deg`, then every `fine_step_deg` within
     `window_deg` of the best). With `refine_torsions`, a ligand that turning cannot clear
     is refined in torsion space, and ligands that none can clear alone are refined together
-    (bend_clusters); anchors may end `max_rmsd` Å (RMS) from their sites, while a
-    single-motif ligand keeps its anchor and tilt and turns only about its normal.
+    (bend_clusters); anchors may end `max_rmsd` Å (RMS) from their sites, and a
+    single-motif ligand keeps its tilt and turns only about its normal.
 
     Returns:
         The coordinates of every ligand.

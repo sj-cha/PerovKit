@@ -93,7 +93,7 @@ def place_ligands(
 
     displaced.extend(sampler.displaced)   # the site atoms multi-motif ligands replace
     core_tree, _ = box.tree(np.delete(core_positions, displaced, axis=0))
-    contacts = Contacts(core_tree, box, overlap_cutoff)
+    contacts = Contacts(core_tree, box, overlap_cutoff, core.a / 2)   # down to the first BX2 layer
     coords_list = pack(
         poses, contacts, rng, max_iters=max_iters, coarse_step_deg=coarse_step_deg,
         fine_step_deg=fine_step_deg, window_deg=window_deg,
@@ -103,12 +103,18 @@ def place_ligands(
     )
     assembly = _assemble(core, requests, [p.ligand for p in poses], coords_list, displaced)
 
+    def deviations(chosen: List) -> np.ndarray:
+        return np.concatenate([np.linalg.norm(box.mic(p.ligand.anchor_positions - p.targets), axis=1)
+                               for p in chosen])
+
+    single_motif_poses = [p for p in poses if isinstance(p, SingleMotifPose)]
+    if single_motif_poses:
+        dev = deviations(single_motif_poses)
+        log(f"[Log] Single-motif anchors sit {dev.mean():.2f} Å (max {dev.max():.2f} Å) from their sites.")
+
     multi_motif_poses = [p for p in poses if isinstance(p, MultiMotifPose)]
     if multi_motif_poses:
-        dev = np.concatenate([
-            np.linalg.norm(box.mic(p.ligand.anchor_positions - p.targets), axis=1)
-            for p in multi_motif_poses
-        ])
+        dev = deviations(multi_motif_poses)
         bent = sum(p.sources[p.variant] != "fit" for p in multi_motif_poses)
         min_distance, n_close = intramolecular_contacts(poses, coords_list)
         log(f"[Log] Multi-motif anchors sit {dev.mean():.2f} Å (max {dev.max():.2f} Å) from their sites; "

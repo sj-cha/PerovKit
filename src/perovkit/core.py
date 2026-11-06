@@ -378,8 +378,8 @@ class Core(Part):
                 refine_torsions (bool): Bend ligands that turning cannot clear. Default True.
                 stretch_tails (bool): Stretch dangling chains before packing. Default True.
                 n_workers (int): Processes for the stretch. Default 8.
-                max_anchor_rmsd (float): Largest anchor deviation (Å) of a multi-motif
-                    ligand from its sites. Default 0.5.
+                max_anchor_rmsd (float): Largest anchor deviation (RMS, Å) of a ligand
+                    from its sites. Default 0.5.
                 Other options go to ConstellationSampler (e.g. n_refine, max_templates).
 
         Returns:

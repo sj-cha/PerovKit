@@ -200,11 +200,30 @@ class _Mutual:
         self.limit = np.full(len(self.p), self.contact_distance)
 
 
-def _terms(X, groups, T, nb, k_anchor, k_contact):
+@numba.njit(cache=True)
+def _inside_terms(x, lo, hi, k, G):
+    """Penalty of the atoms inside the box from `lo` to `hi`, each pushed out through its
+    nearest face; adds its gradient to G. Returns E."""
+    E = 0.0
+    for a in range(x.shape[0]):
+        depth, axis, sign = np.inf, 0, 1.0
+        for ax in range(3):
+            below, above = x[a, ax] - lo[ax], hi[ax] - x[a, ax]
+            if below < depth:
+                depth, axis, sign = below, ax, 1.0
+            if above < depth:
+                depth, axis, sign = above, ax, -1.0
+        if depth > 0.0:
+            E += k * depth * depth
+            G[a, axis] += 2.0 * k * depth * sign
+    return E
+
+
+def _terms(X, groups, T, nb, k_anchor, k_contact, interior=None):
     """
     Anchor, contact and intramolecular penalties of L poses of one ligand type, X (L, n, 3)
     with anchor targets T (L, m, 3), and their Cartesian gradient, from the lists of `nb`
-    (a _Neighbors). Returns (E, G (L, n, 3), min_distance, tangled, rmsd (L,)): the closest
+    (a _Neighbors), and the penalty of atoms inside the box `interior` (lo, hi). Returns (E, G (L, n, 3), min_distance, tangled, rmsd (L,)): the closest
     contact with the fixed atoms (inf if none within `contact_distance`), whether any intramolecular
     pair is within its limit, and the anchor RMSD of each pose.
     """
@@ -223,6 +242,8 @@ def _terms(X, groups, T, nb, k_anchor, k_contact):
     e_in, _, hits = _pair_terms(flat, nb.pa, nb.pb, nb.no_shift, nb.limit,
                                 10.0 * k_contact, G_flat)
     E += e + e_in
+    if interior is not None:
+        E += _inside_terms(flat, interior[0], interior[1], 10.0 * k_contact, G_flat)
     tangled = hits > 0
     return E, G, min_distance, tangled, np.sqrt(sq / len(groups))
 
@@ -245,12 +266,12 @@ def _spin_frame(axis: np.ndarray) -> np.ndarray:
 
 def _held(model: TorsionModel, spin_axis: Optional[np.ndarray]) -> np.ndarray:
     """
-    Parameters held at zero for a ligand with a spin axis: its translation and the two
-    Euler angles across the axis, so that it keeps its place and tilt; none without one.
+    Parameters held at zero for a ligand with a spin axis: the two Euler angles across the
+    axis, so that it keeps its tilt; none without one.
     """
     held = np.zeros(6 + model.n_torsions, dtype=bool)
     if spin_axis is not None:
-        held[:5] = True
+        held[3:5] = True
     return held
 
 
@@ -285,6 +306,7 @@ def refine(
     spin_axis: Optional[np.ndarray] = None,
     stop_at: Optional[float] = None,
     stop_rmsd: float = float("inf"),
+    interior: Optional[tuple] = None,
 ) -> Refinement:
     """
     Refine one ligand pose in torsion space: its rotatable torsions turn and the whole moves
@@ -310,13 +332,15 @@ def refine(
         pull: Optional (direction, atom mask, k): lowers the energy by k per Å that the
             masked atoms move along the unit direction.
         frozen (np.ndarray): Optional (6 + k,) mask of parameters held at zero.
-        spin_axis (np.ndarray): Optional surface normal: the ligand then keeps its place and
-            tilt and turns only about it (the translation and the two Euler angles across it
-            are held at zero).
+        spin_axis (np.ndarray): Optional surface normal: the ligand then keeps its tilt and
+            turns only about it (the two Euler angles across it are held at zero).
         stop_at, stop_rmsd: Stop as soon as every contact with the fixed atoms is at least
             `stop_at` Å, no intramolecular pair is tangled and the anchors are within
             `stop_rmsd` (RMS, Å): the pose is good enough, and the remaining iterations
             would only polish it.
+        interior (tuple): Optional corners (lo, hi) of a box that atoms are pushed out of,
+            10x as hard as out of contacts: the free volume between the atoms of a core
+            would otherwise take in any chain that a long step lands there.
     """
     center = targets.mean(axis=0)
     groups = [np.asarray(g, dtype=int) for g in groups]
@@ -327,7 +351,7 @@ def refine(
     def fun(params):
         x, xt, dR = model.forward(params, coords, center, frame)
         E, G, min_distance, tangled, rmsd = _terms(x[None], groups, targets[None], nb,
-                                                   k_anchor, k_contact)
+                                                   k_anchor, k_contact, interior)
         G = G[0]
         done["x"] = params.copy()
         done["ok"] = (stop_at is not None and min_distance >= stop_at and not tangled
@@ -426,13 +450,15 @@ def refine_joint(
     stop_at: Optional[float] = None,
     stop_rmsd: float = float("inf"),
     spin_axes: Optional[Sequence[Optional[np.ndarray]]] = None,
+    interior: Optional[tuple] = None,
 ) -> List[Refinement]:
     """
     Refine several ligands at once, so that ligands jammed against each other can all give
     way. Each has the terms of `refine`; atoms of different ligands are also pushed
     `contact_distance` Å apart, listed through a tree from `box` (periodic images included).
     `stop_at` and `stop_rmsd` end it early as in `refine`, with every ligand meeting them.
-    `spin_axes` gives each ligand a spin axis as in `refine`, or None.
+    `spin_axes` gives each ligand a spin axis as in `refine`, or None; `interior` is that
+    of `refine`.
     """
     spin_axes = [None] * len(models) if spin_axes is None else list(spin_axes)
     frames = [None if a is None else _spin_frame(a) for a in spin_axes]
@@ -469,7 +495,7 @@ def refine_joint(
             Pb = P[b["params"]]
             Xb, Xt, dR = b["model"].forward_many(Pb, b["X0"], b["C"], b["F"])
             e, G, c, t, rmsd = _terms(Xb, b["groups"], b["T"], b["nb"],
-                                      k_anchor, k_contact)
+                                      k_anchor, k_contact, interior)
             min_distance, tangled = min(min_distance, c), tangled or t
             worst = max(worst, float(rmsd.max()))
             E += e + w_torsion * float(np.sum(1.0 - np.cos(Pb[:, 6:])))

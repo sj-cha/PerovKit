@@ -13,7 +13,7 @@ class Pose:
     A ligand on its site(s): variants of its coordinates, best first (`sources` says where
     each came from), each spinning about `axis` through `center`; `reach` bounds its atoms'
     distance to `center`. `targets` are the anchor targets, `up` the direction the tails
-    are stretched along; a pose with a `spin_axis` only turns about it in refinement.
+    are stretched along; a pose with a `spin_axis` keeps its tilt in refinement.
     """
     random_start = False
     spin_axis: Optional[np.ndarray] = None
@@ -66,7 +66,7 @@ class Pose:
 class SingleMotifPose(Pose):
     """
     Single-motif ligand on one site, its anchor on the site (or its motif's `anchor_offset`
-    above it), spinning about the site normal; in refinement it keeps its anchor and tilt.
+    above it), spinning about the site normal; in refinement it keeps its tilt.
     """
     random_start = True
 
@@ -81,7 +81,7 @@ class SingleMotifPose(Pose):
 
     @property
     def can_bend(self) -> bool:
-        # without torsions only the spin is free, which turn_pose already scans whole
+        # without torsions it stays rigid: turn_pose already scans its spin whole
         return self.ligand.torsion_model().n_torsions > 0
 
 
