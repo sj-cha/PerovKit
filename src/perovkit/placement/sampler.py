@@ -5,12 +5,12 @@ import itertools
 import random
 from typing import TYPE_CHECKING, Dict, Iterator, List, NamedTuple, Optional, Sequence, Tuple
 
-import numba
 import numpy as np
 from scipy.spatial import cKDTree
 
 from ..conformers import ConformerLibrary, embed_at, uff_energy, uff_polish
 from ..core import BindingSite
+from ..kernels import _over_sites
 from ..refine import CONTACT_MARGINS, refine, stretch
 from ..torsion import TorsionModel
 from ..utils.box import Box
@@ -22,33 +22,6 @@ from .sites import assign_faces
 if TYPE_CHECKING:
     from rdkit import Chem
     from ..ligand import Ligand
-
-
-@numba.njit(cache=True)
-def _over_sites(x, sites, normals, radii, out):
-    """
-    out[s]: whether pose s of x (S, m, 3) lies over any of `sites` (K, 3): an atom on the
-    outer side of the site's plane (unit `normals`) within its radius of the site laterally.
-    """
-    for s in range(x.shape[0]):
-        hit = False
-        for k in range(sites.shape[0]):
-            for a in range(x.shape[1]):
-                dx = x[s, a, 0] - sites[k, 0]
-                dy = x[s, a, 1] - sites[k, 1]
-                dz = x[s, a, 2] - sites[k, 2]
-                h = dx * normals[k, 0] + dy * normals[k, 1] + dz * normals[k, 2]
-                if h <= 0.0:
-                    continue
-                lx = dx - h * normals[k, 0]
-                ly = dy - h * normals[k, 1]
-                lz = dz - h * normals[k, 2]
-                if lx * lx + ly * ly + lz * lz < radii[a] * radii[a]:
-                    hit = True
-                    break
-            if hit:
-                break
-        out[s] = hit
 
 
 @dataclasses.dataclass
@@ -693,7 +666,8 @@ class ConstellationSampler:
         around it; returns it as a fit with explicit coordinates, or None if it stays stuck.
         """
         trees = self._surroundings(s.start, s.base.pivot, s.excluded)
-        res = refine(setup.model, s.start, setup.groups, s.targets, trees,
+        res = refine(setup.model, s.start, setup.groups, s.targets,
+                     [t.data for t in trees if t is not None],
                      contact_distance=self.overlap_cutoff + CONTACT_MARGINS[0],
                      stop_at=self.overlap_cutoff + CONTACT_MARGINS[0] / 2, stop_rmsd=self.max_rmsd)
         if res.anchor_rmsd > self.max_rmsd:

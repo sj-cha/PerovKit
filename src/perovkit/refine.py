@@ -2,11 +2,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import List, Optional, Sequence
 
-import numba
 import numpy as np
 from scipy.optimize import minimize
 from scipy.spatial import cKDTree
 
+from .kernels import SKIN, System, evaluate, forward, make_cells
 from .torsion import TorsionModel, dihedral
 from .utils.rotation import rotation_about_axis
 
@@ -14,238 +14,84 @@ from .utils.rotation import rotation_about_axis
 CONTACT_MARGINS = (0.2, 0.05)  # Å, contacts are pushed to the cutoff plus each, in turn
 INTRA_SCALE = 0.7              # atoms four or more bonds apart keep this x their summed vdW radii
 K_CONTACT = 40.0               # per Å^2, soft-sphere weight of a contact
-SKIN = 1.0                     # Å, Verlet list skin
 
 
-def intra_pairs(model, X, scale, skin=0.0):
+def _starts(lengths) -> np.ndarray:
+    """Where runs of these `lengths` start, one after another, and where the last ends."""
+    return np.concatenate([[0], np.cumsum(lengths)]).astype(np.int64)
+
+
+def build_system(
+    models: Sequence[TorsionModel],
+    coords: Sequence[np.ndarray],
+    groups: Sequence[Sequence[Sequence[int]]],
+    targets: Sequence[np.ndarray],
+    frames: Sequence[Optional[np.ndarray]],
+    fixed: Sequence[np.ndarray],
+    contact_distance: float,
+    k_contact: float,
+    shifts: Optional[np.ndarray] = None,
+    interior: Optional[tuple] = None,
+    pull: Optional[tuple] = None,
+) -> System:
     """
-    Pairs (a, b) of atoms of one pose, four or more bonds apart, closer than scale x their
-    summed radii (+ `skin`), in the flattened (L * n, 3) poses X, with those limits.
+    The arrays of L poses for `evaluate`. `fixed` are arrays of fixed atoms (periodic images
+    included), `shifts` the periodic images of the poses, and `pull`, for one pose,
+    (direction, atom mask, k).
     """
-    L, n, _ = X.shape
-    flat = X.reshape(-1, 3)
-    shifted = X + (np.arange(L) * 1.0e4)[:, None, None] * np.array([1.0, 0.0, 0.0])
-    reach = 2.0 * scale * float(model.radii.max()) + skin
-    close = cKDTree(shifted.reshape(-1, 3)).query_pairs(reach, output_type="ndarray")
-    if not len(close):
-        return close[:, 0], close[:, 1], np.zeros(0), np.zeros(0)
-    pa, pb = close[:, 0], close[:, 1]
-    keep = model.far[pa % n, pb % n]
-    pa, pb = pa[keep], pb[keep]
-    limit = scale * (model.radii[pa % n] + model.radii[pb % n])
-    d = np.linalg.norm(flat[pa] - flat[pb], axis=1)
-    hit = (d < limit + skin) & (d > 1e-9)
-    return pa[hit], pb[hit], d[hit], limit[hit]
+    L = len(models)
+    atom_start = _starts([len(c) for c in coords])
+    types = {}
+    for m in models:
+        types.setdefault(id(m), m)
+    index = {key: i for i, key in enumerate(types)}
+    far = [m._far_pairs for m in types.values()]
+
+    group_pose, group_lengths, group_atoms = [], [], []
+    for l, gs in enumerate(groups):
+        for g in gs:
+            group_pose.append(l)
+            group_lengths.append(len(g))
+            group_atoms.append(np.asarray(g, dtype=np.int64) + atom_start[l])
+    lo, hi = (np.zeros(3), np.zeros(3)) if interior is None else interior
+    direction, mask, k_pull = (np.zeros(3), None, 0.0) if pull is None else pull
+    return System(
+        X0=np.concatenate(coords),
+        atom_start=atom_start,
+        param_start=_starts([6 + m.n_torsions for m in models]),
+        torsion_start=_starts([m.n_torsions for m in models]),
+        bonds=np.concatenate([m._bonds + o for m, o in zip(models, atom_start)]),
+        moving_start=_starts(np.concatenate([m._n_moving for m in models])),
+        moving=np.concatenate([m._flat_moving + o for m, o in zip(models, atom_start)]),
+        center=np.array([t.mean(axis=0) for t in targets], dtype=float),
+        frame=np.array([np.eye(3) if f is None else f for f in frames], dtype=float),
+        framed=np.array([f is not None for f in frames]),
+        group_pose=np.array(group_pose, dtype=np.int64),
+        group_start=_starts(group_lengths),
+        group_atoms=np.concatenate(group_atoms),
+        targets=np.concatenate(targets),
+        n_groups=np.array([len(gs) for gs in groups], dtype=np.int64),
+        pose_model=np.array([index[id(m)] for m in models], dtype=np.int64),
+        far_start=_starts([len(a) for a, _ in far]),
+        far_a=np.concatenate([a for a, _ in far]),
+        far_b=np.concatenate([b for _, b in far]),
+        far_limit=np.concatenate([INTRA_SCALE * (m.radii[a] + m.radii[b])
+                                  for m, (a, b) in zip(types.values(), far)]),
+        owner=np.repeat(np.arange(L, dtype=np.int64), np.diff(atom_start)),
+        fixed=make_cells(np.concatenate([np.zeros((0, 3)), *fixed]), contact_distance + SKIN),
+        shifts=np.zeros((1, 3)) if shifts is None else shifts,
+        contact_distance=contact_distance, k_anchor=20.0, k_contact=k_contact,
+        w_torsion=0.02,   # of 1 - cos(change) per torsion, a mild pull to the conformer
+        confined=interior is not None, lo=lo, hi=hi,
+        pull_atoms=np.zeros(0, dtype=np.int64) if mask is None else np.flatnonzero(mask),
+        pull_direction=np.asarray(direction, dtype=float), k_pull=k_pull,
+    )
 
 
 @dataclass
 class Refinement:
     coords: np.ndarray
     anchor_rmsd: float
-
-
-@numba.njit(cache=True)
-def _largest_steps(X, ref, starts, out):
-    """out[b]: largest squared displacement from `ref` of the atoms starts[b]:starts[b + 1]."""
-    for b in range(starts.shape[0] - 1):
-        m = 0.0
-        for a in range(starts[b], starts[b + 1]):
-            dx = X[a, 0] - ref[a, 0]
-            dy = X[a, 1] - ref[a, 1]
-            dz = X[a, 2] - ref[a, 2]
-            m = max(m, dx * dx + dy * dy + dz * dz)
-        out[b] = m
-
-
-@numba.njit(cache=True)
-def _fixed_terms(x, atom, partner, contact_distance, k, G):
-    """Soft-sphere penalty of the listed (atom, fixed partner) pairs within
-    `contact_distance`; adds its gradient to G. Returns (E, closest contact)."""
-    E = 0.0
-    min_distance = np.inf
-    for t in range(atom.shape[0]):
-        a = atom[t]
-        dx = x[a, 0] - partner[t, 0]
-        dy = x[a, 1] - partner[t, 1]
-        dz = x[a, 2] - partner[t, 2]
-        d = np.sqrt(dx * dx + dy * dy + dz * dz)
-        if d < contact_distance and d > 1e-9:
-            min_distance = min(min_distance, d)
-            over = contact_distance - d
-            E += k * over * over
-            c = -2.0 * k * over / d
-            G[a, 0] += c * dx
-            G[a, 1] += c * dy
-            G[a, 2] += c * dz
-    return E, min_distance
-
-
-@numba.njit(cache=True)
-def _pair_terms(x, pa, pb, shift, limit, k, G):
-    """Soft-sphere penalty of the listed pairs of moving atoms, pa against the image of pb at
-    x[pb] + shift, within their `limit`; adds its gradient to G. Returns (E, min_distance, hits)."""
-    E = 0.0
-    min_distance = np.inf
-    hits = 0
-    for t in range(pa.shape[0]):
-        a, b = pa[t], pb[t]
-        dx = x[a, 0] - x[b, 0] - shift[t, 0]
-        dy = x[a, 1] - x[b, 1] - shift[t, 1]
-        dz = x[a, 2] - x[b, 2] - shift[t, 2]
-        d = np.sqrt(dx * dx + dy * dy + dz * dz)
-        if d < limit[t] and d > 1e-9:
-            hits += 1
-            min_distance = min(min_distance, d)
-            over = limit[t] - d
-            E += k * over * over
-            c = -2.0 * k * over / d
-            G[a, 0] += c * dx
-            G[a, 1] += c * dy
-            G[a, 2] += c * dz
-            G[b, 0] -= c * dx
-            G[b, 1] -= c * dy
-            G[b, 2] -= c * dz
-    return E, min_distance, hits
-
-
-class _Neighbors:
-    """
-    Verlet lists of L poses of one ligand type, X (L, n, 3): the fixed atoms of `trees`
-    (their ``data`` holds the positions, periodic images included) within `contact_distance` + SKIN
-    of each atom, and the pairs of one pose four or more bonds apart within their limit
-    + SKIN. A pose is searched again once one of its atoms has moved SKIN / 2.
-    """
-
-    def __init__(self, model, trees, contact_distance, intra):
-        self.model, self.contact_distance, self.intra = model, contact_distance, intra
-        self.trees = [t for t in trees if t is not None and t.n > 0]
-        self.ref = None
-
-    def update(self, X):
-        L, n, _ = X.shape
-        if self.ref is None:
-            self.ref = X.copy()
-            self.starts = np.arange(L + 1, dtype=np.int64) * n
-            stale = np.ones(L, dtype=bool)
-            self.atom = self.pa = self.pb = np.zeros(0, dtype=np.int64)
-            self.partner, self.limit = np.zeros((0, 3)), np.zeros(0)
-        else:
-            moved = np.empty(L)
-            _largest_steps(X.reshape(-1, 3), self.ref.reshape(-1, 3), self.starts, moved)
-            stale = moved > (0.5 * SKIN) ** 2
-            if not stale.any():
-                return
-            self.ref[stale] = X[stale]
-        poses = np.flatnonzero(stale)
-        atoms = (poses[:, None] * n + np.arange(n)).ravel()   # flat index of their atoms
-        keep = ~stale[self.atom // n]
-        found_atom, found_partner = [self.atom[keep]], [self.partner[keep]]
-        if self.trees:
-            own = cKDTree(X[poses].reshape(-1, 3))
-            for tree in self.trees:
-                m = own.sparse_distance_matrix(tree, self.contact_distance + SKIN, output_type="ndarray")
-                found_atom.append(atoms[m["i"]])
-                found_partner.append(tree.data[m["j"]])
-        self.atom, self.partner = np.concatenate(found_atom), np.concatenate(found_partner)
-        pa, pb, _, limit = intra_pairs(self.model, X[poses], self.intra, SKIN)
-        keep = ~stale[self.pa // n]
-        self.pa = np.concatenate([self.pa[keep], atoms[pa]])
-        self.pb = np.concatenate([self.pb[keep], atoms[pb]])
-        self.limit = np.concatenate([self.limit[keep], limit])
-        self.no_shift = np.zeros((len(self.pa), 3))
-
-
-class _Mutual:
-    """
-    Verlet list of the contacts between atoms of different ligands, X (N, 3) with the
-    atoms of ligand l at starts[l]:starts[l + 1], within `contact_distance` + SKIN through the
-    periodic images of `box`: pairs (p, q) with the image of q at X[q] + shift.
-    A ligand's pairs are searched again once one of its atoms has moved SKIN / 4: the pairs
-    of two ligands date from the later of their searches, so together they have moved at
-    most 3/4 SKIN since.
-    """
-
-    def __init__(self, starts, contact_distance, box):
-        self.starts = np.asarray(starts, dtype=np.int64)
-        self.contact_distance, self.box = contact_distance, box
-        self.owner = np.repeat(np.arange(len(starts) - 1), np.diff(starts))
-        self.ref = None
-        self.p = self.q = np.zeros(0, dtype=np.int64)
-        self.shift = np.zeros((0, 3))
-
-    def update(self, X):
-        if self.ref is None:
-            self.ref = X.copy()
-            stale = np.ones(len(self.starts) - 1, dtype=bool)
-        else:
-            moved = np.empty(len(self.starts) - 1)
-            _largest_steps(X, self.ref, self.starts, moved)
-            stale = moved > (0.25 * SKIN) ** 2
-            if not stale.any():
-                return
-        atoms = np.flatnonzero(stale[self.owner])
-        self.ref[atoms] = X[atoms]
-        tree, image_of = self.box.tree(X)
-        m = cKDTree(X[atoms]).sparse_distance_matrix(tree, self.contact_distance + SKIN,
-                                                     output_type="ndarray")
-        p, j = atoms[m["i"]], m["j"].astype(np.int64)
-        q = image_of[j]
-        op, oq = self.owner[p], self.owner[q]
-        # a pair of two searched ligands is found from both sides: keep it once
-        found = (op != oq) & (~stale[oq] | (op < oq))
-        keep = ~stale[self.owner[self.p]] & ~stale[self.owner[self.q]]
-        self.p = np.concatenate([self.p[keep], p[found]])
-        self.q = np.concatenate([self.q[keep], q[found]])
-        self.shift = np.concatenate([self.shift[keep], tree.data[j[found]] - X[q[found]]])
-        self.limit = np.full(len(self.p), self.contact_distance)
-
-
-@numba.njit(cache=True)
-def _inside_terms(x, lo, hi, k, G):
-    """Penalty of the atoms inside the box from `lo` to `hi`, each pushed out through its
-    nearest face; adds its gradient to G. Returns E."""
-    E = 0.0
-    for a in range(x.shape[0]):
-        depth, axis, sign = np.inf, 0, 1.0
-        for ax in range(3):
-            below, above = x[a, ax] - lo[ax], hi[ax] - x[a, ax]
-            if below < depth:
-                depth, axis, sign = below, ax, 1.0
-            if above < depth:
-                depth, axis, sign = above, ax, -1.0
-        if depth > 0.0:
-            E += k * depth * depth
-            G[a, axis] += 2.0 * k * depth * sign
-    return E
-
-
-def _terms(X, groups, T, nb, k_anchor, k_contact, interior=None):
-    """
-    Anchor, contact and intramolecular penalties of L poses of one ligand type, X (L, n, 3)
-    with anchor targets T (L, m, 3), and their Cartesian gradient, from the lists of `nb`
-    (a _Neighbors), and the penalty of atoms inside the box `interior` (lo, hi). Returns (E, G (L, n, 3), min_distance, tangled, rmsd (L,)): the closest
-    contact with the fixed atoms (inf if none within `contact_distance`), whether any intramolecular
-    pair is within its limit, and the anchor RMSD of each pose.
-    """
-    L = len(X)
-    G = np.zeros_like(X)
-    E = 0.0
-    sq = np.zeros(L)
-    for k, grp in enumerate(groups):
-        d = X[:, grp].mean(axis=1) - T[:, k]
-        E += k_anchor * float(np.sum(d * d))
-        sq += np.sum(d * d, axis=1)
-        G[:, grp] += (2.0 * k_anchor * d / len(grp))[:, None, :]
-    nb.update(X)
-    flat, G_flat = X.reshape(-1, 3), G.reshape(-1, 3)
-    e, min_distance = _fixed_terms(flat, nb.atom, nb.partner, nb.contact_distance, k_contact, G_flat)
-    e_in, _, hits = _pair_terms(flat, nb.pa, nb.pb, nb.no_shift, nb.limit,
-                                10.0 * k_contact, G_flat)
-    E += e + e_in
-    if interior is not None:
-        E += _inside_terms(flat, interior[0], interior[1], 10.0 * k_contact, G_flat)
-    tangled = hits > 0
-    return E, G, min_distance, tangled, np.sqrt(sq / len(groups))
 
 
 def _anchor_rmsd(x, groups, targets) -> float:
@@ -256,7 +102,7 @@ def _anchor_rmsd(x, groups, targets) -> float:
 def _spin_frame(axis: np.ndarray) -> np.ndarray:
     """
     Rotation matrix whose rows are two unit axes across `axis` and the unit `axis`: in it
-    the last Euler angle turns about `axis` (see TorsionModel.forward).
+    the last Euler angle turns about `axis` (see kernels.forward).
     """
     n = axis / np.linalg.norm(axis)
     e1 = np.cross(n, [1.0, 0.0, 0.0] if abs(n[0]) < 0.9 else [0.0, 1.0, 0.0])
@@ -275,18 +121,32 @@ def _held(model: TorsionModel, spin_axis: Optional[np.ndarray]) -> np.ndarray:
     return held
 
 
-def _minimize(fun, held, max_iters, done):
+def _solve(system, held, max_iters, stop_at, stop_rmsd) -> np.ndarray:
     """
-    L-BFGS-B from zero with the `held` parameters kept there, that also stops at the first
-    iterate `done` accepted; `done` holds the parameters of the last evaluation and whether
-    that point was good enough.
+    Minimize the objective of `system` by L-BFGS-B from zero with the `held` parameters kept
+    there, stopping at the first iterate with every contact `stop_at` Å, nothing tangled and
+    the anchors within `stop_rmsd`. Returns the coordinates.
     """
+    none = np.zeros(0, dtype=np.int64)
+    unset = lambda: np.full((len(system.X0), 3), np.inf)    # every pose counts as moved
+    lists = unset(), none, none, unset(), none, none, np.zeros(0), unset(), none, none, none
+    good_enough = None
+
+    def fun(params):
+        nonlocal lists, good_enough
+        E, g, min_distance, tangled, rmsd, lists = evaluate(params, system, lists)
+        good_enough = (params.copy() if stop_at is not None and min_distance >= stop_at
+                       and not tangled and rmsd <= stop_rmsd else None)
+        return E, g
+
     def callback(intermediate_result):
-        if done["ok"] and np.array_equal(done["x"], intermediate_result.x):
+        if good_enough is not None and np.array_equal(good_enough, intermediate_result.x):
             raise StopIteration
+
     bounds = [(0.0, 0.0) if h else (None, None) for h in held] if held.any() else None
-    return minimize(fun, np.zeros(len(held)), jac=True, method="L-BFGS-B", bounds=bounds,
-                    callback=callback, options={"maxiter": max_iters})
+    res = minimize(fun, np.zeros(len(held)), jac=True, method="L-BFGS-B", bounds=bounds,
+                   callback=callback, options={"maxiter": max_iters})
+    return forward(res.x, system)[0]
 
 
 def refine(
@@ -294,12 +154,8 @@ def refine(
     coords: np.ndarray,
     groups: Sequence[Sequence[int]],
     targets: np.ndarray,
-    trees: Sequence,
+    fixed: Sequence[Optional[np.ndarray]],
     contact_distance: float,
-    k_anchor: float = 20.0,
-    k_contact: float = K_CONTACT,
-    intra: float = INTRA_SCALE,
-    w_torsion: float = 0.02,
     max_iters: int = 400,
     pull: Optional[tuple] = None,
     frozen: Optional[np.ndarray] = None,
@@ -320,14 +176,10 @@ def refine(
         coords (np.ndarray): (n_atoms, 3) starting pose.
         groups: Binding atoms of each motif.
         targets (np.ndarray): (n_motifs, 3) anchor targets.
-        trees: KD-trees of fixed atoms to stay `contact_distance` Å away from (core, neighbors);
-            their ``data`` must hold the positions, periodic images included.
+        fixed: Arrays of fixed atoms to stay `contact_distance` Å away from (core, neighbors),
+            periodic images included.
         contact_distance (float): Distance (Å) to which the fixed atoms are pushed out:
             closer pairs are penalized.
-        k_anchor, k_contact (float): Weights (per Å^2) of anchor and contact penalties.
-        intra (float): Ligand atoms four or more bonds apart are pushed this times their
-            summed van der Waals radii apart (see INTRA_SCALE).
-        w_torsion (float): Weight of 1 - cos(change) per torsion, a mild pull to the conformer.
         max_iters (int): L-BFGS-B iterations.
         pull: Optional (direction, atom mask, k): lowers the energy by k per Å that the
             masked atoms move along the unit direction.
@@ -342,35 +194,13 @@ def refine(
             10x as hard as out of contacts: the free volume between the atoms of a core
             would otherwise take in any chain that a long step lands there.
     """
-    center = targets.mean(axis=0)
-    groups = [np.asarray(g, dtype=int) for g in groups]
-    done = {"ok": False, "x": None}
-    nb = _Neighbors(model, trees, contact_distance, intra)
     frame = None if spin_axis is None else _spin_frame(spin_axis)
-
-    def fun(params):
-        x, xt, dR = model.forward(params, coords, center, frame)
-        E, G, min_distance, tangled, rmsd = _terms(x[None], groups, targets[None], nb,
-                                                   k_anchor, k_contact, interior)
-        G = G[0]
-        done["x"] = params.copy()
-        done["ok"] = (stop_at is not None and min_distance >= stop_at and not tangled
-                      and float(rmsd[0]) <= stop_rmsd)
-        if pull is not None:
-            direction, mask, k_pull = pull
-            E -= k_pull * float(np.sum((x[mask] - center) @ direction))
-            G[mask] -= k_pull * direction
-        phi = params[6:]
-        E += w_torsion * float(np.sum(1.0 - np.cos(phi)))
-        g = model.gradient(params, x, xt, dR, G)
-        g[6:] += w_torsion * np.sin(phi)
-        return E, g
-
+    system = build_system([model], [coords], [groups], [targets], [frame], fixed, contact_distance,
+                          K_CONTACT, interior=interior, pull=pull)
     held = _held(model, spin_axis)
     if frozen is not None:
-        held |= np.asarray(frozen, dtype=bool)
-    res = _minimize(fun, held, max_iters, done)
-    x, _, _ = model.forward(res.x, coords, center, frame)
+        held |= frozen
+    x = _solve(system, held, max_iters, stop_at, stop_rmsd)
     return Refinement(coords=x, anchor_rmsd=_anchor_rmsd(x, groups, targets))
 
 
@@ -382,7 +212,6 @@ def stretch(
     normal: np.ndarray,
     trees: Sequence,
     contact_distance: float,
-    k_pull: float = 1.0,
     max_iters: int = 200,
     stop_at: Optional[float] = None,
 ) -> Optional[Refinement]:
@@ -430,8 +259,9 @@ def stretch(
         x[mask] = best
     lifted = model.masks[model.tails].any(axis=0) & model.heavy
     frozen = np.concatenate([np.ones(6, dtype=bool), ~model.tails])
-    return refine(model, x, groups, targets, trees, contact_distance, max_iters=max_iters,
-                  pull=(normal, lifted, k_pull), frozen=frozen, stop_at=stop_at)
+    return refine(model, x, groups, targets, [t.data for t in fixed], contact_distance,
+                  max_iters=max_iters, pull=(normal, lifted, 1.0), frozen=frozen,
+                  stop_at=stop_at)
 
 
 def refine_joint(
@@ -439,13 +269,10 @@ def refine_joint(
     coords: Sequence[np.ndarray],
     groups: Sequence[Sequence[Sequence[int]]],
     targets: Sequence[np.ndarray],
-    trees: Sequence,
+    fixed: Sequence[Optional[np.ndarray]],
     contact_distance: float,
-    box,
-    k_anchor: float = 20.0,
+    shifts: np.ndarray,
     k_contact: float = K_CONTACT,
-    intra: float = INTRA_SCALE,
-    w_torsion: float = 0.02,
     max_iters: int = 400,
     stop_at: Optional[float] = None,
     stop_rmsd: float = float("inf"),
@@ -455,73 +282,19 @@ def refine_joint(
     """
     Refine several ligands at once, so that ligands jammed against each other can all give
     way. Each has the terms of `refine`; atoms of different ligands are also pushed
-    `contact_distance` Å apart, listed through a tree from `box` (periodic images included).
+    `contact_distance` Å apart, their images at `shifts` included.
     `stop_at` and `stop_rmsd` end it early as in `refine`, with every ligand meeting them.
     `spin_axes` gives each ligand a spin axis as in `refine`, or None; `interior` is that
     of `refine`.
     """
     spin_axes = [None] * len(models) if spin_axes is None else list(spin_axes)
-    frames = [None if a is None else _spin_frame(a) for a in spin_axes]
-    sizes = [6 + m.n_torsions for m in models]
-    offsets = np.concatenate([[0], np.cumsum(sizes)])
-    groups = [[np.asarray(g, dtype=int) for g in gs] for gs in groups]
-    starts = np.concatenate([[0], np.cumsum([len(c) for c in coords])])
-    done = {"ok": False, "x": None}
-
-    # ligands of one type are computed together (forward_many and _terms)
-    batches = []
-    for model in {id(m): m for m in models}.values():
-        members = [l for l, m in enumerate(models) if m is model]
-        k = 6 + model.n_torsions
-        batches.append(dict(
-            model=model, groups=groups[members[0]],
-            params=np.array([np.arange(offsets[l], offsets[l] + k) for l in members]),
-            atoms=np.concatenate([np.arange(starts[l], starts[l + 1]) for l in members]),
-            X0=np.array([coords[l] for l in members]),
-            T=np.array([targets[l] for l in members]),
-            C=np.array([targets[l].mean(axis=0) for l in members]),
-            # one ligand type: all of them have a spin axis or none does
-            F=None if frames[members[0]] is None else np.array([frames[l] for l in members]),
-            nb=_Neighbors(model, trees, contact_distance, intra),
-        ))
-    mutual = _Mutual(starts, contact_distance, box)
-
-    def fun(P):
-        E = 0.0
-        min_distance, tangled, worst = float("inf"), False, 0.0
-        X = np.empty((starts[-1], 3))
-        state = []
-        for b in batches:
-            Pb = P[b["params"]]
-            Xb, Xt, dR = b["model"].forward_many(Pb, b["X0"], b["C"], b["F"])
-            e, G, c, t, rmsd = _terms(Xb, b["groups"], b["T"], b["nb"],
-                                      k_anchor, k_contact, interior)
-            min_distance, tangled = min(min_distance, c), tangled or t
-            worst = max(worst, float(rmsd.max()))
-            E += e + w_torsion * float(np.sum(1.0 - np.cos(Pb[:, 6:])))
-            X[b["atoms"]] = Xb.reshape(-1, 3)
-            state.append((Pb, Xb, Xt, dR, G))
-        G_all = np.zeros_like(X)
-        mutual.update(X)
-        e, c, _ = _pair_terms(X, mutual.p, mutual.q, mutual.shift, mutual.limit, k_contact, G_all)
-        E += e
-        min_distance = min(min_distance, c)
-        grad = np.empty_like(P)
-        for b, (Pb, Xb, Xt, dR, G) in zip(batches, state):
-            G += G_all[b["atoms"]].reshape(G.shape)
-            g = b["model"].gradient_many(Pb, Xb, Xt, dR, G)
-            g[:, 6:] += w_torsion * np.sin(Pb[:, 6:])
-            grad[b["params"]] = g
-        done["x"] = P.copy()
-        done["ok"] = (stop_at is not None and min_distance >= stop_at and not tangled
-                      and worst <= stop_rmsd)
-        return E, grad
-
+    system = build_system(models, coords, groups, targets,
+                          [None if a is None else _spin_frame(a) for a in spin_axes],
+                          fixed, contact_distance, k_contact, shifts=shifts, interior=interior)
     held = np.concatenate([_held(m, a) for m, a in zip(models, spin_axes)])
-    res = _minimize(fun, held, max_iters, done)
+    x = _solve(system, held, max_iters, stop_at, stop_rmsd)
     out = []
-    for l, model in enumerate(models):
-        x, _, _ = model.forward(res.x[offsets[l]:offsets[l + 1]], coords[l], targets[l].mean(axis=0),
-                                frames[l])
-        out.append(Refinement(coords=x, anchor_rmsd=_anchor_rmsd(x, groups[l], targets[l])))
+    for l in range(len(models)):
+        y = x[system.atom_start[l]:system.atom_start[l + 1]]
+        out.append(Refinement(coords=y, anchor_rmsd=_anchor_rmsd(y, groups[l], targets[l])))
     return out

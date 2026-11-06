@@ -9,6 +9,7 @@ from ..refine import CONTACT_MARGINS, stretch
 
 
 STRETCH_ITERS = 30    # L-BFGS iterations; chains reach 99% of their height within 20
+WORKER_JOBS = 32      # ligands a stretch process is worth
 _WORKER_CORE = None
 
 
@@ -60,7 +61,8 @@ def _stretched(poses: Sequence, core_tree, cutoff: float, n_workers: int) -> Lis
     """Stretched coordinates of the best variant of each of `poses`; None where it cannot be."""
     jobs = [(p.ligand.torsion_model(), p.variants[0], p.ligand.binding_groups,
              p.targets, p.up, cutoff + CONTACT_MARGINS[0]) for p in poses]
-    n_workers = min(n_workers, available_cpus(), len(jobs))
+    # a process costs more than a few ligands: each one has to load the compiled code
+    n_workers = min(n_workers, available_cpus(), len(jobs) // WORKER_JOBS)
     if n_workers > 1:
         with ProcessPoolExecutor(max_workers=n_workers,
                                  initializer=_init_stretch_worker,
@@ -77,9 +79,9 @@ def stretch_poses(poses: Sequence, core_tree, cutoff: float, n_workers: int = 1)
     Single-motif ligands of one kind on one plane start from one shape and stand alike, so
     one of them is stretched and the others take the result; one that would then touch the
     core is stretched on its own. Stretching sees only the core, so the ligands are
-    independent and, with `n_workers` above 1, go to that many processes (no more than the
-    CPUs available); each builds the core tree once. The result does not depend on
-    `n_workers`.
+    independent and go to up to `n_workers` processes, no more than the CPUs available and
+    one per WORKER_JOBS ligands; each builds the core tree once. The result does not depend
+    on `n_workers`.
 
     Returns:
         How many poses now start stretched: they had chains to stretch and the result

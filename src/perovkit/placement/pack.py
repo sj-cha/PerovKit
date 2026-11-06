@@ -9,9 +9,9 @@ from scipy.sparse.csgraph import connected_components
 from scipy.spatial import cKDTree
 from tqdm.auto import tqdm
 
-from ..refine import CONTACT_MARGINS, INTRA_SCALE, K_CONTACT, intra_pairs, refine, refine_joint
+from ..kernels import _best_spin, _closest, make_cells
+from ..refine import CONTACT_MARGINS, INTRA_SCALE, K_CONTACT, refine, refine_joint
 from ..utils.box import Box
-from .grid import _best_spin, _closest, cells
 from .poses import MultiMotifPose, Pose
 from .stretch import stretch_poses
 
@@ -36,17 +36,16 @@ def bend_pose(
     leaves the anchors farther than `max_rmsd` (RMS, Å) from their sites.
     """
     cutoff = contacts.cutoff
-    trees = [contacts.core_tree]
-    if neighbors_coords:
-        trees.append(contacts.box.tree(np.vstack(neighbors_coords))[0])
+    around = contacts.around(neighbors_coords)
+    fixed = [contacts.core_cells[0], around[0]]
     best, best_d = None, -float("inf")
     for margin in CONTACT_MARGINS:
         res = refine(pose.ligand.torsion_model(), coords, pose.ligand.binding_groups,
-                     pose.targets, trees, contact_distance=cutoff + margin, spin_axis=pose.spin_axis,
+                     pose.targets, fixed, contact_distance=cutoff + margin, spin_axis=pose.spin_axis,
                      stop_at=cutoff + margin / 2, stop_rmsd=max_rmsd, interior=contacts.interior)
         if res.anchor_rmsd > max_rmsd:
             continue
-        d = min(float(tree.query(res.coords)[0].min()) for tree in trees)
+        d = _closest(res.coords, contacts.core_cells, around, contacts.reach)
         if d > best_d:
             best, best_d = res.coords, d
         if best_d >= cutoff:
@@ -64,8 +63,9 @@ def intramolecular_contacts(poses: Sequence, coords_list: List[np.ndarray]) -> T
         if not isinstance(pose, MultiMotifPose):
             continue
         model = pose.ligand.torsion_model()
-        n += len(intra_pairs(model, x[None], INTRA_SCALE)[0])
-        d = np.linalg.norm(x[:, None] - x[None], axis=-1)[np.triu(model.far)]
+        a, b = np.nonzero(np.triu(model.far))
+        d = np.linalg.norm(x[a] - x[b], axis=1)
+        n += int(np.sum((d < INTRA_SCALE * (model.radii[a] + model.radii[b])) & (d > 1e-9)))
         min_distance = min(min_distance, float(d.min()) if d.size else min_distance)
     return min_distance, n
 
@@ -159,7 +159,7 @@ def bend_clusters(
     Returns:
         Whether any component improved.
     """
-    cutoff, box = contacts.cutoff, contacts.box
+    cutoff = contacts.cutoff
     n = len(poses)
     # components do not touch, so what one finds here holds while the others move
     dists, a, b = contacts.closest(coords_list)
@@ -175,14 +175,14 @@ def bend_clusters(
         if before >= cutoff:
             continue  # nothing to clear: a lone ligand with no contact below the cutoff
         others = [c for j, c in enumerate(coords_list) if j not in members]
-        trees = [contacts.core_tree, box.tree(np.vstack(others))[0] if others else None]
+        fixed = [contacts.core_cells[0], contacts.around(others)[0]]
         for stiff, margin in [(k, m) for k in (1.0, 2.0, 4.0) for m in CONTACT_MARGINS]:
             results = refine_joint(
                 [poses[i].ligand.torsion_model() for i in members],
                 [coords_list[i] for i in members],
                 [poses[i].ligand.binding_groups for i in members],
                 [poses[i].targets for i in members],
-                trees, cutoff + margin, box, k_contact=K_CONTACT * stiff,
+                fixed, cutoff + margin, contacts.box.shifts, k_contact=K_CONTACT * stiff,
                 stop_at=cutoff + margin / 2 if stop_at is None else stop_at, stop_rmsd=max_rmsd,
                 spin_axes=[poses[i].spin_axis for i in members], interior=contacts.interior,
             )
@@ -213,12 +213,12 @@ class Contacts:
         self.core_tree = core_tree
         self.box = box
         self.cutoff = cutoff
-        x = np.asarray(core_tree.data)
+        x = np.array(core_tree.data)
         lo, hi = x.min(axis=0) + depth, x.max(axis=0) - depth
         lo[box.axes], hi[box.axes] = -np.inf, np.inf
         self.interior = (lo, hi)
         self.reach = cutoff + 0.5   # contacts farther than this make no difference
-        self.core_cells = cells(x, self.reach)
+        self.core_cells = make_cells(x, self.reach)
 
     def closest(self, coords_list: List[np.ndarray],
                 ligands: Optional[Sequence[int]] = None) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -251,7 +251,7 @@ class Contacts:
         Cells of `neighbors_coords` and their images one cell away along the periodic axes.
         """
         x = np.vstack(neighbors_coords) if neighbors_coords else np.zeros((0, 3))
-        return cells((x + self.box.shifts[:, None]).reshape(-1, 3), self.reach)
+        return make_cells((x + self.box.shifts[:, None]).reshape(-1, 3), self.reach)
 
     def neighbors(self, i: int, centers: np.ndarray, radii: np.ndarray) -> List[int]:
         """
