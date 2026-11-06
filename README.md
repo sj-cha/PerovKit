@@ -1,6 +1,6 @@
 # PerovKit
 
-PerovKit provides modular, Pythonic data structures for constructing ligand-passivated ABX<sub>3</sub> perovskite models (nanocrystals, nanorods, and periodic slabs) for downstream atomistic simulations. 
+PerovKit provides modular, Pythonic data structures for constructing ligand-passivated ABX<sub>3</sub> perovskite models for downstream atomistic simulations. 
 
 Under active development by Seungjun Cha (scha@gatech.edu)
 
@@ -14,74 +14,73 @@ cd perovkit
 pip install -e .
 ```
 
-Dependencies: `numpy`, `scipy`, `ase`, `rdkit`, `tqdm`
+## Supported systems
 
-## Key Concepts
-
-- **Core**: The inorganic ABX<sub>3</sub> perovskite structure. Built with `build_core`, whose required `pbc` sets the periodicity: `False` for a finite nanocrystal, `(True, True, False)` for a slab periodic in x and y. `place_ligands` puts ligands on a copy of it, choosing the sites and turning the ligands until they clear each other; `place_ligands_manually` places them with fixed shifts and turns instead, optionally only those given by `ligand_ids`. Both return an `Assembly` and leave the core as it is.
-- **Ligand**: An organic molecule that passivates surface sites. Created from SMILES (`from_smiles`) or an existing file (`from_file`). The `BindingMotif` specifies which atoms coordinate the surface. Cationic ligands take A-sites and anionic ligands take X-sites.
-- **LigandSpec**: Pairs a `Ligand` with placement parameters: `coverage` (fraction or absolute count of surface sites), optional `binding_sites` (explicit site indices), and `anchor_offset` (controls a vertical offset from the surface).
-- **Assembly**: A `Core` with its `Ligand`s, for a nanocrystal and a slab alike (a periodic `Core` gets minimum-image distances), as returned by `Core.place_ligands` or read with `Assembly.from_file`. `NanoCrystal` and `Slab` remain as other names for it.
+* Cubic ABX<sub>3</sub> systems; organic or inorganic A-site
+* Monodentate, bridging, and multidentate ligands (including zwitterionic, multipodal, etc.) with specified surface coverage
+* Nanocrystals, nanorods, and periodic slabs
 
 ## Quick Start
 
 ```python
-from perovkit import Core, Ligand, LigandSpec, BindingMotif, Assembly
+from perovkit import Core, Ligand, BindingMotif, Assembly
 ```
 
-### Build a Nanocrystal with Ligands
+### Build a Nanocrystal with Co-passivation
 
 ```python
-# 1. Build a 3x3x3 CsPbBr3 core
-core = Core.build_core(
-    A="Cs", B="Pb", X="Br",
-    a=5.95,
-    supercell=(3,3,3),
-    pbc=False,
-    charge_neutral=True,
-    random_seed=42,
+# Build a 5x5x5 CsPbBr3 nanocrystal
+core = Core.build_core(A="Cs", B="Pb", X="Br", a=5.95, supercell=(5, 5, 5), pbc=False)
+
+# Oleylammonium
+OAm = Ligand.from_smiles(
+    smiles=r"CCCCCCCC/C=C\CCCCCCCC[NH3+]",
+    binding_motif=BindingMotif(atoms=["N"], anchor="[NH3+]", site="A"),
+    name="OAm",
 )
 
-# 2. Define ligands from SMILES or .xyz file
-cationic_lig = Ligand.from_smiles(
-    smiles="C[NH3+]",
-    binding_motif=BindingMotif(["N"]),
-    random_seed=42,
-    name="MA",
+# Oleate
+OA = Ligand.from_smiles(
+    smiles=r"CCCCCCCC/C=C\CCCCCCCC(=O)[O-]",
+    binding_motif=BindingMotif(atoms=["O", "O"], anchor="C(=O)[O-]", site="X"),
+    name="OA",
 )
 
-anionic_lig = Ligand.from_file(
-    filename="ligands/OP.xyz",
-    binding_motif=BindingMotif(["O", "O"]),
-    name="OP",
-)
-
-# 3. Specify coverage and assemble
-specs = [
-    LigandSpec(ligand=cationic_lig, coverage=0.5),
-    LigandSpec(ligand=anionic_lig, coverage=0.5),
-]
-
-nc = core.place_ligands(specs)
+# Place ligands substitutionally. Returns `Assembly`
+nc = core.place_ligands(ligands=[OAm, OA], coverage=[0.5, 0.5])
+nc.to(fmt="xyz", filename="nc_OA_OAm.xyz")
 ```
 
-### Build a Slab with Ligands
+### Build a Slab with Multidentate Ligands
 
 ```python
-# Build a 2x2x3 CsPbBr3 slab
-core = Core.build_core(
-    A="Cs", B="Pb", X="Br",
-    a=5.95,
-    supercell=(2,2,3),
-    pbc=(True, True, False),
+# A-site foraminidium
+FA = Ligand.from_smiles(
+    smiles="NC=[NH2+]", 
+    name="FA",
 )
 
-specs = [
-    LigandSpec(ligand=cationic_lig, coverage=0.5),
-    LigandSpec(ligand=anionic_lig, coverage=0.5),
-]
+# PO-T2T with three binding anchors that adsorbes on FA
+POT2T = Ligand.from_smiles(
+    smiles="O=P(c1ccccc1)(c1ccccc1)c1cccc(-c2nc(-c3cccc(P(=O)(c4ccccc4)c4ccccc4)c3)nc(-c3cccc(P(=O)(c4ccccc4)c4ccccc4)c3)n2)c1", 
+    binding_motif=[BindingMotif(atoms=["O"], anchor="P(=O)", site="A", adsorb = True),
+                    BindingMotif(atoms=["O"], anchor="P(=O)", site="A", adsorb = True),
+                    BindingMotif(atoms=["O"], anchor="P(=O)", site="A", adsorb = True)],
+    name="POT2T",
+)
 
-slab = core.place_ligands(specs)
+# Build a 4x4x3 FAPbI3 slab
+core = Core.build_core(
+    A=FA, B="Pb", X="Br",
+    a=6.3691,
+    supercell=(4,4,3),
+    pbc=True
+)
+
+
+# POT2T adsorbs above the surface FA
+slab = core.place_ligands(ligands=POT2T, coverage=0.25)
+slab.to(fmt="vasp", filename="slab_POT2T.vasp")
 ```
 
 ### Serialization
@@ -89,9 +88,8 @@ slab = core.place_ligands(specs)
 An `Assembly` can be exported as a JSON file, alongside the structure file. 
 
 ```python
-# Save
-nc.to(fmt="xyz", filename="structure.xyz", write_json=True)
-
-# Load
 nc = Assembly.from_file("structure.xyz", "structure.xyz.json")
 ```
+
+### License
+MIT license. Hu Group, Georgia Institute of Technology
