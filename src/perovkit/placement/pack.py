@@ -11,6 +11,7 @@ from tqdm.auto import tqdm
 
 from ..refine import CONTACT_MARGINS, INTRA_SCALE, K_CONTACT, intra_pairs, refine, refine_joint
 from ..utils.box import Box
+from .grid import _best_spin, _closest, cells
 from .poses import MultiMotifPose, Pose
 from .stretch import stretch_poses
 
@@ -85,86 +86,55 @@ def bounding_spheres(poses: Sequence, coords_list: List[np.ndarray]) -> Tuple[np
     return centers, radii
 
 
-def tree_min_distance(core_tree, box: Box, neighbors_coords: List[np.ndarray]) -> Callable:
-    """
-    Closest contact with the core or any of `neighbors_coords`, as a function of the
-    coordinates, from a tree built once: the rotation search evaluates it at every spin and
-    variant of a long ligand that has nearly every other ligand as a neighbor.
-    """
-    tree = box.tree(np.vstack(neighbors_coords))[0] if neighbors_coords else None
-
-    def min_distance(coords: np.ndarray) -> float:
-        d_core = float(core_tree.query(coords)[0].min())
-        if tree is None:
-            return d_core
-        return min(d_core, float(tree.query(coords, k=1)[0].min()))
-
-    return min_distance
-
-
 def turn_pose(
     pose,
-    min_distance: Callable,
+    contacts: Contacts,
+    neighbors,
     rng: random.Random,
-    cutoff: float,
     coarse_step_deg: float,
     fine_step_deg: float,
     window_deg: float,
 ) -> Tuple[int, np.ndarray]:
     """
-    Search the spin (and the fit variant) that maximizes `min_distance`, the closest contact
-    of the coordinates with the core and the neighboring ligands.
+    Search the spin (and the fit variant) that keeps the closest contact of the coordinates
+    with the core and `neighbors` (cells) farthest.
 
     Variants are scanned in order and the search stops at the first one whose coarse scan
-    clears `cutoff`, so better-fitting conformers win whenever they are clash-free. The
+    clears the cutoff, so better-fitting conformers win whenever they are clash-free. The
     fine scan refines the best angle of the best variant.
 
     Returns:
         (variant, coords) of the best pose found.
     """
-    best_theta = None
-    best_variant = 0
-    best_min_d = -float("inf")
-    best_coords = None
+    cutoff, bound = contacts.cutoff, contacts.reach
     theta0 = 2.0 * math.pi * rng.random()
+    if pose.can_spin:
+        axis = np.asarray(pose.axis, dtype=float) / np.linalg.norm(pose.axis)
+        n_coarse = max(int(round(360.0 / coarse_step_deg)), 1)
+        spins, spin0 = 2.0 * math.pi * np.arange(n_coarse) / n_coarse, theta0
+    else:
+        axis, spins, spin0 = np.zeros(3), np.zeros(1), 0.0
+    center = np.asarray(pose.center, dtype=float)
 
-    # Coarse search
-    n_coarse = max(int(round(360.0 / coarse_step_deg)), 1) if pose.can_spin else 1
+    def scan(variant, thetas, reference, follow, best):
+        return _best_spin(pose.variants[variant], center, axis, thetas, reference, follow, best,
+                          contacts.core_cells, neighbors, bound)
 
+    best_theta, best_variant, best_d = 0.0, 0, -float("inf")
     for v in range(pose.n_variants):
-        for k in range(n_coarse):
-            theta = theta0 + 2.0 * math.pi * (k / n_coarse)
-            theta = theta % (2.0 * math.pi)
+        theta, d = scan(v, spins, spin0, False, -1.0)
+        if d > best_d:
+            best_theta, best_variant, best_d = theta, v, d
+        if best_d >= cutoff:
+            return best_variant, pose.coords(best_theta, best_variant)
 
-            coords = pose.coords(theta, v)
-            min_d = min_distance(coords)
-
-            if min_d > best_min_d:
-                best_theta, best_variant, best_min_d, best_coords = theta, v, min_d, coords
-
-        if best_min_d >= cutoff:
-            return best_variant, best_coords
-
-    if not pose.can_spin:
-        return best_variant, best_coords
-
-    # Fine search
-    window_rad = math.radians(window_deg)
-    fine_step_rad = math.radians(fine_step_deg)
-
-    # the window follows best_theta as it improves
-    n_fine = int(round(2.0 * window_rad / fine_step_rad)) + 1
-    for k in range(n_fine):
-        delta = -window_rad + k * (2.0 * window_rad / (n_fine - 1))
-        theta = (best_theta + delta) % (2.0 * math.pi)
-
-        coords = pose.coords(theta, best_variant)
-        min_d = min_distance(coords)
-
-        if min_d > best_min_d:
-            best_theta, best_min_d, best_coords = theta, min_d, coords
-
-    return best_variant, best_coords
+    if pose.can_spin:
+        # the window follows the best angle as it improves
+        window_rad = math.radians(window_deg)
+        n_fine = int(round(2.0 * window_rad / math.radians(fine_step_deg))) + 1
+        best_theta, _ = scan(best_variant, np.linspace(-window_rad, window_rad, n_fine),
+                             best_theta, True, best_d)
+    return best_variant, pose.coords(best_theta, best_variant)
 
 
 def bend_clusters(
@@ -247,26 +217,8 @@ class Contacts:
         lo, hi = x.min(axis=0) + depth, x.max(axis=0) - depth
         lo[box.axes], hi[box.axes] = -np.inf, np.inf
         self.interior = (lo, hi)
-
-    def quick(self, coords: np.ndarray, neighbors_coords: Optional[List[np.ndarray]]) -> float:
-        """
-        Closest contact of `coords` with the core, and with `neighbors_coords` unless the
-        core is already closer than the cutoff.
-        """
-        d_core = float(np.min(self.core_tree.query(coords)[0]))
-        if d_core < self.cutoff or not neighbors_coords:
-            return d_core
-
-        neighbors = np.vstack(neighbors_coords)  # (N,3)
-        if len(coords) * len(neighbors) > 20000:
-            # wrapped into the box, periodic images one box away hold every minimum image
-            tree, image_of = self.box.tree(self.box.wrap(coords))
-            _, k = tree.query(self.box.wrap(neighbors))
-            diff = self.box.mic(coords[image_of[k]] - neighbors)
-        else:
-            diff = self.box.mic(coords[:, None, :] - neighbors[None, :, :])  # (M,N,3)
-        d2 = np.sum(diff * diff, axis=-1)
-        return min(d_core, float(np.sqrt(d2.min())))
+        self.reach = cutoff + 0.5   # contacts farther than this make no difference
+        self.core_cells = cells(x, self.reach)
 
     def closest(self, coords_list: List[np.ndarray],
                 ligands: Optional[Sequence[int]] = None) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -293,6 +245,13 @@ class Contacts:
         np.minimum.at(dists, a, d)
         close = d < self.cutoff
         return dists, a[close], b[close]
+
+    def around(self, neighbors_coords: List[np.ndarray]) -> tuple:
+        """
+        Cells of `neighbors_coords` and their images one cell away along the periodic axes.
+        """
+        x = np.vstack(neighbors_coords) if neighbors_coords else np.zeros((0, 3))
+        return cells((x + self.box.shifts[:, None]).reshape(-1, 3), self.reach)
 
     def neighbors(self, i: int, centers: np.ndarray, radii: np.ndarray) -> List[int]:
         """
@@ -398,17 +357,13 @@ def pack(
         for i in tqdm(active, desc=f"Optimizing ligand (iter {iteration})", disable=not verbose):
             neighbors_coords = [coords_list[j] for j in contacts.neighbors(i, centers, radii)]
 
-            # ligands that may bend need exact contacts, neighbors included even near the core
+            around = contacts.around(neighbors_coords)
             bends = poses[i].can_bend
-            if bends:
-                min_distance = tree_min_distance(contacts.core_tree, contacts.box, neighbors_coords)
-            else:
-                min_distance = lambda x: contacts.quick(x, neighbors_coords)
-            d_old = min_distance(coords_list[i])
+            d_old = _closest(coords_list[i], contacts.core_cells, around, contacts.reach)
             best_variant, best_coords = turn_pose(
-                poses[i], min_distance, rng, cutoff, coarse_step_deg, fine_step_deg, window_deg,
+                poses[i], contacts, around, rng, coarse_step_deg, fine_step_deg, window_deg,
             )
-            d_new = min_distance(best_coords)
+            d_new = _closest(best_coords, contacts.core_cells, around, contacts.reach)
 
             # if turning fails, the ligand may bend, against every other ligand
             if refine_torsions and bends and d_new < cutoff:

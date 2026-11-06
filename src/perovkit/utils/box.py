@@ -5,10 +5,7 @@ from scipy.spatial import cKDTree
 
 
 class Box:
-    """
-    An orthorhombic cell, periodic along the axes marked in `pbc`. With no periodic axis its
-    minimum images, wrapped points and trees are those of plain space.
-    """
+    """An orthorhombic cell, periodic along the axes marked in `pbc`; with none, plain space."""
 
     def __init__(self, lengths: np.ndarray, pbc: np.ndarray):
         self.lengths = np.asarray(lengths, dtype=float)
@@ -24,15 +21,6 @@ class Box:
         for ax in self.axes:
             d[..., ax] -= self.lengths[ax] * np.round(d[..., ax] / self.lengths[ax])
         return d
-
-    def wrap(self, points: np.ndarray) -> np.ndarray:
-        """Points brought into the cell along the periodic axes."""
-        if not len(self.axes):
-            return points
-        x = np.array(points, dtype=float)
-        for ax in self.axes:
-            x[..., ax] -= self.lengths[ax] * np.floor(x[..., ax] / self.lengths[ax])
-        return x
 
     def tree(self, points: np.ndarray) -> Tuple[cKDTree, np.ndarray]:
         """
