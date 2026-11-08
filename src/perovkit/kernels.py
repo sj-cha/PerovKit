@@ -119,33 +119,6 @@ def _turn(ux, uy, uz, phi):
 
 
 @numba.njit(cache=True)
-def _grid_min_distance(x, n_poses, lo, h, shape, table, points, image_of, blocked, bound, out):
-    m = x.shape[0] // n_poses
-    for s in range(n_poses):
-        best = np.inf
-        for p in range(s * m, (s + 1) * m):
-            c0 = int(np.floor((x[p, 0] - lo[0]) / h))
-            c1 = int(np.floor((x[p, 1] - lo[1]) / h))
-            c2 = int(np.floor((x[p, 2] - lo[2]) / h))
-            if c0 < 0 or c1 < 0 or c2 < 0 or c0 >= shape[0] or c1 >= shape[1] or c2 >= shape[2]:
-                continue
-            row = (c0 * shape[1] + c1) * shape[2] + c2
-            for k in range(table.shape[1]):
-                a = table[row, k]
-                if a < 0:
-                    break
-                if blocked[image_of[a]]:
-                    continue
-                dx = x[p, 0] - points[a, 0]
-                dy = x[p, 1] - points[a, 1]
-                dz = x[p, 2] - points[a, 2]
-                d = np.sqrt(dx * dx + dy * dy + dz * dz)
-                if d < bound and d < best:
-                    best = d
-        out[s] = best
-
-
-@numba.njit(cache=True)
 def _best_spin(x0, center, axis, thetas, reference, follow, best, core, neighbors, bound):
     """
     Among spins of x0 about `axis` through `center`, the first that keeps the closest contact
@@ -183,6 +156,46 @@ def _closest(x, core, neighbors, bound):
         closest = closest_squared(x[a, 0], x[a, 1], x[a, 2], closest, core)
         closest = closest_squared(x[a, 0], x[a, 1], x[a, 2], closest, neighbors)
     return math.sqrt(closest)
+
+
+@numba.njit(cache=True)
+def _nearest(x, grid, bound):
+    """Distance of each atom of `x` to the closest point of `grid`, inf beyond `bound`."""
+    out = np.empty(x.shape[0])
+    for a in range(x.shape[0]):
+        closest = closest_squared(x[a, 0], x[a, 1], x[a, 2], bound * bound, grid)
+        out[a] = math.sqrt(closest) if closest < bound * bound else np.inf
+    return out
+
+
+@numba.njit(cache=True)
+def _min_distance(x, n_poses, grid, image_of, blocked, bound):
+    """
+    Per pose, `x` holding `n_poses` of them one after another: the distance to the closest
+    point of `grid` whose original (`image_of`) is not `blocked`, inf beyond `bound`.
+    """
+    points, lo, h, shape, head, following = grid
+    m = x.shape[0] // n_poses
+    out = np.empty(n_poses)
+    for s in range(n_poses):
+        closest = bound * bound
+        for p in range(s * m, (s + 1) * m):
+            c0 = int(np.floor((x[p, 0] - lo[0]) / h))
+            c1 = int(np.floor((x[p, 1] - lo[1]) / h))
+            c2 = int(np.floor((x[p, 2] - lo[2]) / h))
+            for i in range(max(c0 - 1, 0), min(c0 + 2, shape[0])):
+                for j in range(max(c1 - 1, 0), min(c1 + 2, shape[1])):
+                    for k in range(max(c2 - 1, 0), min(c2 + 2, shape[2])):
+                        a = head[(i * shape[1] + j) * shape[2] + k]
+                        while a >= 0:
+                            if not blocked[image_of[a]]:
+                                dx, dy, dz = x[p, 0] - points[a, 0], x[p, 1] - points[a, 1], x[p, 2] - points[a, 2]
+                                d2 = dx * dx + dy * dy + dz * dz
+                                if d2 < closest:
+                                    closest = d2
+                            a = following[a]
+        out[s] = math.sqrt(closest) if closest < bound * bound else np.inf
+    return out
 
 
 @numba.njit(cache=True)

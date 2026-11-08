@@ -22,13 +22,16 @@ class Box:
             d[..., ax] -= self.lengths[ax] * np.round(d[..., ax] / self.lengths[ax])
         return d
 
-    def tree(self, points: np.ndarray) -> Tuple[cKDTree, np.ndarray]:
+    def images(self, points: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         """
-        KD-tree of `points` and their images one cell away along the periodic axes, with the
-        point each comes from.
+        `points` and their images one cell away along the periodic axes, with the point each
+        comes from.
         """
         pts = np.asarray(points, dtype=float)
+        return (pts + self.shifts[:, None]).reshape(-1, 3), np.tile(np.arange(len(pts)), len(self.shifts))
+
+    def tree(self, points: np.ndarray) -> Tuple[cKDTree, np.ndarray]:
+        """KD-tree of the images of `points`, with the point each comes from."""
+        x, image_of = self.images(points)
         # most are searched a few times and rebuilt: quicker to build, no slower to search
-        tree = cKDTree((pts + self.shifts[:, None]).reshape(-1, 3),
-                       balanced_tree=False, compact_nodes=False)
-        return tree, np.tile(np.arange(len(pts)), len(self.shifts))
+        return cKDTree(x, balanced_tree=False, compact_nodes=False), image_of

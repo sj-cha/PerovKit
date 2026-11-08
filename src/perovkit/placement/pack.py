@@ -199,16 +199,16 @@ def bend_clusters(
 
 class Contacts:
     """
-    Closest contacts of ligands with the core left after displacement and with each other,
-    following the cell `box` of the core. `interior` holds the corners of the core without
-    its outer `depth` Å, along the axes where it has a surface: no place for ligand atoms.
+    Closest contacts of ligands with the core left after displacement (`core_points`, with
+    their periodic images) and with each other, following the cell `box` of the core.
+    `interior` holds the corners of the core without its outer `depth` Å, along the axes
+    where it has a surface: no place for ligand atoms.
     """
 
-    def __init__(self, core_tree, box: Box, cutoff: float, depth: float):
-        self.core_tree = core_tree
+    def __init__(self, core_points: np.ndarray, box: Box, cutoff: float, depth: float):
         self.box = box
         self.cutoff = cutoff
-        x = np.array(core_tree.data)
+        x = self.core_points = np.array(core_points, dtype=float)
         lo, hi = x.min(axis=0) + depth, x.max(axis=0) - depth
         lo[box.axes], hi[box.axes] = -np.inf, np.inf
         self.interior = (lo, hi)
@@ -314,7 +314,7 @@ def pack(
     # stand up tails first: coiled conformers tangle with their neighbors
     n_stretched = 0
     if stretch_tails:
-        n_stretched = stretch_poses(poses, contacts.core_tree, cutoff, n_workers)
+        n_stretched = stretch_poses(poses, contacts.core_points, cutoff, n_workers)
         if n_stretched:
             log(f"[Log] Stretched the tails of {n_stretched} of {len(poses)} ligands.")
 

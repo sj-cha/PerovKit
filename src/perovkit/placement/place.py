@@ -92,8 +92,8 @@ def place_ligands(
         raise RuntimeError("No ligands to place.")
 
     displaced.extend(sampler.displaced)   # the site atoms multi-motif ligands replace
-    core_tree, _ = box.tree(np.delete(core_positions, displaced, axis=0))
-    contacts = Contacts(core_tree, box, overlap_cutoff, core.a / 2)   # down to the first BX2 layer
+    core_points, _ = box.images(np.delete(core_positions, displaced, axis=0))
+    contacts = Contacts(core_points, box, overlap_cutoff, core.a / 2)   # down to the first BX2 layer
     coords_list = pack(
         poses, contacts, rng, max_iters=max_iters, coarse_step_deg=coarse_step_deg,
         fine_step_deg=fine_step_deg, window_deg=window_deg,

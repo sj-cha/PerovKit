@@ -6,17 +6,15 @@ import random
 from typing import TYPE_CHECKING, Dict, Iterator, List, NamedTuple, Optional, Sequence, Tuple
 
 import numpy as np
-from scipy.spatial import cKDTree
 
 from ..conformers import ConformerLibrary, embed_at, uff_energy, uff_polish
 from ..core import BindingSite
-from ..kernels import _over_sites
+from ..kernels import _min_distance, _over_sites, make_cells
 from ..refine import CONTACT_MARGINS, refine, stretch
 from ..torsion import TorsionModel
 from ..utils.box import Box
 from ..utils.rotation import rotation_about_axis
 from .fitting import Candidate, Fit, fit_conformers, mean_normal, site_normals
-from .grid import CoreGrid
 from .sites import assign_faces
 
 if TYPE_CHECKING:
@@ -107,7 +105,7 @@ class ConstellationSampler:
         embed_conformers: int = 8,
         max_embeddings: int = 12,
     ):
-        self.core_tree, self.core_image_of = box.tree(np.asarray(core_positions, dtype=float))
+        self.core_points, self.core_image_of = box.images(core_positions)
         self._n_core = len(core_positions)
         self.box = box
         self.rng = rng
@@ -129,7 +127,8 @@ class ConstellationSampler:
         self.max_embeddings = max_embeddings
         self.placed: List[np.ndarray] = []
         self._lig_tree = None
-        self._core_grid: Optional[CoreGrid] = None
+        # contacts up to overlap_cutoff + 0.5 Å are searched: see _core_min_distance
+        self._core_cells = make_cells(self.core_points, overlap_cutoff + 0.5)
         self.sites = list(sites)
         self._site_positions = np.array([s.position for s in self.sites], dtype=float).reshape(-1, 3)
         planes = np.array([s.plane for s in self.sites], dtype=float).reshape(-1, 3)
@@ -603,13 +602,13 @@ class ConstellationSampler:
         fit = cand.fits[0]
         x = fit.coords(lib)
         excluded = self._excluded(cand.sites, setup.displaces)
-        core_tree = self._local_tree(self.core_tree, self.core_image_of, fit.pivot, np.inf, excluded)
-        res = stretch(setup.model, x, groups, cand.targets, mean_normal(cand.sites), [core_tree],
-                      self.overlap_cutoff + CONTACT_MARGINS[0])
+        res = stretch(setup.model, x, groups, cand.targets, mean_normal(cand.sites),
+                      [self._core_points(excluded)], self.overlap_cutoff + CONTACT_MARGINS[0])
         poses = []
         if res is not None:
             held = [i for g in groups for i in g]
-            held += np.flatnonzero(core_tree.query(res.coords)[0] < self.overlap_cutoff + 0.5).tolist()
+            held += np.flatnonzero(self._core_min_distance(res.coords[:, None], excluded)
+                                   < self.overlap_cutoff + 0.5).tolist()
             y, e = uff_polish(mol, res.coords, held)
             poses = [(y, e), (res.coords, None)]
         for y, e in poses:
@@ -634,15 +633,17 @@ class ConstellationSampler:
         return np.fromiter(excluded, dtype=int, count=len(excluded))
 
 
-    def _surroundings(self, start: np.ndarray, pivot: np.ndarray, excluded: np.ndarray) -> list:
-        """
-        Trees of the core atoms (minus `excluded`) and placed ligand atoms around a pose.
-        """
-        reach = float(np.linalg.norm(start - pivot, axis=1).max()) + self.overlap_cutoff + 1.0
-        trees = [self._local_tree(self.core_tree, self.core_image_of, pivot, reach, excluded)]
+    def _core_points(self, excluded: np.ndarray) -> np.ndarray:
+        """The core atoms and their periodic images, without those of `excluded`."""
+        return self.core_points[~np.isin(self.core_image_of, excluded)]
+
+
+    def _surroundings(self, excluded: np.ndarray) -> List[np.ndarray]:
+        """The core atoms (minus `excluded`) and placed ligand atoms, periodic images included."""
+        fixed = [self._core_points(excluded)]
         if self._lig_tree is not None:
-            trees.append(self._local_tree(*self._lig_tree, pivot, reach))
-        return trees
+            fixed.append(self._lig_tree[0].data)
+        return fixed
 
 
     def _stretch_fit(self, setup: _TypeSetup, s: _Start) -> Optional[Fit]:
@@ -652,8 +653,7 @@ class ConstellationSampler:
         before packing still stands it up fully) if that works, else None.
         """
         res = stretch(setup.model, s.start, setup.groups, s.targets, mean_normal(s.sites),
-                      self._surroundings(s.start, s.base.pivot, s.excluded),
-                      self.overlap_cutoff + CONTACT_MARGINS[0],
+                      self._surroundings(s.excluded), self.overlap_cutoff + CONTACT_MARGINS[0],
                       stop_at=self.overlap_cutoff + CONTACT_MARGINS[0] / 2)
         if res is None or self._core_min_distance(res.coords[None], s.excluded)[0] < self.overlap_cutoff:
             return None
@@ -665,9 +665,7 @@ class ConstellationSampler:
         Refine a fit that clashes with the core, against the core atoms and placed ligands
         around it; returns it as a fit with explicit coordinates, or None if it stays stuck.
         """
-        trees = self._surroundings(s.start, s.base.pivot, s.excluded)
-        res = refine(setup.model, s.start, setup.groups, s.targets,
-                     [t.data for t in trees if t is not None],
+        res = refine(setup.model, s.start, setup.groups, s.targets, self._surroundings(s.excluded),
                      contact_distance=self.overlap_cutoff + CONTACT_MARGINS[0],
                      stop_at=self.overlap_cutoff + CONTACT_MARGINS[0] / 2, stop_rmsd=self.max_rmsd)
         if res.anchor_rmsd > self.max_rmsd:
@@ -678,17 +676,6 @@ class ConstellationSampler:
                                    source="refined")
 
 
-    @staticmethod
-    def _local_tree(tree, image_of, center, radius, excluded: Optional[np.ndarray] = None):
-        """
-        Tree of the points of `tree` within `radius` of `center`, minus `excluded` atoms.
-        """
-        idx = np.asarray(tree.query_ball_point(center, r=radius), dtype=int)
-        if excluded is not None and len(idx):
-            idx = idx[~np.isin(image_of[idx], excluded)]
-        return cKDTree(tree.data[idx]) if len(idx) else None
-
-
     def _core_min_distance(self, coords: np.ndarray, excluded: np.ndarray) -> np.ndarray:
         """
         Per-pose distance to the nearest core atom not in `excluded`: (S,) for (S, m, 3).
@@ -697,12 +684,10 @@ class ConstellationSampler:
         the result looks at contacts below the cutoff, and bounding the search is what
         makes the scan over spins and fits affordable.
         """
-        if self._core_grid is None:
-            self._core_grid = CoreGrid(self.core_tree.data, self.core_image_of,
-                                       self.overlap_cutoff + 0.5)
         blocked = np.zeros(self._n_core, dtype=bool)
         blocked[np.asarray(excluded, dtype=int)] = True
-        return self._core_grid.min_distance(coords, blocked)
+        return _min_distance(np.ascontiguousarray(coords, dtype=float).reshape(-1, 3), coords.shape[0],
+                             self._core_cells, self.core_image_of, blocked, self.overlap_cutoff + 0.5)
 
 
     def _ligand_min_distance(self, coords: np.ndarray) -> np.ndarray:

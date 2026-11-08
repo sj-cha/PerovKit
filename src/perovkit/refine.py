@@ -6,7 +6,7 @@ import numpy as np
 from scipy.optimize import minimize
 from scipy.spatial import cKDTree
 
-from .kernels import SKIN, System, evaluate, forward, make_cells
+from .kernels import SKIN, System, _nearest, evaluate, forward, make_cells
 from .torsion import TorsionModel, dihedral
 from .utils.rotation import rotation_about_axis
 
@@ -210,7 +210,7 @@ def stretch(
     groups: Sequence[Sequence[int]],
     targets: np.ndarray,
     normal: np.ndarray,
-    trees: Sequence,
+    fixed: Sequence[np.ndarray],
     contact_distance: float,
     max_iters: int = 200,
     stop_at: Optional[float] = None,
@@ -221,7 +221,7 @@ def stretch(
     Every tail torsion is set anti (180°), from the anchors outward, or gauche (±60°) where
     anti would run the chain into the rest of the ligand or the fixed atoms; then only the
     tail torsions are optimized, so no anchor moves, to lift the tail's heavy atoms along
-    `normal` while keeping clear of the fixed atoms in `trees` and of the ligand itself.
+    `normal` while keeping clear of the `fixed` atoms (arrays) and of the ligand itself.
     With `stop_at` it stops as soon as every contact with the fixed atoms is that far, when
     the point is only to unstick a chain from the surface. Returns None for a ligand without
     tails.
@@ -229,7 +229,8 @@ def stretch(
     if not model.tails.any():
         return None
     x = coords.copy()
-    fixed = [t for t in trees if t is not None and t.n > 0]
+    fixed = [f for f in fixed if len(f)]
+    grids = [make_cells(f, contact_distance) for f in fixed]
     # tail torsions, anchors outward: anti, or gauche where anti hits the ligand or fixed atoms
     order = [b for b in range(model.n_torsions - 1, -1, -1) if model.tails[b]]
     reach = 2.0 * INTRA_SCALE * float(model.radii.max())
@@ -248,8 +249,8 @@ def stretch(
             limit = INTRA_SCALE * (model.radii[moved][:, None] + model.radii[other])
             short = np.where(np.isfinite(d) & model.far[moved[:, None], other], limit - d, 0.0)
             overlap = float(np.sum(np.maximum(short, 0.0) ** 2))
-            for tree in fixed:
-                d = tree.query(y, distance_upper_bound=contact_distance)[0]
+            for grid in grids:
+                d = _nearest(y, grid, contact_distance)
                 overlap += float(np.sum((contact_distance - d[np.isfinite(d)]) ** 2))
             if overlap == 0.0:
                 best = y
@@ -259,7 +260,7 @@ def stretch(
         x[mask] = best
     lifted = model.masks[model.tails].any(axis=0) & model.heavy
     frozen = np.concatenate([np.ones(6, dtype=bool), ~model.tails])
-    return refine(model, x, groups, targets, [t.data for t in fixed], contact_distance,
+    return refine(model, x, groups, targets, fixed, contact_distance,
                   max_iters=max_iters, pull=(normal, lifted, 1.0), frozen=frozen,
                   stop_at=stop_at)
 
