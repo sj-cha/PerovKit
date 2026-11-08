@@ -10,9 +10,9 @@ import numpy as np
 from ..assembly import Assembly
 from ..core import Core
 from ..ligand import Ligand
-from ..refine import INTRA_SCALE
 from .pack import Contacts, intramolecular_contacts, pack
 from .poses import MultiMotifPose, SingleMotifPose
+from .refine import INTRA_SCALE
 from .sampler import ConstellationSampler
 from .sites import motif_pools, select_constellations, take_sites
 

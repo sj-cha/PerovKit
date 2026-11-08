@@ -8,10 +8,10 @@ from scipy.sparse import coo_matrix
 from scipy.sparse.csgraph import connected_components
 from tqdm.auto import tqdm
 
-from ..kernels import _best_spin, _closest, _contacts, make_cells
-from ..refine import CONTACT_MARGINS, INTRA_SCALE, K_CONTACT, refine, refine_joint
 from ..utils.box import Box
+from .kernels import _best_spin, _closest, _contacts, make_cells
 from .poses import MultiMotifPose, Pose
+from .refine import CONTACT_MARGINS, INTRA_SCALE, K_CONTACT, refine, refine_joint
 from .stretch import stretch_poses
 
 

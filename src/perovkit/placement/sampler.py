@@ -9,12 +9,12 @@ import numpy as np
 
 from ..conformers import ConformerLibrary, embed_at, uff_energy, uff_polish
 from ..core import BindingSite
-from ..kernels import _min_distance, _over_sites, make_cells
-from ..refine import CONTACT_MARGINS, refine, stretch
 from ..torsion import TorsionModel
 from ..utils.box import Box
 from ..utils.rotation import rotation_about_axis
 from .fitting import Candidate, Fit, fit_conformers, mean_normal, site_normals
+from .kernels import _min_distance, _over_sites, make_cells
+from .refine import CONTACT_MARGINS, refine, stretch
 from .sites import assign_faces
 
 if TYPE_CHECKING:

@@ -4,8 +4,8 @@ from typing import Dict, List, Optional, Sequence
 
 import numpy as np
 
-from ..kernels import _nearest, make_cells
-from ..refine import CONTACT_MARGINS, stretch
+from .kernels import _nearest, make_cells
+from .refine import CONTACT_MARGINS, stretch
 
 
 STRETCH_ITERS = 30    # L-BFGS iterations; chains reach 99% of their height within 20

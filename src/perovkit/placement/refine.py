@@ -6,9 +6,9 @@ import numpy as np
 from scipy.optimize import minimize
 from scipy.spatial import cKDTree
 
+from ..torsion import TorsionModel, dihedral
+from ..utils.rotation import rotation_about_axis
 from .kernels import SKIN, System, _nearest, evaluate, forward, make_cells
-from .torsion import TorsionModel, dihedral
-from .utils.rotation import rotation_about_axis
 
 
 CONTACT_MARGINS = (0.2, 0.05)  # Å, contacts are pushed to the cutoff plus each, in turn
