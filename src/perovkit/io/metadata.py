@@ -8,7 +8,7 @@ from ase.data import atomic_numbers
 import numpy as np
 
 from ..core import Core
-from ..ligand import BindingMotif, Ligand
+from ..ligand import BindingMotif, Ligand, ReactiveMotif
 
 
 def motifs_from_metadata(meta: dict) -> List[BindingMotif]:
@@ -38,29 +38,40 @@ def ligand_type_key(lig: Ligand) -> tuple:
     motifs = tuple((tuple(m.atoms), m.anchor, tuple(m.indices) if m.indices else None, m.site,
                     m.adsorb, m.anchor_offset)
                    for m in lig.binding_motifs)
-    return lig.name, lig.smiles, lig.charge, motifs, tuple(lig.binding_atoms or ())
+    key = lig.name, lig.smiles, lig.charge, motifs, tuple(lig.binding_atoms or ())
+    if lig.reactive_motifs:
+        key += (tuple((m.smarts, m.bond_length) for m in lig.reactive_motifs),)
+    return key
 
 
 def ligand_type_metadata(lig: Ligand) -> dict:
     """
     Per-type JSON metadata: identity, binding motifs and resolved binding atoms.
     """
-    return {
+    meta = {
         "name": lig.name,
         "smiles": lig.smiles,
         "charge": lig.charge,
         "binding_atoms_indices": list(lig.binding_atoms or []),
         "binding_motifs": [asdict(m) for m in lig.binding_motifs],
     }
+    if lig.reactive_motifs:
+        meta["reactive_motifs"] = [asdict(m) for m in lig.reactive_motifs]
+    return meta
 
 
 def ligand_instance_metadata(lig: Ligand) -> dict:
     """
-    Per-instance plane metadata; ``planes`` is written only when there is more than one.
+    Per-instance metadata: the plane, ``planes`` only when there is more than one, and for a
+    ligand with reactive groups those and its atom count, which drops by each cap a bond
+    replaced.
     """
     meta = {"plane": list(lig.plane)}
     if len(lig.planes) > 1:
         meta["planes"] = [list(p) for p in lig.planes]
+    if lig.reactive_groups:
+        meta["reactive_groups"] = [list(map(int, g)) for g in lig.reactive_groups]
+        meta["n_atoms"] = len(lig.atoms)
     return meta
 
 
@@ -171,6 +182,8 @@ def write_metadata(assembly, filename: str, sort: bool = False) -> None:
         "core_indices": {"octahedra": assembly.octahedra, "B_ijk": assembly.B_ijk},
         "ligands": ligands_meta,
     }
+    if assembly.ligand_bonds:
+        topo["ligand_bonds"] = [list(map(int, b)) for b in assembly.ligand_bonds]
 
     if sort:
         topo["sort_idx"] = np.argsort(assembly.atoms.symbols).tolist()
@@ -218,11 +231,12 @@ def read_assemblies(cls, atoms: Atoms | List[Atoms], json_filename: str):
     # Everything that is the same for every frame is resolved once, outside the loop.
     order = np.argsort(sort_idx) if sort_idx is not None else None
     motifs = {t["id"]: motifs_from_metadata(t) for t in ligand_types_meta}
+    reactive = {t["id"]: [ReactiveMotif(**m) for m in t.get("reactive_motifs", [])] for t in ligand_types_meta}
 
     lig_slices: List[slice] = []
     cursor = n_core_atoms
     for inst_meta in ligands_meta:
-        n_atoms = type_id_to_meta[inst_meta["spec_id"]]["n_atoms"]
+        n_atoms = inst_meta.get("n_atoms", type_id_to_meta[inst_meta["spec_id"]]["n_atoms"])
         lig_slices.append(slice(cursor, cursor + n_atoms))
         cursor += n_atoms
 
@@ -284,6 +298,8 @@ def read_assemblies(cls, atoms: Atoms | List[Atoms], json_filename: str):
                 planes=inst_meta.get("planes") or [inst_meta["plane"]],
                 volume=tmeta["volume"],
                 binding_atoms=binding_atoms,
+                reactive_motifs=reactive[spec_id],
+                reactive_groups=inst_meta.get("reactive_groups", []),
             )
 
             ligands.append(lig)
@@ -291,6 +307,7 @@ def read_assemblies(cls, atoms: Atoms | List[Atoms], json_filename: str):
         core.octahedra = octahedra
         core.B_ijk = B_ijk
         assemblies.append(cls(core=core, ligands=ligands,
-                              ligand_coverage={t["name"]: t["coverage"] for t in ligand_types_meta}))
+                              ligand_coverage={t["name"]: t["coverage"] for t in ligand_types_meta},
+                              ligand_bonds=[tuple(b) for b in topo.get("ligand_bonds", [])]))
 
     return assemblies[0] if single_input else assemblies

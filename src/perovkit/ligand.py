@@ -10,7 +10,7 @@ from ase.io import read
 from rdkit import Chem
 from rdkit.Chem import AllChem, rdDetermineBonds
 
-from .conformers import ConformerLibrary
+from .conformers import ConformerLibrary, uff_polish
 from .io.structure import write_structure
 from .torsion import TorsionModel
 from .utils.rotation import rotation_about_axis, rotation_from_u_to_v
@@ -71,16 +71,132 @@ class BindingMotif:
         if len(set(self.indices)) != len(self.indices):
             raise ValueError(f"BindingMotif: indices must be distinct, got {self.indices}")
 
-def pack_motifs(value) -> List[BindingMotif]:
-    """A binding_motif value as a list: one motif, several, or none for None."""
+@dataclass
+class ReactiveMotif:
+    """
+    A polymerizable C=C or C#C of a ligand. The ligand is built as its repeat unit: the
+    multiple bond one order lower and each of its carbons given one more hydrogen, a cap,
+    where the bond to the next unit goes. Placement bonds the tail of a unit to the head of
+    a neighbor's (the head being the carbon with fewer heavy neighbors) in place of their
+    caps; caps left unbonded end the chains, and a group that bonded to nothing gets its
+    multiple bond back.
+
+    Attributes:
+        smarts (str): SMARTS whose first two atoms are the carbons of the multiple bond, e.g.
+            "C=C" or "C#C"; motifs sharing one take its groups in order.
+        bond_length (float, optional): Length (Å) of the bond between units; by default its
+            UFF rest length.
+    """
+    smarts: str
+    bond_length: Optional[float] = None
+
+    def __post_init__(self):
+        query = Chem.MolFromSmarts(self.smarts)
+        if query is None or query.GetNumAtoms() < 2:
+            raise ValueError(f"ReactiveMotif: give a SMARTS of at least two atoms, got {self.smarts!r}")
+        if self.bond_length is not None:
+            self.bond_length = float(self.bond_length)
+
+
+def pack_motifs(value, kind=BindingMotif, name: str = "binding_motif") -> list:
+    """A motif value as a list: one motif, several, or none for None."""
     if value is None:
         return []
-    if isinstance(value, BindingMotif):
+    if isinstance(value, kind):
         return [value]
     motifs = list(value)
-    if not all(isinstance(m, BindingMotif) for m in motifs):
-        raise TypeError("binding_motif must be a BindingMotif or a list of them")
+    if not all(isinstance(m, kind) for m in motifs):
+        raise TypeError(f"{name} must be a {kind.__name__} or a list of them")
     return motifs
+
+
+# a reactive multiple bond in the repeat unit, and back
+_LOWER = {Chem.BondType.DOUBLE: Chem.BondType.SINGLE, Chem.BondType.TRIPLE: Chem.BondType.DOUBLE}
+_HIGHER = {lower: higher for higher, lower in _LOWER.items()}
+
+
+def _repeat_unit(mol: Chem.Mol, motifs: List[ReactiveMotif]) -> Tuple[Chem.Mol, List[List[int]]]:
+    """
+    `mol`, hydrogens explicit, as the repeat unit of its polymer: the multiple bond of each
+    motif one order lower, and a cap hydrogen on each of its carbons, after all the others.
+    Returns the unit, without coordinates, and per motif [head, tail, head cap, tail cap].
+    """
+    unit = Chem.RWMol(mol)
+    groups, claimed = [], set()
+    for motif in motifs:
+        pairs = [m[:2] for m in mol.GetSubstructMatches(Chem.MolFromSmarts(motif.smarts))
+                 if claimed.isdisjoint(m[:2])]
+        if not pairs:
+            raise ValueError(f"reactive SMARTS {motif.smarts!r} matches no multiple bond left in the ligand")
+        i, j = pairs[0]
+        bond = unit.GetBondBetweenAtoms(i, j)
+        if bond is None or bond.GetBondType() not in _LOWER or \
+                {mol.GetAtomWithIdx(i).GetSymbol(), mol.GetAtomWithIdx(j).GetSymbol()} != {"C"}:
+            raise ValueError(f"the first two atoms of reactive SMARTS {motif.smarts!r} must be a C=C or C#C")
+        claimed.update((i, j))
+        heavy = [sum(n.GetAtomicNum() > 1 for n in mol.GetAtomWithIdx(a).GetNeighbors()) for a in (i, j)]
+        head, tail = (i, j) if heavy[0] <= heavy[1] else (j, i)
+        bond.SetBondType(_LOWER[bond.GetBondType()])
+        bond.SetStereo(Chem.BondStereo.STEREONONE)
+        for b in unit.GetBonds():   # the cis/trans marks on its neighbors mean nothing now
+            if {b.GetBeginAtomIdx(), b.GetEndAtomIdx()} & {head, tail}:
+                b.SetBondDir(Chem.BondDir.NONE)
+        caps = []
+        for carbon in (head, tail):
+            caps.append(unit.AddAtom(Chem.Atom(1)))
+            unit.AddBond(carbon, caps[-1], Chem.BondType.SINGLE)
+        groups.append([head, tail, *caps])
+    unit = unit.GetMol()
+    Chem.SanitizeMol(unit)
+    return unit, groups
+
+
+def _planar_hydrogens(mol: Chem.Mol, x: np.ndarray, a: int, b: int) -> np.ndarray:
+    """
+    `x` with the hydrogens on the carbons of the double bond a=b where they belong: in the
+    plane of a heavy substituent, 120° from the bond, 1.08 Å out; each carbon's heavy
+    substituents stay and take the place nearest them.
+    """
+    x = x.copy()
+    neighbors = {c: [n for n in mol.GetAtomWithIdx(c).GetNeighbors() if n.GetIdx() not in (a, b)] for c in (a, b)}
+    heavy = [n.GetIdx() for c in (a, b) for n in neighbors[c] if n.GetAtomicNum() > 1]
+    for c, o in ((a, b), (b, a)):
+        hydrogens = [n.GetIdx() for n in neighbors[c] if n.GetAtomicNum() == 1]
+        if not hydrogens:
+            continue
+        u = (x[o] - x[c]) / np.linalg.norm(x[o] - x[c])
+        ref = x[heavy[0]] - x[c] if heavy else x[hydrogens[0]] - x[c]
+        w = ref - (ref @ u) * u
+        w /= np.linalg.norm(w)
+        places = [-0.5 * u + 0.866 * w, -0.5 * u - 0.866 * w]
+        for n in neighbors[c]:   # a heavy substituent keeps the place nearest it
+            if n.GetAtomicNum() > 1:
+                places.sort(key=lambda d: -d @ (x[n.GetIdx()] - x[c]))
+                places = places[1:]
+        for h in hydrogens:
+            places.sort(key=lambda d: -d @ (x[h] - x[c]))
+            x[h] = x[c] + 1.08 * places.pop(0)
+    return x
+
+
+def _linear_substituents(mol: Chem.Mol, x: np.ndarray, a: int, b: int) -> np.ndarray:
+    """
+    `x` with the triple bond a#b straight: when one carbon has a heavy substituent and the
+    other none, the other and its hydrogen go on the line from that substituent through the
+    first carbon, 1.20 and 1.06 Å on.
+    """
+    x = x.copy()
+    heavy = {c: [n.GetIdx() for n in mol.GetAtomWithIdx(c).GetNeighbors()
+                 if n.GetIdx() not in (a, b) and n.GetAtomicNum() > 1] for c in (a, b)}
+    for c, o in ((a, b), (b, a)):
+        if heavy[c] and not heavy[o]:
+            u = (x[c] - x[heavy[c][0]]) / np.linalg.norm(x[c] - x[heavy[c][0]])
+            x[o] = x[c] + 1.20 * u
+            for n in mol.GetAtomWithIdx(o).GetNeighbors():
+                if n.GetAtomicNum() == 1:
+                    x[n.GetIdx()] = x[o] + 1.06 * u
+            break
+    return x
 
 
 class _SyncedMol:
@@ -118,6 +234,11 @@ class Ligand(Part):
         binding_atoms (List[int]): Indices of the binding atoms, motif after motif.
         planes (List[Tuple[int, int, int]]): Miller index of the surface under each motif,
             after placement.
+        reactive_motifs (List[ReactiveMotif]): Polymerizable groups; the ligand is then
+            their repeat unit (see ReactiveMotif).
+        reactive_groups (List[List[int]]): Per reactive motif, [head, tail, head cap, tail
+            cap] atom indices; a cap is -1 once gone, its carbon bonded to another unit or,
+            for a group that bonded to nothing, back in its multiple bond.
     """
     atoms: Atoms = PartAtoms()
     mol: Chem.Mol = _SyncedMol()
@@ -129,6 +250,8 @@ class Ligand(Part):
     volume: float = None
     binding_atoms: List[int] = field(default_factory=list)
     planes: List[Tuple[int, int, int]] = field(default_factory=list)
+    reactive_motifs: List[ReactiveMotif] = field(default_factory=list)
+    reactive_groups: List[List[int]] = field(default_factory=list)
 
     def __post_init__(self):
         mol = self.mol
@@ -146,10 +269,17 @@ class Ligand(Part):
                 f"every motif of a multi-motif ligand needs a site ('A', 'B' or 'X'); "
                 f"motif(s) {missing} of ligand {self.name!r} have none"
             )
+        self.reactive_motifs = pack_motifs(self.reactive_motifs, ReactiveMotif, "reactive_motif")
+        if len(self.reactive_groups) != len(self.reactive_motifs):
+            raise ValueError("a ligand with reactive motifs is built with from_smiles, which makes "
+                             "its repeat unit")
         # a coarse grid will do: the volume only orders ligands
         self.volume = float(AllChem.ComputeMolVolume(mol, gridSpacing=0.4))
         if self.binding_motifs:
             self.binding_atoms = self._find_binding_atoms()
+            reacting = {a for g in self.reactive_groups for a in g}
+            if reacting & set(self.binding_atoms):
+                raise ValueError(f"ligand {self.name!r}: a reactive carbon is also a binding atom")
             self._orient_ligand()
 
 
@@ -239,6 +369,7 @@ class Ligand(Part):
         binding_motif: BindingMotif | List[BindingMotif] = None,
         random_seed: int = 42,
         name: str = None,
+        reactive_motif: ReactiveMotif | List[ReactiveMotif] = None,
     ) -> Ligand:
         """
         Build a ligand from SMILES, embedded with ETKDG and relaxed with UFF.
@@ -249,11 +380,17 @@ class Ligand(Part):
                 per binding group; an A-site cation needs none.
             random_seed (int): Seed for the embedding.
             name (str, optional): Name; the chemical formula by default.
+            reactive_motif (ReactiveMotif | List[ReactiveMotif], optional): Polymerizable
+                groups: the ligand is then built as their repeat unit.
 
         Returns:
             Ligand: The ligand.
         """
         mol = Chem.AddHs(Chem.MolFromSmiles(smiles))
+        reactive_motifs = pack_motifs(reactive_motif, ReactiveMotif, "reactive_motif")
+        reactive_groups = []
+        if reactive_motifs:
+            mol, reactive_groups = _repeat_unit(mol, reactive_motifs)
         params = AllChem.ETKDGv3()
         params.randomSeed = random_seed
         conf_id = AllChem.EmbedMolecule(mol, params)
@@ -277,7 +414,9 @@ class Ligand(Part):
             smiles=smiles,
             charge=Chem.GetFormalCharge(mol),
             binding_motifs=binding_motif,
-            name=name)
+            name=name,
+            reactive_motifs=reactive_motifs,
+            reactive_groups=reactive_groups)
 
 
     def conformers(self, **kwargs) -> ConformerLibrary:
@@ -316,7 +455,54 @@ class Ligand(Part):
         if mol is not None:
             lig.mol = Chem.Mol(mol)  # own conformer, so it can follow its own atoms
         lig.planes = list(self.planes)
+        lig.reactive_groups = [list(g) for g in self.reactive_groups]
         return lig
+
+
+    def _settle_reactive(self, bonded: set) -> None:
+        """
+        After polymerization: delete the caps of the reactive carbons `bonded` to another unit,
+        which keep the open valence of that bond, and give each group neither of whose carbons
+        bonded its multiple bond back: both caps go, its hydrogens are put where the bond wants
+        them, and its carbons and their hydrogens are relaxed with UFF, the rest held. Caps
+        follow every other atom, so no other index changes. For a ligand in no structure.
+        """
+        restore = [g for g, (head, tail, *_) in enumerate(self.reactive_groups) if not {head, tail} & bonded]
+        restored = {a for g in restore for a in self.reactive_groups[g][:2]}
+        caps = sorted({cap for head, tail, *caps in self.reactive_groups
+                       for carbon, cap in zip((head, tail), caps) if carbon in bonded or carbon in restored})
+        keep = np.ones(len(self.atoms), dtype=bool)
+        keep[caps] = False
+        new = np.cumsum(keep) - 1
+        unit = Chem.RWMol(self.mol)
+        for g in restore:
+            bond = unit.GetBondBetweenAtoms(*self.reactive_groups[g][:2])
+            bond.SetBondType(_HIGHER[bond.GetBondType()])
+        for cap in reversed(caps):
+            carbon = unit.GetAtomWithIdx(cap).GetNeighbors()[0]
+            if carbon.GetIdx() not in restored:
+                carbon.SetNoImplicit(True)
+                carbon.SetNumRadicalElectrons(carbon.GetNumRadicalElectrons() + 1)
+            unit.RemoveAtom(cap)
+        unit = unit.GetMol()
+        Chem.SanitizeMol(unit)
+        x = self.atoms.get_positions()[keep]
+        if restored and AllChem.UFFHasAllMoleculeParams(unit):
+            for g in restore:
+                a, b = self.reactive_groups[g][:2]
+                triple = unit.GetBondBetweenAtoms(a, b).GetBondType() == Chem.BondType.TRIPLE
+                x = (_linear_substituents if triple else _planar_hydrogens)(unit, x, a, b)
+            moving = restored | {n.GetIdx() for c in restored for n in unit.GetAtomWithIdx(c).GetNeighbors()
+                                 if n.GetAtomicNum() == 1}
+            x, _ = uff_polish(unit, x, [a for a in range(len(x)) if a not in moving])
+        self.atoms = self.atoms[keep]
+        self.atoms.set_positions(x)
+        self.mol = unit
+        self.reactive_groups = [[g[0], g[1], *(int(new[c]) if c >= 0 and keep[c] else -1 for c in g[2:])]
+                                for g in self.reactive_groups]
+        # built for the unit with its caps
+        self.__dict__.pop("_torsions", None)
+        self.__dict__.pop("_conformers", None)
 
 
     @classmethod
@@ -328,6 +514,8 @@ class Ligand(Part):
         lig = object.__new__(cls)
         lig.binding_atoms = []
         lig.planes = []
+        lig.reactive_motifs = []
+        lig.reactive_groups = []
         for k, v in kwargs.items():
             setattr(lig, k, v)
         return lig

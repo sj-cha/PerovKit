@@ -36,6 +36,10 @@ System = namedtuple("System", [
     "lo", "hi",
     "pull_atoms",     # atoms pulled along pull_direction by k_pull per Å
     "pull_direction", "k_pull",
+    "links",          # (K, 4) bonds being made between poses, a row per direction: the cap the
+                      #     bond replaces, its carbon, the partner carbon and the partner's image
+    "link_scale",     # (K) the point this far from the carbon to the cap is pulled onto the
+    "k_link",         #     partner; caps touch nothing, and the two carbons not each other
 ])
 
 
@@ -46,6 +50,24 @@ def doubled(a):
     for i in range(a.shape[0]):
         b[i] = a[i]
     return b
+
+
+@numba.njit(cache=True)
+def _capped(a, links):
+    """Whether atom `a` is the cap of a bond being made, in no contact then."""
+    for t in range(links.shape[0]):
+        if links[t, 0] == a:
+            return True
+    return False
+
+
+@numba.njit(cache=True)
+def _bonding(p, q, links):
+    """Whether atoms `p` and `q` are the carbons of a bond being made."""
+    for t in range(links.shape[0]):
+        if links[t, 1] == p and links[t, 2] == q:
+            return True
+    return False
 
 
 @numba.njit(cache=True)
@@ -310,6 +332,8 @@ def _update_fixed(X, s, ref, atom, partner):
             continue
         x, y, z = X[a, 0], X[a, 1], X[a, 2]
         ref[a, 0], ref[a, 1], ref[a, 2] = x, y, z
+        if _capped(a, s.links):
+            continue
         c0, c1, c2 = int(np.floor((x - lo[0]) / h)), int(np.floor((y - lo[1]) / h)), int(np.floor((z - lo[2]) / h))
         for i in range(max(c0 - 1, 0), min(c0 + 2, shape[0])):
             for j in range(max(c1 - 1, 0), min(c1 + 2, shape[1])):
@@ -398,6 +422,8 @@ def _update_mutual(X, s, ref, mp, mq, image):
         op = s.owner[p]
         x, y, z = X[p, 0], X[p, 1], X[p, 2]
         ref[p, 0], ref[p, 1], ref[p, 2] = x, y, z
+        if _capped(p, s.links):
+            continue
         c0, c1, c2 = int(np.floor((x - lo[0]) / h)), int(np.floor((y - lo[1]) / h)), int(np.floor((z - lo[2]) / h))
         for i in range(max(c0 - 1, 0), min(c0 + 2, shape[0])):
             for j in range(max(c1 - 1, 0), min(c1 + 2, shape[1])):
@@ -406,7 +432,8 @@ def _update_mutual(X, s, ref, mp, mq, image):
                     while b >= 0:
                         q = b % N
                         # a pair of two searched atoms is found from both sides: keep it once
-                        if op != s.owner[q] and (not stale[q] or p < q):
+                        if op != s.owner[q] and (not stale[q] or p < q) and not _capped(q, s.links) \
+                                and not _bonding(p, q, s.links):
                             dx, dy, dz = x - points[b, 0], y - points[b, 1], z - points[b, 2]
                             if dx * dx + dy * dy + dz * dz <= reach2:
                                 if n == new_p.shape[0]:
@@ -493,11 +520,13 @@ def _mutual_terms(x, mp, mq, image, shifts, contact_distance, k, G):
 
 
 @numba.njit(cache=True)
-def _inside_terms(x, lo, hi, k, G):
-    """Penalty of the atoms inside the box from `lo` to `hi`, each pushed out through its
-    nearest face; adds its gradient to G. Returns E."""
+def _inside_terms(x, lo, hi, k, links, G):
+    """Penalty of the atoms inside the box from `lo` to `hi`, but the caps of `links`, each
+    pushed out through its nearest face; adds its gradient to G. Returns E."""
     E = 0.0
     for a in range(x.shape[0]):
+        if _capped(a, links):
+            continue
         depth, axis, sign = np.inf, 0, 1.0
         for ax in range(3):
             below, above = x[a, ax] - lo[ax], hi[ax] - x[a, ax]
@@ -634,11 +663,11 @@ def _gradient(P, s, X, Xt, dR, G):
 @numba.njit(cache=True)
 def evaluate(P, s, lists):
     """
-    Energy and gradient at parameters P: anchor, contact, intramolecular, inside-the-box and
-    pull terms, and a mild pull of the torsions to the conformer. `lists` are the Verlet
-    lists of the last call, returned updated. Returns (E, gradient, closest contact with
-    fixed atoms and other poses, whether any pair of a pose is within its limit, worst
-    anchor RMSD of a pose, lists).
+    Energy and gradient at parameters P: anchor, contact, intramolecular, inside-the-box,
+    pull and link terms, and a mild pull of the torsions to the conformer. `lists` are the
+    Verlet lists of the last call, returned updated. Returns (E, gradient, closest contact
+    with fixed atoms and other poses, whether any pair of a pose is within its limit, worst
+    anchor RMSD of a pose, farthest link point from its partner, lists).
     """
     X, Xt, dR = forward(P, s)
     ref_fixed, atom, partner, ref_own, pa, pb, limit, ref_mutual, mp, mq, image = lists
@@ -678,7 +707,7 @@ def evaluate(P, s, lists):
     E += e
     min_distance = min(min_distance, d)
     if s.confined:
-        E += _inside_terms(X, s.lo, s.hi, 10.0 * s.k_contact, G)
+        E += _inside_terms(X, s.lo, s.hi, 10.0 * s.k_contact, s.links, G)
     for t in range(s.pull_atoms.shape[0]):
         a = s.pull_atoms[t]
         E -= s.k_pull * ((X[a, 0] - s.center[0, 0]) * s.pull_direction[0]
@@ -687,6 +716,25 @@ def evaluate(P, s, lists):
         G[a, 0] -= s.k_pull * s.pull_direction[0]
         G[a, 1] -= s.k_pull * s.pull_direction[1]
         G[a, 2] -= s.k_pull * s.pull_direction[2]
+    link_miss = 0.0
+    for t in range(s.links.shape[0]):
+        c, o, q, i, w = s.links[t, 0], s.links[t, 1], s.links[t, 2], s.links[t, 3], s.link_scale[t]
+        dx = (1.0 - w) * X[o, 0] + w * X[c, 0] - X[q, 0] - s.shifts[i, 0]
+        dy = (1.0 - w) * X[o, 1] + w * X[c, 1] - X[q, 1] - s.shifts[i, 1]
+        dz = (1.0 - w) * X[o, 2] + w * X[c, 2] - X[q, 2] - s.shifts[i, 2]
+        d2 = dx * dx + dy * dy + dz * dz
+        E += s.k_link * d2
+        link_miss = max(link_miss, math.sqrt(d2))
+        g = 2.0 * s.k_link
+        G[o, 0] += g * (1.0 - w) * dx
+        G[o, 1] += g * (1.0 - w) * dy
+        G[o, 2] += g * (1.0 - w) * dz
+        G[c, 0] += g * w * dx
+        G[c, 1] += g * w * dy
+        G[c, 2] += g * w * dz
+        G[q, 0] -= g * dx
+        G[q, 1] -= g * dy
+        G[q, 2] -= g * dz
 
     grad = _gradient(P, s, X, Xt, dR, G)
     worst = 0.0
@@ -694,5 +742,5 @@ def evaluate(P, s, lists):
         for q in range(s.param_start[l] + 6, s.param_start[l + 1]):
             E += s.w_torsion * (1.0 - math.cos(P[q]))
         worst = max(worst, math.sqrt(sq[l] / s.n_groups[l]))
-    return (E, grad, min_distance, hits > 0, worst,
+    return (E, grad, min_distance, hits > 0, worst, link_miss,
             (ref_fixed, atom, partner, ref_own, pa, pb, limit, ref_mutual, mp, mq, image))

@@ -33,10 +33,14 @@ class Assembly:
         atoms (Atoms): Every atom of the assembly.
         octahedra (Dict[int, dict]): As in Core, with the ids of the bound ligands.
         B_ijk (Dict[int, Tuple[int, int, int]]): As in Core.
+        ligand_bonds (List[Tuple[int, int, int, int]]): Bonds between ligands, made by
+            polymerizing their reactive groups: (ligand id, atom, ligand id, atom), atoms
+            numbered within each ligand. Moving a ligand stretches its bonds.
     """
     core: Core
     ligands: List[Ligand] = field(default_factory=list)
     ligand_coverage: Dict[str, float] = field(default_factory=dict)
+    ligand_bonds: List[Tuple[int, int, int, int]] = field(default_factory=list)
 
     @property
     def octahedra(self):
@@ -50,6 +54,14 @@ class Assembly:
 
     def __post_init__(self):
         self._build_atoms()
+
+    @property
+    def bond_atoms(self) -> np.ndarray:
+        """The atoms of each bond between ligands, as indices into `atoms`: (n_bonds, 2)."""
+        self._follow_deleted_atoms()
+        index = {lig.id: lig.indices for lig in self.ligands}
+        return np.array([(index[l][a], index[m][b]) for l, a, m, b in self.ligand_bonds],
+                        dtype=int).reshape(-1, 2)
 
 
     def remove_ligand(self, ligand_id: int) -> None:
@@ -152,7 +164,8 @@ class Assembly:
 
     def check_overlaps(self, cutoff: float = 1.6, verbose: bool = True) -> float:
         """
-        Closest contact between the core and a ligand, or between two ligands.
+        Closest contact between the core and a ligand, or between two ligands; the atoms of
+        a bond between ligands (ligand_bonds) are no contact.
 
         Args:
             cutoff (float): Pairs closer than this (Å) are listed when verbose.
@@ -170,6 +183,11 @@ class Assembly:
 
         centers = np.array([e.mean(axis=0) for e in entities])
         radii = np.array([np.linalg.norm(e - c, axis=1).max() for e, c in zip(entities, centers)])
+        # entity pair (i < j) -> {atom of j: the atom of i it is bonded to}
+        bonded: Dict[Tuple[int, int], Dict[int, int]] = {}
+        for l, a, m, b in self.ligand_bonds:
+            (i, x), (j, y) = sorted([(l + 1, a), (m + 1, b)])
+            bonded.setdefault((i, j), {})[y] = x
 
         global_min = np.inf
         global_pair = None
@@ -185,8 +203,16 @@ class Assembly:
                     continue
 
                 if tree_i is None:
-                    tree_i, _ = box.tree(entities[i])
-                dists_j, _ = tree_i.query(entities[j], k=1)
+                    tree_i, image_of = box.tree(entities[i])
+                if (i, j) in bonded:
+                    # the nearest atom but the bond partner
+                    near, which = tree_i.query(entities[j], k=2)
+                    dists_j = near[:, 0].copy()
+                    for y, x in bonded[(i, j)].items():
+                        if image_of[which[y, 0]] == x:
+                            dists_j[y] = near[y, 1]
+                else:
+                    dists_j, _ = tree_i.query(entities[j], k=1)
                 d_min = float(np.min(dists_j))
 
                 if d_min < global_min:
@@ -334,4 +360,6 @@ class Assembly:
         core.octahedra = {new[b]: {"X": [new[x] for x in octa["X"] if x in new],
                                    "Ligand": [new_id[l] for l in octa["Ligand"] if l in new_id]}
                           for b, octa in core.octahedra.items() if b in new}
+        self.ligand_bonds = [(new_id[l], a, new_id[m], b) for l, a, m, b in self.ligand_bonds
+                             if l in new_id and m in new_id]
         core.B_ijk = {new[b]: ijk for b, ijk in core.B_ijk.items() if b in new}

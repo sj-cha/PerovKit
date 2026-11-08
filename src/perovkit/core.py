@@ -380,6 +380,10 @@ class Core(Part):
                 n_workers (int): Processes for the stretch. Default 8.
                 max_anchor_rmsd (float): Largest anchor deviation (RMS, Å) of a ligand
                     from its sites. Default 0.5.
+                polymerize (bool): Bond the reactive groups of neighboring ligands (see
+                    ReactiveMotif) into chains. Default True.
+                bond_reach (float): Farthest (Å) two reactive carbons may be to bond.
+                    Default 12.0.
                 Other options go to ConstellationSampler (e.g. n_refine, max_templates).
 
         Returns:

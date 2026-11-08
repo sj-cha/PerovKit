@@ -33,14 +33,17 @@ def build_system(
     shifts: Optional[np.ndarray] = None,
     interior: Optional[tuple] = None,
     pull: Optional[tuple] = None,
+    links: Optional[tuple] = None,
 ) -> System:
     """
     The arrays of L poses for `evaluate`. `fixed` are arrays of fixed atoms (periodic images
-    included), `shifts` the periodic images of the poses, and `pull`, for one pose,
-    (direction, atom mask, k).
+    included), `shifts` the periodic images of the poses, `pull`, for one pose, (direction,
+    atom mask, k), and `links` the bonds being made between poses, (rows, scale, k) as
+    System holds them, atoms numbered across the poses.
     """
     L = len(models)
     atom_start = _starts([len(c) for c in coords])
+    rows, scale, k_link = (np.zeros((0, 4), dtype=np.int64), np.zeros(0), 0.0) if links is None else links
     types = {}
     for m in models:
         types.setdefault(id(m), m)
@@ -85,6 +88,8 @@ def build_system(
         confined=interior is not None, lo=lo, hi=hi,
         pull_atoms=np.zeros(0, dtype=np.int64) if mask is None else np.flatnonzero(mask),
         pull_direction=np.asarray(direction, dtype=float), k_pull=k_pull,
+        links=np.ascontiguousarray(rows, dtype=np.int64).reshape(-1, 4),
+        link_scale=np.asarray(scale, dtype=float), k_link=float(k_link),
     )
 
 
@@ -121,11 +126,12 @@ def _held(model: TorsionModel, spin_axis: Optional[np.ndarray]) -> np.ndarray:
     return held
 
 
-def _solve(system, held, max_iters, stop_at, stop_rmsd) -> np.ndarray:
+def _solve(system, held, max_iters, stop_at, stop_rmsd, stop_link=float("inf")) -> np.ndarray:
     """
     Minimize the objective of `system` by L-BFGS-B from zero with the `held` parameters kept
-    there, stopping at the first iterate with every contact `stop_at` Å, nothing tangled and
-    the anchors within `stop_rmsd`. Returns the coordinates.
+    there, stopping at the first iterate with every contact `stop_at` Å, nothing tangled, the
+    anchors within `stop_rmsd` and every link point within `stop_link` of its partner.
+    Returns the coordinates.
     """
     none = np.zeros(0, dtype=np.int64)
     unset = lambda: np.full((len(system.X0), 3), np.inf)    # every pose counts as moved
@@ -134,9 +140,9 @@ def _solve(system, held, max_iters, stop_at, stop_rmsd) -> np.ndarray:
 
     def fun(params):
         nonlocal lists, good_enough
-        E, g, min_distance, tangled, rmsd, lists = evaluate(params, system, lists)
+        E, g, min_distance, tangled, rmsd, link_miss, lists = evaluate(params, system, lists)
         good_enough = (params.copy() if stop_at is not None and min_distance >= stop_at
-                       and not tangled and rmsd <= stop_rmsd else None)
+                       and not tangled and rmsd <= stop_rmsd and link_miss <= stop_link else None)
         return E, g
 
     def callback(intermediate_result):
@@ -279,6 +285,9 @@ def refine_joint(
     stop_rmsd: float = float("inf"),
     spin_axes: Optional[Sequence[Optional[np.ndarray]]] = None,
     interior: Optional[tuple] = None,
+    links: Optional[tuple] = None,
+    stop_link: float = float("inf"),
+    held_poses: Optional[Sequence[bool]] = None,
 ) -> List[Refinement]:
     """
     Refine several ligands at once, so that ligands jammed against each other can all give
@@ -286,14 +295,18 @@ def refine_joint(
     `contact_distance` Å apart, their images at `shifts` included.
     `stop_at` and `stop_rmsd` end it early as in `refine`, with every ligand meeting them.
     `spin_axes` gives each ligand a spin axis as in `refine`, or None; `interior` is that
-    of `refine`.
+    of `refine`; `links` are bonds being made between them (see build_system), and
+    `stop_link` how near their points must be for stop_at to end it. Ligands marked in
+    `held_poses` stay put, there only for the links to them.
     """
     spin_axes = [None] * len(models) if spin_axes is None else list(spin_axes)
     system = build_system(models, coords, groups, targets,
                           [None if a is None else _spin_frame(a) for a in spin_axes],
-                          fixed, contact_distance, k_contact, shifts=shifts, interior=interior)
-    held = np.concatenate([_held(m, a) for m, a in zip(models, spin_axes)])
-    x = _solve(system, held, max_iters, stop_at, stop_rmsd)
+                          fixed, contact_distance, k_contact, shifts=shifts, interior=interior, links=links)
+    held_poses = [False] * len(models) if held_poses is None else held_poses
+    held = np.concatenate([np.ones(6 + m.n_torsions, dtype=bool) if still else _held(m, a)
+                           for m, a, still in zip(models, spin_axes, held_poses)])
+    x = _solve(system, held, max_iters, stop_at, stop_rmsd, stop_link)
     out = []
     for l in range(len(models)):
         y = x[system.atom_start[l]:system.atom_start[l + 1]]

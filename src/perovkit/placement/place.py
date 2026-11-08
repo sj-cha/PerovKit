@@ -11,6 +11,7 @@ from ..assembly import Assembly
 from ..core import Core
 from ..ligand import Ligand
 from .pack import Contacts, intramolecular_contacts, pack
+from .polymerize import bond_units
 from .poses import MultiMotifPose, SingleMotifPose
 from .refine import INTRA_SCALE
 from .sampler import ConstellationSampler
@@ -41,6 +42,8 @@ def place_ligands(
     refine_torsions: bool = True,
     stretch_tails: bool = True,
     n_workers: int = 8,   # at most the CPUs available
+    polymerize: bool = True,
+    bond_reach: float = 12.0,   # Å
     **sampler_options,
 ) -> Assembly:
     """
@@ -101,7 +104,20 @@ def place_ligands(
         refine_torsions=refine_torsions, stretch_tails=stretch_tails, n_workers=n_workers,
         log=log, verbose=verbose,
     )
-    assembly = _assemble(core, requests, [p.ligand for p in poses], coords_list, displaced)
+    reactive = [l for l, p in enumerate(poses) if p.ligand.reactive_groups]
+    bonds = []
+    if polymerize and reactive:
+        bonds = bond_units(poses, coords_list, contacts, max_anchor_rmsd, bond_reach, log)
+    bonded = {l: set() for l in reactive}
+    for l, a, m, b in bonds:
+        bonded[l].add(a)
+        bonded[m].add(b)
+    for l in reactive:
+        lig = poses[l].ligand
+        lig.atoms.set_positions(coords_list[l])
+        lig._settle_reactive(bonded[l])
+        coords_list[l] = lig.atoms.get_positions()
+    assembly = _assemble(core, requests, [p.ligand for p in poses], coords_list, displaced, bonds)
 
     def deviations(chosen: List) -> np.ndarray:
         return np.concatenate([np.linalg.norm(box.mic(p.ligand.anchor_positions - p.targets), axis=1)
@@ -130,10 +146,12 @@ def _assemble(
     ligands: List[Ligand],
     coords_list: List[np.ndarray],
     displaced: List[int],
+    bonds: List[tuple],
 ) -> Assembly:
     """
     Give the ligands their coordinates and ids, and put them on a copy of `core` without
-    the `displaced` atoms, keeping the core's octahedra and lattice coordinates.
+    the `displaced` atoms, keeping the core's octahedra and lattice coordinates; `bonds`
+    join ligands, which take the ids of their places in `ligands`.
     """
     max_z = 0
     for i, (lig, coords) in enumerate(zip(ligands, coords_list)):
@@ -169,7 +187,7 @@ def _assemble(
     # as plain Python numbers, which JSON takes; None for a ligand given its sites
     coverage = {lig.name: np.asarray(cov).item() if isinstance(cov, Real) else None
                 for lig, cov in requests}
-    return Assembly(core=stripped, ligands=list(ligands), ligand_coverage=coverage)
+    return Assembly(core=stripped, ligands=list(ligands), ligand_coverage=coverage, ligand_bonds=list(bonds))
 
 
 def _assign_to_octahedra(core: Core, ligands: List[Ligand]) -> None:
