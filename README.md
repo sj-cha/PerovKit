@@ -10,7 +10,7 @@ Requires Python >= 3.12.
 
 ```bash
 git clone https://github.com/sj-cha/PerovKit.git
-cd perovkit
+cd PerovKit
 pip install -e .
 ```
 
@@ -25,6 +25,8 @@ pip install -e .
 ```python
 from perovkit import Core, Ligand, BindingMotif, Assembly
 ```
+
+The first placement after installation takes about 15–20 s longer while Numba compiles its kernels; later runs load them from Numba's cache.
 
 ### Build a Nanocrystal with Co-passivation
 
@@ -54,13 +56,13 @@ nc.to(fmt="xyz", filename="nc_OA_OAm.xyz")
 ### Build a Slab with Multidentate Ligands
 
 ```python
-# A-site foraminidium
+# A-site formamidinium
 FA = Ligand.from_smiles(
     smiles="NC=[NH2+]", 
     name="FA",
 )
 
-# PO-T2T with three binding anchors that adsorbes on FA
+# PO-T2T with three binding anchors that adsorbs on FA
 POT2T = Ligand.from_smiles(
     smiles="O=P(c1ccccc1)(c1ccccc1)c1cccc(-c2nc(-c3cccc(P(=O)(c4ccccc4)c4ccccc4)c3)nc(-c3cccc(P(=O)(c4ccccc4)c4ccccc4)c3)n2)c1", 
     binding_motif=[BindingMotif(atoms=["O"], anchor="P(=O)", site="A", adsorb = True),
@@ -71,7 +73,7 @@ POT2T = Ligand.from_smiles(
 
 # Build a 4x4x3 FAPbI3 slab
 core = Core.build_core(
-    A=FA, B="Pb", X="Br",
+    A=FA, B="Pb", X="I",
     a=6.3691,
     supercell=(4,4,3),
     pbc=True
