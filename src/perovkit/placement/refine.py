@@ -6,14 +6,10 @@ import numpy as np
 from scipy.optimize import minimize
 from scipy.spatial import cKDTree
 
+from ..config import PlacementConfig
 from ..torsion import TorsionModel, dihedral
 from ..utils.rotation import rotation_about_axis
 from .kernels import SKIN, System, _nearest, evaluate, forward, make_cells
-
-
-CONTACT_MARGINS = (0.2, 0.05)  # Å, contacts are pushed to the cutoff plus each, in turn
-INTRA_SCALE = 0.7              # atoms four or more bonds apart keep this x their summed vdW radii
-K_CONTACT = 40.0               # per Å^2, soft-sphere weight of a contact
 
 
 def _starts(lengths) -> np.ndarray:
@@ -30,16 +26,17 @@ def build_system(
     fixed: Sequence[np.ndarray],
     contact_distance: float,
     k_contact: float,
+    config: PlacementConfig,
     shifts: Optional[np.ndarray] = None,
     interior: Optional[tuple] = None,
     pull: Optional[tuple] = None,
     links: Optional[tuple] = None,
 ) -> System:
     """
-    The arrays of L poses for `evaluate`. `fixed` are arrays of fixed atoms (periodic images
-    included), `shifts` the periodic images of the poses, `pull`, for one pose, (direction,
-    atom mask, k), and `links` the bonds being made between poses, (rows, scale, k) as
-    System holds them, atoms numbered across the poses.
+    The arrays of L poses for `evaluate`, its other weights those of `config`. `fixed` are
+    arrays of fixed atoms (periodic images included), `shifts` the periodic images of the
+    poses, `pull`, for one pose, (direction, atom mask, k), and `links` the bonds being made
+    between poses, (rows, scale, k) as System holds them, atoms numbered across the poses.
     """
     L = len(models)
     atom_start = _starts([len(c) for c in coords])
@@ -78,13 +75,14 @@ def build_system(
         far_start=_starts([len(a) for a, _ in far]),
         far_a=np.concatenate([a for a, _ in far]),
         far_b=np.concatenate([b for _, b in far]),
-        far_limit=np.concatenate([INTRA_SCALE * (m.radii[a] + m.radii[b])
+        far_limit=np.concatenate([config.intra_scale * (m.radii[a] + m.radii[b])
                                   for m, (a, b) in zip(types.values(), far)]),
         owner=np.repeat(np.arange(L, dtype=np.int64), np.diff(atom_start)),
         fixed=make_cells(np.concatenate([np.zeros((0, 3)), *fixed]), contact_distance + SKIN),
         shifts=np.zeros((1, 3)) if shifts is None else shifts,
-        contact_distance=contact_distance, k_anchor=20.0, k_contact=k_contact,
-        w_torsion=0.02,   # of 1 - cos(change) per torsion, a mild pull to the conformer
+        contact_distance=contact_distance, k_anchor=config.k_anchor, k_contact=k_contact,
+        k_intra=config.intra_weight * k_contact, k_inside=config.interior_weight * k_contact,
+        w_torsion=config.w_torsion,
         confined=interior is not None, lo=lo, hi=hi,
         pull_atoms=np.zeros(0, dtype=np.int64) if mask is None else np.flatnonzero(mask),
         pull_direction=np.asarray(direction, dtype=float), k_pull=k_pull,
@@ -162,7 +160,8 @@ def refine(
     targets: np.ndarray,
     fixed: Sequence[Optional[np.ndarray]],
     contact_distance: float,
-    max_iters: int = 400,
+    config: PlacementConfig,
+    max_iters: Optional[int] = None,
     pull: Optional[tuple] = None,
     frozen: Optional[np.ndarray] = None,
     spin_axis: Optional[np.ndarray] = None,
@@ -186,7 +185,8 @@ def refine(
             periodic images included.
         contact_distance (float): Distance (Å) to which the fixed atoms are pushed out:
             closer pairs are penalized.
-        max_iters (int): L-BFGS-B iterations.
+        config (PlacementConfig): Weights of the objective, and refine_iters.
+        max_iters (int, optional): L-BFGS-B iterations, by default refine_iters.
         pull: Optional (direction, atom mask, k): lowers the energy by k per Å that the
             masked atoms move along the unit direction.
         frozen (np.ndarray): Optional (6 + k,) mask of parameters held at zero.
@@ -197,16 +197,16 @@ def refine(
             `stop_rmsd` (RMS, Å): the pose is good enough, and the remaining iterations
             would only polish it.
         interior (tuple): Optional corners (lo, hi) of a box that atoms are pushed out of,
-            10x as hard as out of contacts: the free volume between the atoms of a core
-            would otherwise take in any chain that a long step lands there.
+            interior_weight times as hard as out of contacts: the free volume between the
+            atoms of a core would otherwise take in any chain that a long step lands there.
     """
     frame = None if spin_axis is None else _spin_frame(spin_axis)
     system = build_system([model], [coords], [groups], [targets], [frame], fixed, contact_distance,
-                          K_CONTACT, interior=interior, pull=pull)
+                          config.k_contact, config, interior=interior, pull=pull)
     held = _held(model, spin_axis)
     if frozen is not None:
         held |= frozen
-    x = _solve(system, held, max_iters, stop_at, stop_rmsd)
+    x = _solve(system, held, max_iters or config.refine_iters, stop_at, stop_rmsd)
     return Refinement(coords=x, anchor_rmsd=_anchor_rmsd(x, groups, targets))
 
 
@@ -218,7 +218,8 @@ def stretch(
     normal: np.ndarray,
     fixed: Sequence[np.ndarray],
     contact_distance: float,
-    max_iters: int = 200,
+    config: PlacementConfig,
+    max_iters: int,
     stop_at: Optional[float] = None,
 ) -> Optional[Refinement]:
     """
@@ -239,7 +240,7 @@ def stretch(
     grids = [make_cells(f, contact_distance) for f in fixed]
     # tail torsions, anchors outward: anti, or gauche where anti hits the ligand or fixed atoms
     order = [b for b in range(model.n_torsions - 1, -1, -1) if model.tails[b]]
-    reach = 2.0 * INTRA_SCALE * float(model.radii.max())
+    reach = 2.0 * config.intra_scale * float(model.radii.max())
     for b in order:
         (i, j), mask, quad = model.bonds[b], model.masks[b], model.quads[b]
         u = x[j] - x[i]
@@ -252,7 +253,7 @@ def stretch(
             y = (x[mask] - x[i]) @ R.T + x[i]
             d, k = rest_tree.query(y, k=min(8, len(rest)), distance_upper_bound=reach)
             other = rest[np.minimum(k, len(rest) - 1)]
-            limit = INTRA_SCALE * (model.radii[moved][:, None] + model.radii[other])
+            limit = config.intra_scale * (model.radii[moved][:, None] + model.radii[other])
             short = np.where(np.isfinite(d) & model.far[moved[:, None], other], limit - d, 0.0)
             overlap = float(np.sum(np.maximum(short, 0.0) ** 2))
             for grid in grids:
@@ -266,8 +267,8 @@ def stretch(
         x[mask] = best
     lifted = model.masks[model.tails].any(axis=0) & model.heavy
     frozen = np.concatenate([np.ones(6, dtype=bool), ~model.tails])
-    return refine(model, x, groups, targets, fixed, contact_distance,
-                  max_iters=max_iters, pull=(normal, lifted, 1.0), frozen=frozen,
+    return refine(model, x, groups, targets, fixed, contact_distance, config,
+                  max_iters=max_iters, pull=(normal, lifted, config.k_pull), frozen=frozen,
                   stop_at=stop_at)
 
 
@@ -279,8 +280,9 @@ def refine_joint(
     fixed: Sequence[Optional[np.ndarray]],
     contact_distance: float,
     shifts: np.ndarray,
-    k_contact: float = K_CONTACT,
-    max_iters: int = 400,
+    config: PlacementConfig,
+    k_contact: Optional[float] = None,
+    max_iters: Optional[int] = None,
     stop_at: Optional[float] = None,
     stop_rmsd: float = float("inf"),
     spin_axes: Optional[Sequence[Optional[np.ndarray]]] = None,
@@ -292,7 +294,8 @@ def refine_joint(
     """
     Refine several ligands at once, so that ligands jammed against each other can all give
     way. Each has the terms of `refine`; atoms of different ligands are also pushed
-    `contact_distance` Å apart, their images at `shifts` included.
+    `contact_distance` Å apart, their images at `shifts` included. `k_contact` and
+    `max_iters` are by default those of `config`.
     `stop_at` and `stop_rmsd` end it early as in `refine`, with every ligand meeting them.
     `spin_axes` gives each ligand a spin axis as in `refine`, or None; `interior` is that
     of `refine`; `links` are bonds being made between them (see build_system), and
@@ -302,11 +305,12 @@ def refine_joint(
     spin_axes = [None] * len(models) if spin_axes is None else list(spin_axes)
     system = build_system(models, coords, groups, targets,
                           [None if a is None else _spin_frame(a) for a in spin_axes],
-                          fixed, contact_distance, k_contact, shifts=shifts, interior=interior, links=links)
+                          fixed, contact_distance, k_contact or config.k_contact, config, shifts=shifts,
+                          interior=interior, links=links)
     held_poses = [False] * len(models) if held_poses is None else held_poses
     held = np.concatenate([np.ones(6 + m.n_torsions, dtype=bool) if still else _held(m, a)
                            for m, a, still in zip(models, spin_axes, held_poses)])
-    x = _solve(system, held, max_iters, stop_at, stop_rmsd, stop_link)
+    x = _solve(system, held, max_iters or config.refine_iters, stop_at, stop_rmsd, stop_link)
     out = []
     for l in range(len(models)):
         y = x[system.atom_start[l]:system.atom_start[l + 1]]

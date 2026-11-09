@@ -7,6 +7,7 @@ from ase import Atoms
 from ase.data import atomic_numbers
 import numpy as np
 
+from ..config import PlacementConfig
 from ..core import Core
 from ..ligand import BindingMotif, Ligand, ReactiveMotif
 
@@ -184,6 +185,8 @@ def write_metadata(assembly, filename: str, sort: bool = False) -> None:
     }
     if assembly.ligand_bonds:
         topo["ligand_bonds"] = [list(map(int, b)) for b in assembly.ligand_bonds]
+    if assembly.config is not None:
+        topo["placement_config"] = asdict(assembly.config)
 
     if sort:
         topo["sort_idx"] = np.argsort(assembly.atoms.symbols).tolist()
@@ -232,6 +235,7 @@ def read_assemblies(cls, atoms: Atoms | List[Atoms], json_filename: str):
     order = np.argsort(sort_idx) if sort_idx is not None else None
     motifs = {t["id"]: motifs_from_metadata(t) for t in ligand_types_meta}
     reactive = {t["id"]: [ReactiveMotif(**m) for m in t.get("reactive_motifs", [])] for t in ligand_types_meta}
+    config = PlacementConfig.from_dict(topo["placement_config"]) if "placement_config" in topo else None
 
     lig_slices: List[slice] = []
     cursor = n_core_atoms
@@ -308,6 +312,7 @@ def read_assemblies(cls, atoms: Atoms | List[Atoms], json_filename: str):
         core.B_ijk = B_ijk
         assemblies.append(cls(core=core, ligands=ligands,
                               ligand_coverage={t["name"]: t["coverage"] for t in ligand_types_meta},
-                              ligand_bonds=[tuple(b) for b in topo.get("ligand_bonds", [])]))
+                              ligand_bonds=[tuple(b) for b in topo.get("ligand_bonds", [])],
+                              config=config))
 
     return assemblies[0] if single_input else assemblies

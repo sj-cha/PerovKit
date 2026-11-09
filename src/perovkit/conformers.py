@@ -56,6 +56,8 @@ class ConformerLibrary:
         reference_energy (float): Absolute UFF energy (kcal/mol) the energies are relative to.
         n_templates (int): Poses appended by with_template, the last conformers; they have
             no mirror image.
+        n_embedded (int): Distinct ETKDG conformers found, before mirroring; fewer than
+            asked for when no more turned up rmsd_cutoff apart.
     """
     coords: np.ndarray
     energies: np.ndarray
@@ -66,6 +68,7 @@ class ConformerLibrary:
     mirrored: bool = False
     reference_energy: float = 0.0
     n_templates: int = 0
+    n_embedded: int = 0
 
     @property
     def n_conformers(self) -> int:
@@ -106,7 +109,7 @@ class ConformerLibrary:
         cls,
         ligand: Ligand,
         n_conformers: int = 50,
-        prune_rms: float = 0.5,
+        rmsd_cutoff: float = 0.5,
         optimize: bool = True,
         mirror: Optional[bool] = None,
         random_seed: int = 42,
@@ -123,8 +126,10 @@ class ConformerLibrary:
 
         Args:
             ligand (Ligand): Ligand with an RDKit mol and resolved binding atoms.
-            n_conformers (int): Number of ETKDG embeddings to attempt.
-            prune_rms (float): RMSD (Å) below which ETKDG discards a conformer as a duplicate,
+            n_conformers (int): Number of distinct conformers to embed. Each round embeds the
+                shortfall with a new seed, until there are this many or three rounds in a row
+                find none new (n_embedded tells how many were found).
+            rmsd_cutoff (float): RMSD (Å) below which ETKDG discards a conformer as a duplicate,
                 comparing atoms by index rather than up to symmetry.
             optimize (bool): Minimize every conformer with UFF and record its energy.
             mirror (Optional[bool]): Add the mirror image of every conformer. A rotation
@@ -147,17 +152,25 @@ class ConformerLibrary:
             mol.AddConformer(current, assignId=True)
         params = AllChem.ETKDGv3()
         params.randomSeed = random_seed
-        params.pruneRmsThresh = prune_rms
+        params.pruneRmsThresh = rmsd_cutoff
         # a sulfonate turned by 120 degrees is a duplicate to ETKDG, but not to a motif that
         # names two of its oxygens
         params.useSymmetryForPruning = False
-        params.clearConfs = False
+        params.clearConfs = False   # each round prunes against the conformers kept so far
         params.numThreads = n_threads
-        n_new = len(AllChem.EmbedMultipleConfs(mol, n_conformers, params))
-        if n_new < n_conformers // 2:
-            # large molecules mostly fail to embed unless started from random coordinates
-            params.useRandomCoords = True
-            AllChem.EmbedMultipleConfs(mol, n_conformers - n_new, params)
+        # rounds embed the shortfall until three in a row find nothing new: the last
+        # distinct conformers of a small ligand turn up only now and then
+        want, idle = n_conformers, 0
+        while want > 0 and idle < 3:
+            got = len(AllChem.EmbedMultipleConfs(mol, want, params))
+            idle = 0 if got else idle + 1
+            if got < want // 2 and not params.useRandomCoords:
+                # large molecules mostly fail to embed unless started from random coordinates
+                params.useRandomCoords = True
+            else:
+                params.randomSeed += 1
+            want -= got
+        n_embedded = n_conformers - want
 
         energies = np.zeros(mol.GetNumConformers())
         if optimize and AllChem.UFFHasAllMoleculeParams(mol):
@@ -183,7 +196,7 @@ class ConformerLibrary:
             body[:] = True
         return cls(coords=coords, energies=energies, anchors=anchors, directions=directions,
                    body=body, stretched=np.zeros(len(coords), dtype=bool), mirrored=bool(mirror),
-                   reference_energy=reference)
+                   reference_energy=reference, n_embedded=n_embedded)
 
 
 def uff_polish(mol: Chem.Mol, x: np.ndarray, fixed: List[int], max_displ: float = 0.3,

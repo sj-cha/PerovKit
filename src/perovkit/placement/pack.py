@@ -8,10 +8,11 @@ from scipy.sparse import coo_matrix
 from scipy.sparse.csgraph import connected_components
 from tqdm.auto import tqdm
 
+from ..config import PlacementConfig
 from ..utils.box import Box
 from .kernels import _best_spin, _closest, _contacts, make_cells
 from .poses import MultiMotifPose, Pose
-from .refine import CONTACT_MARGINS, INTRA_SCALE, K_CONTACT, refine, refine_joint
+from .refine import refine, refine_joint
 from .stretch import stretch_poses
 
 
@@ -20,23 +21,23 @@ def bend_pose(
     coords: np.ndarray,
     neighbors_coords: List[np.ndarray],
     contacts: Contacts,
-    max_rmsd: float,
+    config: PlacementConfig,
 ) -> Tuple[Optional[np.ndarray], float]:
     """
     Refine a ligand in torsion space against the core and `neighbors_coords`; one with a
     spin axis (a single-motif ligand) keeps its tilt and turns only about it.
 
     Returns the refined coordinates whose closest contact is farthest, and that contact,
-    stopping at the first margin that clears the cutoff; (None, -inf) when every attempt
-    leaves the anchors farther than `max_rmsd` (RMS, Å) from their sites.
+    stopping at the first of the contact margins that clears the cutoff; (None, -inf) when
+    every attempt leaves the anchors farther than max_anchor_rmsd from their sites.
     """
-    cutoff = contacts.cutoff
+    cutoff, max_rmsd = contacts.cutoff, config.max_anchor_rmsd
     around = contacts.around(neighbors_coords)
     fixed = [contacts.core_cells[0], around[0]]
     best, best_d = None, -float("inf")
-    for margin in CONTACT_MARGINS:
+    for margin in config.contact_margins:
         res = refine(pose.ligand.torsion_model(), coords, pose.ligand.binding_groups,
-                     pose.targets, fixed, contact_distance=cutoff + margin, spin_axis=pose.spin_axis,
+                     pose.targets, fixed, cutoff + margin, config, spin_axis=pose.spin_axis,
                      stop_at=cutoff + margin / 2, stop_rmsd=max_rmsd, interior=contacts.interior)
         if res.anchor_rmsd > max_rmsd:
             continue
@@ -48,10 +49,11 @@ def bend_pose(
     return best, best_d
 
 
-def intramolecular_contacts(poses: Sequence, coords_list: List[np.ndarray]) -> Tuple[float, int]:
+def intramolecular_contacts(poses: Sequence, coords_list: List[np.ndarray],
+                            intra_scale: float) -> Tuple[float, int]:
     """
     Over the multi-motif ligands: the closest pair of atoms of one ligand four or more bonds
-    apart (Å), and how many such pairs are closer than INTRA_SCALE x their summed radii.
+    apart (Å), and how many such pairs are closer than `intra_scale` x their summed radii.
     """
     min_distance, n = float("inf"), 0
     for pose, x in zip(poses, coords_list):
@@ -60,7 +62,7 @@ def intramolecular_contacts(poses: Sequence, coords_list: List[np.ndarray]) -> T
         model = pose.ligand.torsion_model()
         a, b = np.nonzero(np.triu(model.far))
         d = np.linalg.norm(x[a] - x[b], axis=1)
-        n += int(np.sum((d < INTRA_SCALE * (model.radii[a] + model.radii[b])) & (d > 1e-9)))
+        n += int(np.sum((d < intra_scale * (model.radii[a] + model.radii[b])) & (d > 1e-9)))
         min_distance = min(min_distance, float(d.min()) if d.size else min_distance)
     return min_distance, n
 
@@ -136,8 +138,7 @@ def bend_clusters(
     poses: Sequence,
     coords_list: List[np.ndarray],
     contacts: Contacts,
-    max_rmsd: float,
-    stop_at: Optional[float] = None,
+    config: PlacementConfig,
 ) -> bool:
     """
     Refine jammed ligands together, for when no ligand can clear its contacts alone.
@@ -145,16 +146,16 @@ def bend_clusters(
     Ligands closer than the cutoff form a contact graph. In every connected component with a
     contact below the cutoff (a single ligand touching the core included), the members that
     can bend are refined jointly against the core and all other ligands and pushed apart
-    from each other, with the margins of CONTACT_MARGINS and then stiffer contacts (2x and 4x).
-    Members whose anchors end farther than `max_rmsd` from their sites keep their poses;
+    from each other, with each contact margin at each k_contact weight of `config` in turn.
+    Members whose anchors end farther than max_anchor_rmsd from their sites keep their poses;
     the others take theirs if the closest contact of the component improves. Each
-    refinement stops once every contact is `stop_at` Å (by default halfway into the
-    margin). Updates `coords_list` and the poses in place.
+    refinement stops once every contact clears the cutoff. Updates `coords_list` and the
+    poses in place.
 
     Returns:
         Whether any component improved.
     """
-    cutoff = contacts.cutoff
+    cutoff, max_rmsd = contacts.cutoff, config.max_anchor_rmsd
     n = len(poses)
     # components do not touch, so what one finds here holds while the others move
     dists, a, b = contacts.closest(coords_list)
@@ -171,14 +172,14 @@ def bend_clusters(
             continue  # nothing to clear: a lone ligand with no contact below the cutoff
         others = [c for j, c in enumerate(coords_list) if j not in members]
         fixed = [contacts.core_cells[0], contacts.around(others)[0]]
-        for stiff, margin in [(k, m) for k in (1.0, 2.0, 4.0) for m in CONTACT_MARGINS]:
+        for weight, margin in [(w, m) for w in config.k_contact_weights for m in config.contact_margins]:
             results = refine_joint(
                 [poses[i].ligand.torsion_model() for i in members],
                 [coords_list[i] for i in members],
                 [poses[i].ligand.binding_groups for i in members],
                 [poses[i].targets for i in members],
-                fixed, cutoff + margin, contacts.box.shifts, k_contact=K_CONTACT * stiff,
-                stop_at=cutoff + margin / 2 if stop_at is None else stop_at, stop_rmsd=max_rmsd,
+                fixed, cutoff + margin, contacts.box.shifts, config, k_contact=config.k_contact * weight,
+                stop_at=cutoff, stop_rmsd=max_rmsd,
                 spin_axes=[poses[i].spin_axis for i in members], interior=contacts.interior,
             )
             moved = [(i, r) for i, r in zip(members, results) if r.anchor_rmsd <= max_rmsd]
@@ -200,19 +201,20 @@ def bend_clusters(
 class Contacts:
     """
     Closest contacts of ligands with the core left after displacement (`core_points`, with
-    their periodic images) and with each other, following the cell `box` of the core.
-    `interior` holds the corners of the core without its outer `depth` Å, along the axes
-    where it has a surface: no place for ligand atoms.
+    their periodic images) and with each other, following the cell `box` of the core, up to
+    `reach` Å beyond the cutoff: farther ones make no difference. `interior` holds the
+    corners of the core without its outer `depth` Å, along the axes where it has a surface:
+    no place for ligand atoms.
     """
 
-    def __init__(self, core_points: np.ndarray, box: Box, cutoff: float, depth: float):
+    def __init__(self, core_points: np.ndarray, box: Box, cutoff: float, depth: float, reach: float):
         self.box = box
         self.cutoff = cutoff
         x = self.core_points = np.array(core_points, dtype=float)
         lo, hi = x.min(axis=0) + depth, x.max(axis=0) - depth
         lo[box.axes], hi[box.axes] = -np.inf, np.inf
         self.interior = (lo, hi)
-        self.reach = cutoff + 0.5   # contacts farther than this make no difference
+        self.reach = cutoff + reach
         self.core_cells = make_cells(x, self.reach)
 
     def closest(self, coords_list: List[np.ndarray],
@@ -274,14 +276,8 @@ def pack(
     poses: Sequence,
     contacts: Contacts,
     rng: random.Random,
-    max_iters: int,
-    coarse_step_deg: float,
-    fine_step_deg: float,
-    window_deg: float,
+    config: PlacementConfig,
     active_radius: float,
-    max_rmsd: float,
-    refine_torsions: bool,
-    stretch_tails: bool,
     n_workers: int,
     log: Callable = print,
     verbose: bool = True,
@@ -290,22 +286,23 @@ def pack(
     Pack the ligands of `poses` until no atoms of two ligands, or of a ligand and the core,
     are closer than the cutoff of `contacts`.
 
-    The dangling chains of the ligands are first stretched (`stretch_tails`, in `n_workers`
-    processes) and, if any were, relaxed together. Then, up to `max_iters` times, the
+    The dangling chains of the ligands are first stretched (stretch_tails, in `n_workers`
+    processes) and, if any were, relaxed together. Then, up to max_iters times, the
     ligands in conflict and those whose sites lie within `active_radius` of theirs turn one
     by one, in random order, to the spin (and fit variant) that clears their neighbors best
-    (turn_pose: a scan every `coarse_step_deg`, then every `fine_step_deg` within
-    `window_deg` of the best). With `refine_torsions`, a ligand that turning cannot clear
-    is refined in torsion space, and ligands that none can clear alone are refined together
-    (bend_clusters); anchors may end `max_rmsd` Å (RMS) from their sites, and a
-    single-motif ligand keeps its tilt and turns only about its normal.
+    (turn_pose: a scan every coarse_step_deg, then every fine_step_deg within window_deg of
+    the best). With refine_torsions, a ligand that turning cannot clear is refined in
+    torsion space, and ligands that none can clear alone are refined together
+    (bend_clusters); anchors may end max_anchor_rmsd (RMS) from their sites, and a
+    single-motif ligand keeps its tilt and turns only about its normal. The settings are
+    those of `config`.
 
     Returns:
         The coordinates of every ligand.
 
     Raises:
         RuntimeError: when an iteration moves no ligand, or the cutoff is still not met
-        after `max_iters`.
+        after max_iters.
     """
     cutoff = contacts.cutoff
     # Where each ligand binds: its site, or the centroid of its sites
@@ -313,8 +310,8 @@ def pack(
 
     # stand up tails first: coiled conformers tangle with their neighbors
     n_stretched = 0
-    if stretch_tails:
-        n_stretched = stretch_poses(poses, contacts.core_points, cutoff, n_workers)
+    if config.stretch_tails:
+        n_stretched = stretch_poses(poses, contacts.core_points, config, n_workers)
         if n_stretched:
             log(f"[Log] Stretched the tails of {n_stretched} of {len(poses)} ligands.")
 
@@ -323,16 +320,16 @@ def pack(
                        for p in poses], dtype=float)
     coords_list: List[np.ndarray] = [p.coords(t, p.variant) for p, t in zip(poses, thetas)]
 
-    # relax the stretched shell together, short of the cutoff; single turns clear the rest
-    if n_stretched and refine_torsions:
-        bend_clusters(poses, coords_list, contacts, max_rmsd, stop_at=cutoff - 0.1)
+    # relax the stretched shell together up to the cutoff; single turns clear the rest
+    if n_stretched and config.refine_torsions:
+        bend_clusters(poses, coords_list, contacts, config)
 
     # Rotation optimization loop
     centers, radii = bounding_spheres(poses, coords_list)
     global_min, conflict_ligs = contacts.conflicts(coords_list)
     log(f"[Log] Initial global_min = {global_min:.3f} Å")
 
-    for iteration in range(1, max_iters + 1):
+    for iteration in range(1, config.max_iters + 1):
         if global_min >= cutoff:
             log(f"[Log] Hard cutoff {cutoff:.3f} Å satisfied. Stopping optimization.")
             break
@@ -348,15 +345,14 @@ def pack(
             around = contacts.around(neighbors_coords)
             bends = poses[i].can_bend
             d_old = _closest(coords_list[i], contacts.core_cells, around, contacts.reach)
-            best_variant, best_coords = turn_pose(
-                poses[i], contacts, around, rng, coarse_step_deg, fine_step_deg, window_deg,
-            )
+            best_variant, best_coords = turn_pose(poses[i], contacts, around, rng, config.coarse_step_deg,
+                                                  config.fine_step_deg, config.window_deg)
             d_new = _closest(best_coords, contacts.core_cells, around, contacts.reach)
 
             # if turning fails, the ligand may bend, against every other ligand
-            if refine_torsions and bends and d_new < cutoff:
+            if config.refine_torsions and bends and d_new < cutoff:
                 others = [c for j, c in enumerate(coords_list) if j != i]
-                refined, d_ref = bend_pose(poses[i], best_coords, others, contacts, max_rmsd)
+                refined, d_ref = bend_pose(poses[i], best_coords, others, contacts, config)
                 if refined is not None and d_ref > d_new:
                     best_variant, best_coords, d_new = poses[i].add_variant(refined), refined, d_ref
 
@@ -368,9 +364,9 @@ def pack(
                     # a refined variant may reach farther: let the ligands still to move see it
                     centers[[i]], radii[[i]] = bounding_spheres([poses[i]], [best_coords])
 
-        if not improved and refine_torsions:
+        if not improved and config.refine_torsions:
             # nobody could move alone: let jammed ligands give way together
-            improved = bend_clusters(poses, coords_list, contacts, max_rmsd)
+            improved = bend_clusters(poses, coords_list, contacts, config)
 
         if not improved:
             raise RuntimeError("[Log] No improvement in active cluster. Stopping.")

@@ -1,19 +1,18 @@
 from __future__ import annotations
 from copy import deepcopy
-import math
 from numbers import Real
 import random
-from typing import List, Sequence
+from typing import List, Optional, Sequence
 
 import numpy as np
 
 from ..assembly import Assembly
+from ..config import PlacementConfig
 from ..core import Core
 from ..ligand import Ligand
 from .pack import Contacts, intramolecular_contacts, pack
 from .polymerize import bond_units
 from .poses import MultiMotifPose, SingleMotifPose
-from .refine import INTRA_SCALE
 from .sampler import ConstellationSampler
 from .sites import motif_pools, select_constellations, take_sites
 
@@ -30,21 +29,10 @@ def place_ligands(
     core: Core,
     ligands: Ligand | Sequence[Ligand],
     coverage: float | Sequence,
-    max_iters: int = 10,
-    overlap_cutoff: float = 1.6,   # Å
-    coarse_step_deg: int = 18,
-    fine_step_deg: int = 2,
-    window_deg: int = 12,
-    active_radius_factor: float = math.sqrt(2)/2,
+    config: Optional[PlacementConfig] = None,
     random_seed: int = 42,
     verbose: bool = True,
-    max_anchor_rmsd: float = 0.5,   # Å
-    refine_torsions: bool = True,
-    stretch_tails: bool = True,
     n_workers: int = 8,   # at most the CPUs available
-    polymerize: bool = True,
-    bond_reach: float = 12.0,   # Å
-    **sampler_options,
 ) -> Assembly:
     """
     Implements Core.place_ligands, which documents the arguments.
@@ -61,6 +49,7 @@ def place_ligands(
         if isinstance(cov, Real) and cov < 0:
             raise ValueError(f"coverage must be at least 0; got {cov} for ligand {lig.name!r}")
 
+    config = PlacementConfig() if config is None else config
     log = print if verbose else (lambda *a, **k: None)
     rng = random.Random(random_seed)
     box = core.box
@@ -70,20 +59,19 @@ def place_ligands(
 
     displaced: List[int] = []
     poses: List[SingleMotifPose | MultiMotifPose] = []
-    # made even without multi-motif ligands, so that a misspelled option fails at once
-    sampler = ConstellationSampler(core_positions, box, rng, sites, overlap_cutoff=overlap_cutoff,
-                                   max_rmsd=max_anchor_rmsd, **sampler_options)
+    # single-motif ligands too ask it which sites the multi-motif ones cover
+    sampler = ConstellationSampler(core_positions, box, rng, sites, config)
 
     for lig, cov in requests:
         if lig.n_motifs > 1:
             pools, by_sublattice = motif_pools(lig, sites, core.site_symbols)
             for lig_cloned, cand in select_constellations(lig, cov, pools, by_sublattice, sampler, log,
-                                                          refine_torsions=refine_torsions):
+                                                          refine_torsions=config.refine_torsions):
                 poses.append(MultiMotifPose(lig_cloned, cand))
             continue
 
         # sites under a multi-motif ligand cannot take one more
-        n_blocked = sampler.block_covered(sites, overlap_cutoff + 1.0)
+        n_blocked = sampler.block_covered(sites, config.overlap_cutoff + config.cover_margin)
         if n_blocked:
             log(f"[Log] Left out {n_blocked} free sites covered by multi-motif ligands.")
 
@@ -96,18 +84,14 @@ def place_ligands(
 
     displaced.extend(sampler.displaced)   # the site atoms multi-motif ligands replace
     core_points, _ = box.images(np.delete(core_positions, displaced, axis=0))
-    contacts = Contacts(core_points, box, overlap_cutoff, core.a / 2)   # down to the first BX2 layer
-    coords_list = pack(
-        poses, contacts, rng, max_iters=max_iters, coarse_step_deg=coarse_step_deg,
-        fine_step_deg=fine_step_deg, window_deg=window_deg,
-        active_radius=active_radius_factor * core.a + 1e-2, max_rmsd=max_anchor_rmsd,
-        refine_torsions=refine_torsions, stretch_tails=stretch_tails, n_workers=n_workers,
-        log=log, verbose=verbose,
-    )
+    contacts = Contacts(core_points, box, config.overlap_cutoff, config.interior_depth * core.a,
+                        config.contact_reach)
+    coords_list = pack(poses, contacts, rng, config, config.active_radius_factor * core.a + 1e-2, n_workers,
+                       log=log, verbose=verbose)
     reactive = [l for l, p in enumerate(poses) if p.ligand.reactive_groups]
     bonds = []
-    if polymerize and reactive:
-        bonds = bond_units(poses, coords_list, contacts, max_anchor_rmsd, bond_reach, log)
+    if config.polymerize and reactive:
+        bonds = bond_units(poses, coords_list, contacts, config, log)
     bonded = {l: set() for l in reactive}
     for l, a, m, b in bonds:
         bonded[l].add(a)
@@ -117,7 +101,7 @@ def place_ligands(
         lig.atoms.set_positions(coords_list[l])
         lig._settle_reactive(bonded[l])
         coords_list[l] = lig.atoms.get_positions()
-    assembly = _assemble(core, requests, [p.ligand for p in poses], coords_list, displaced, bonds)
+    assembly = _assemble(core, requests, [p.ligand for p in poses], coords_list, displaced, bonds, config)
 
     def deviations(chosen: List) -> np.ndarray:
         return np.concatenate([np.linalg.norm(box.mic(p.ligand.anchor_positions - p.targets), axis=1)
@@ -132,10 +116,10 @@ def place_ligands(
     if multi_motif_poses:
         dev = deviations(multi_motif_poses)
         bent = sum(p.sources[p.variant] != "fit" for p in multi_motif_poses)
-        min_distance, n_close = intramolecular_contacts(poses, coords_list)
+        min_distance, n_close = intramolecular_contacts(poses, coords_list, config.intra_scale)
         log(f"[Log] Multi-motif anchors sit {dev.mean():.2f} Å (max {dev.max():.2f} Å) from their sites; "
             f"{bent} of {len(multi_motif_poses)} ligands refined in torsion space; closest intramolecular "
-            f"contact {min_distance:.2f} Å ({n_close} pairs within {INTRA_SCALE:g}x their vdW radii).")
+            f"contact {min_distance:.2f} Å ({n_close} pairs within {config.intra_scale:g}x their vdW radii).")
 
     return assembly
 
@@ -147,11 +131,13 @@ def _assemble(
     coords_list: List[np.ndarray],
     displaced: List[int],
     bonds: List[tuple],
+    config: PlacementConfig,
 ) -> Assembly:
     """
     Give the ligands their coordinates and ids, and put them on a copy of `core` without
     the `displaced` atoms, keeping the core's octahedra and lattice coordinates; `bonds`
-    join ligands, which take the ids of their places in `ligands`.
+    join ligands, which take the ids of their places in `ligands`. The assembly records
+    `config`.
     """
     max_z = 0
     for i, (lig, coords) in enumerate(zip(ligands, coords_list)):
@@ -187,7 +173,8 @@ def _assemble(
     # as plain Python numbers, which JSON takes; None for a ligand given its sites
     coverage = {lig.name: np.asarray(cov).item() if isinstance(cov, Real) else None
                 for lig, cov in requests}
-    return Assembly(core=stripped, ligands=list(ligands), ligand_coverage=coverage, ligand_bonds=list(bonds))
+    return Assembly(core=stripped, ligands=list(ligands), ligand_coverage=coverage, ligand_bonds=list(bonds),
+                    config=config)
 
 
 def _assign_to_octahedra(core: Core, ligands: List[Ligand]) -> None:

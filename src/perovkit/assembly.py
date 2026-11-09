@@ -8,6 +8,7 @@ import numpy as np
 from ase import Atoms
 from ase.io import read
 
+from .config import PlacementConfig
 from .core import Core
 from .io.metadata import read_assemblies, write_metadata
 from .io.structure import write_structure
@@ -36,11 +37,13 @@ class Assembly:
         ligand_bonds (List[Tuple[int, int, int, int]]): Bonds between ligands, made by
             polymerizing their reactive groups: (ligand id, atom, ligand id, atom), atoms
             numbered within each ligand. Moving a ligand stretches its bonds.
+        config (PlacementConfig, optional): The settings it was placed with.
     """
     core: Core
     ligands: List[Ligand] = field(default_factory=list)
     ligand_coverage: Dict[str, float] = field(default_factory=dict)
     ligand_bonds: List[Tuple[int, int, int, int]] = field(default_factory=list)
+    config: Optional[PlacementConfig] = None
 
     @property
     def octahedra(self):

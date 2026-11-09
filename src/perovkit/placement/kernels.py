@@ -31,7 +31,10 @@ System = namedtuple("System", [
     "owner",          # (N) the pose of each atom
     "fixed",          # cells of the fixed atoms
     "shifts",         # (S, 3) periodic images
-    "contact_distance", "k_anchor", "k_contact", "w_torsion",
+    "contact_distance", "k_anchor", "k_contact",
+    "k_intra",        # weight of a pair of a pose within its limit
+    "k_inside",       # weight of an atom inside the box lo..hi
+    "w_torsion",
     "confined",       # whether atoms are kept out of the box lo..hi
     "lo", "hi",
     "pull_atoms",     # atoms pulled along pull_direction by k_pull per Å
@@ -701,13 +704,13 @@ def evaluate(P, s, lists):
 
     e, min_distance = _fixed_terms(X, atom, partner, s.fixed[0], s.contact_distance, s.k_contact, G)
     E += e
-    e, hits = _own_terms(X, pa, pb, limit, 10.0 * s.k_contact, G)
+    e, hits = _own_terms(X, pa, pb, limit, s.k_intra, G)
     E += e
     e, d = _mutual_terms(X, mp, mq, image, s.shifts, s.contact_distance, s.k_contact, G)
     E += e
     min_distance = min(min_distance, d)
     if s.confined:
-        E += _inside_terms(X, s.lo, s.hi, 10.0 * s.k_contact, s.links, G)
+        E += _inside_terms(X, s.lo, s.hi, s.k_inside, s.links, G)
     for t in range(s.pull_atoms.shape[0]):
         a = s.pull_atoms[t]
         E -= s.k_pull * ((X[a, 0] - s.center[0, 0]) * s.pull_direction[0]

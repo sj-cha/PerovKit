@@ -4,11 +4,11 @@ from typing import Dict, List, Optional, Sequence
 
 import numpy as np
 
+from ..config import PlacementConfig
 from .kernels import _nearest, make_cells
-from .refine import CONTACT_MARGINS, stretch
+from .refine import stretch
 
 
-STRETCH_ITERS = 30    # L-BFGS iterations; chains reach 99% of their height within 20
 WORKER_JOBS = 32      # ligands a stretch process is worth
 _WORKER_CORE = None
 
@@ -43,10 +43,10 @@ def _init_stretch_worker(core_points: np.ndarray) -> None:
 
 
 def _stretch_job(job: tuple, core_points=None) -> Optional[np.ndarray]:
-    model, coords, groups, targets, normal, contact_distance = job
+    model, coords, groups, targets, normal, config = job
     res = stretch(model, coords, groups, targets, normal,
-                  [_WORKER_CORE if core_points is None else core_points], contact_distance,
-                  max_iters=STRETCH_ITERS)
+                  [_WORKER_CORE if core_points is None else core_points],
+                  config.overlap_cutoff + config.contact_margins[0], config, config.stretch_iters)
     return None if res is None else res.coords
 
 
@@ -57,11 +57,11 @@ def available_cpus() -> int:
     return os.cpu_count() or 1
 
 
-def _stretched(poses: Sequence, core_points: np.ndarray, cutoff: float,
+def _stretched(poses: Sequence, core_points: np.ndarray, config: PlacementConfig,
                n_workers: int) -> List[Optional[np.ndarray]]:
     """Stretched coordinates of the best variant of each of `poses`; None where it cannot be."""
-    jobs = [(p.ligand.torsion_model(), p.variants[0], p.ligand.binding_groups,
-             p.targets, p.up, cutoff + CONTACT_MARGINS[0]) for p in poses]
+    jobs = [(p.ligand.torsion_model(), p.variants[0], p.ligand.binding_groups, p.targets, p.up, config)
+            for p in poses]
     # a process costs more than a few ligands: each one has to load the compiled code
     n_workers = min(n_workers, available_cpus(), len(jobs) // WORKER_JOBS)
     if n_workers > 1:
@@ -72,7 +72,8 @@ def _stretched(poses: Sequence, core_points: np.ndarray, cutoff: float,
     return [_stretch_job(job, core_points) for job in jobs]
 
 
-def stretch_poses(poses: Sequence, core_points: np.ndarray, cutoff: float, n_workers: int = 1) -> int:
+def stretch_poses(poses: Sequence, core_points: np.ndarray, config: PlacementConfig,
+                  n_workers: int = 1) -> int:
     """
     Put a stretched copy of each pose's best variant first: its dangling chains anti and
     raised along the pose's `up`, its anchors and orientation untouched.
@@ -88,6 +89,7 @@ def stretch_poses(poses: Sequence, core_points: np.ndarray, cutoff: float, n_wor
         How many poses now start stretched: they had chains to stretch and the result
         clears the core, or site selection had already stretched them.
     """
+    cutoff = config.overlap_cutoff
     core_cells = make_cells(core_points, cutoff)
 
     def take(pose, coords: Optional[np.ndarray]) -> bool:
@@ -105,11 +107,12 @@ def stretch_poses(poses: Sequence, core_points: np.ndarray, cutoff: float, n_wor
 
     groups = list(alike.values())
     alone = []
-    for (first, *rest), coords in zip(groups, _stretched([g[0] for g in groups], core_points, cutoff, n_workers)):
+    firsts = _stretched([g[0] for g in groups], core_points, config, n_workers)
+    for (first, *rest), coords in zip(groups, firsts):
         done += take(first, coords)
         for p in rest:
             if coords is not None and take(p, coords + p.targets - first.targets):
                 done += 1
             else:
                 alone.append(p)
-    return done + sum(map(take, alone, _stretched(alone, core_points, cutoff, n_workers)))
+    return done + sum(map(take, alone, _stretched(alone, core_points, config, n_workers)))

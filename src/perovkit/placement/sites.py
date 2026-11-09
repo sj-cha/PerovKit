@@ -140,6 +140,11 @@ def select_constellations(
     scarcer sublattice. With `refine_torsions`, constellations whose fits all clash with
     the core get a torsion-space refinement first.
     """
+    cfg = sampler.config
+    lib = lig.conformers(n_conformers=cfg.n_conformers, rmsd_cutoff=cfg.rmsd_cutoff)
+    if lib.n_embedded < cfg.n_conformers:
+        log(f"[Log] Found {lib.n_embedded} of {cfg.n_conformers} requested {lig.name} conformers "
+            f"at least {cfg.rmsd_cutoff:g} Å RMSD apart.")
     shadowed = sampler.n_shadowed
     chosen: List[Candidate] = []
 

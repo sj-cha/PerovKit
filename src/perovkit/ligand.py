@@ -1,5 +1,6 @@
 from __future__ import annotations
 import copy
+import inspect
 from dataclasses import dataclass, field, replace
 from itertools import product
 from typing import Optional, Tuple, List
@@ -15,6 +16,9 @@ from .io.structure import write_structure
 from .torsion import TorsionModel
 from .utils.rotation import rotation_about_axis, rotation_from_u_to_v
 from .utils.selection import Part, PartAtoms
+
+_BUILD_DEFAULTS = {name: p.default for name, p in inspect.signature(ConformerLibrary.build).parameters.items()
+                   if p.default is not inspect.Parameter.empty}
 
 
 @dataclass
@@ -424,12 +428,14 @@ class Ligand(Part):
         Conformer library of this ligand, built on first use and shared with clones made after.
 
         Args:
-            **kwargs: Forwarded to ConformerLibrary.build; giving any rebuilds the library.
+            **kwargs: Forwarded to ConformerLibrary.build; a setting other than the one the
+                library at hand was built with builds it anew.
         """
         lib = getattr(self, "_conformers", None)
-        if lib is None or kwargs:
+        built = getattr(self, "_conformer_settings", {})
+        if lib is None or any(k not in built or built[k] != v for k, v in kwargs.items()):
             lib = ConformerLibrary.build(self, **kwargs)
-            self._conformers = lib
+            self._conformers, self._conformer_settings = lib, {**_BUILD_DEFAULTS, **kwargs}
         return lib
 
 

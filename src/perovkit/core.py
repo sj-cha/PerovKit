@@ -16,6 +16,7 @@ from .utils.selection import Part, PartAtoms
 
 if TYPE_CHECKING:
     from .assembly import Assembly
+    from .config import PlacementConfig
 
 @dataclass
 class Core(Part):
@@ -351,14 +352,18 @@ class Core(Part):
         self,
         ligands: Ligand | Sequence[Ligand],
         coverage: float | Sequence,
-        **kwargs,
+        config: Optional[PlacementConfig] = None,
+        random_seed: int = 42,
+        verbose: bool = True,
+        n_workers: int = 8,
     ) -> Assembly:
         """
         Place ligands on a copy of this core.
 
         Sites are chosen by coverage, then the ligands turn and bend until no atoms of two
-        ligands, or of a ligand and the core, are closer than `overlap_cutoff`. How each
-        ligand binds is set by its BindingMotif(s).
+        ligands, or of a ligand and the core, are closer than `config.overlap_cutoff`. How
+        each ligand binds is set by its BindingMotif(s), and neighboring reactive groups
+        (ReactiveMotif) are bonded into chains.
 
         Args:
             ligands (Ligand | Sequence[Ligand]): One ligand, or a list of them.
@@ -366,31 +371,17 @@ class Core(Part):
                 Ligand): up to 1, a fraction of the free sites; above 1, a number of
                 ligands; a list, the site atom indices to take (for a multi-motif ligand,
                 groups of one index per motif).
-            **kwargs: Placement options:
-                max_iters (int): Rounds of the turning search. Default 10.
-                overlap_cutoff (float): Closest allowed contact (Å). Default 1.6.
-                coarse_step_deg, fine_step_deg, window_deg (int): Spin scan step, then a
-                    finer step within this window of the best. Defaults 18, 2, 12.
-                active_radius_factor (float): Ligands within this many lattice constants
-                    of a clashing one turn with it. Default sqrt(2)/2.
-                random_seed (int): Seed. Default 42.
-                verbose (bool): Print the placement log. Default True.
-                refine_torsions (bool): Bend ligands that turning cannot clear. Default True.
-                stretch_tails (bool): Stretch dangling chains before packing. Default True.
-                n_workers (int): Processes for the stretch. Default 8.
-                max_anchor_rmsd (float): Largest anchor deviation (RMS, Å) of a ligand
-                    from its sites. Default 0.5.
-                polymerize (bool): Bond the reactive groups of neighboring ligands (see
-                    ReactiveMotif) into chains. Default True.
-                bond_reach (float): Farthest (Å) two reactive carbons may be to bond.
-                    Default 12.0.
-                Other options go to ConstellationSampler (e.g. n_refine, max_templates).
+            config (PlacementConfig, optional): Every setting that shapes the result;
+                PlacementConfig() by default. The assembly records it.
+            random_seed (int): Seed.
+            verbose (bool): Print the placement log.
+            n_workers (int): Processes for the stretch of dangling chains.
 
         Returns:
             Assembly: The core with its ligands.
         """
         from .placement import place_ligands
-        return place_ligands(self, ligands, coverage, **kwargs)
+        return place_ligands(self, ligands, coverage, config, random_seed, verbose, n_workers)
 
 
     def to(

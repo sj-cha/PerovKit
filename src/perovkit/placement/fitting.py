@@ -4,6 +4,7 @@ from typing import List, NamedTuple, Optional, Sequence
 
 import numpy as np
 
+from ..config import PlacementConfig
 from ..conformers import ConformerLibrary
 from ..core import BindingSite
 from ..utils.rotation import rotation_about_axis
@@ -86,24 +87,20 @@ def fit_conformers(
     lib: ConformerLibrary,
     targets: np.ndarray,
     normals: np.ndarray,
-    w_align: float,
-    w_foot: float,
-    foot_scale: float,
-    sigma_rmsd: float = 0.25,
-    energy_scale: float = 5.0,
-    n_spin: int = 72,
+    config: PlacementConfig,
 ) -> ConformerFits:
     """
     Kabsch-fit every conformer's anchors to `targets` at once.
 
     The cost of a conformer is ``fit_cost + orient``, with
-    ``fit_cost = (rmsd / sigma_rmsd)^2 + energy / energy_scale`` and
-    ``orient = w_align * (1 - alignment) + w_foot * (footprint / foot_scale)^2``.
+    ``fit_cost = w_rmsd * rmsd^2 + w_energy * energy`` and
+    ``orient = w_align * (1 - alignment) + w_foot * footprint^2``.
     Alignment is the mean cosine between motif directions and site normals; footprint is
     the spread (Å, RMS) of the body atoms across the mean normal, small when the ligand
     stands up rather than lying on the surface. When the fit leaves a spin free, the
-    spin minimizing ``orient`` is taken.
+    spin minimizing ``orient`` is taken, of fit_n_spin. The weights are those of `config`.
     """
+    w_align, w_foot = config.w_align, config.w_foot
     P = lib.anchors
     center = P.mean(axis=1)
     pivot = targets.mean(axis=0)
@@ -140,7 +137,7 @@ def fit_conformers(
     spread = np.trace(cov, axis1=1, axis2=2)
 
     if axis is not None:
-        thetas = np.linspace(0.0, 2.0 * np.pi, n_spin, endpoint=False)
+        thetas = np.linspace(0.0, 2.0 * np.pi, config.fit_n_spin, endpoint=False)
         spins = rotation_about_axis(axis, thetas)                    # (S, 3, 3)
         # cos[c, s, n] = normal_n . (spin_s @ dir_cn), with the normals turned back instead
         back = normals @ spins                                        # (S, n, 3)
@@ -148,7 +145,7 @@ def fit_conformers(
         align = cos.sum(axis=-1) / n_dir[:, None]
         u = np.einsum("sji,j->si", spins, nbar)                       # spin^T n
         lat2 = spread[:, None] - np.einsum("si,cij,sj->cs", u, cov, u)
-        orient = w_align * (1.0 - align) + w_foot * lat2 / foot_scale ** 2
+        orient = w_align * (1.0 - align) + w_foot * lat2
         best = np.argmin(orient, axis=1)
         idx = np.arange(len(P))
         R = spins[best] @ R
@@ -156,9 +153,9 @@ def fit_conformers(
     else:
         alignment = np.einsum("cnj,nj->cn", dirs, normals).sum(axis=-1) / n_dir
         lat2 = spread - np.einsum("i,cij,j->c", nbar, cov, nbar)
-        orient = w_align * (1.0 - alignment) + w_foot * lat2 / foot_scale ** 2
+        orient = w_align * (1.0 - alignment) + w_foot * lat2
 
-    fit_cost = (rmsd / sigma_rmsd) ** 2 + lib.energies / energy_scale
+    fit_cost = config.w_rmsd * rmsd ** 2 + config.w_energy * lib.energies
     return ConformerFits(rotation=R, conformer_center=center, pivot=pivot, axis=axis, rmsd=rmsd,
                          alignment=alignment, footprint=np.sqrt(np.maximum(lat2, 0.0)),
                          fit_cost=fit_cost, cost=fit_cost + orient)

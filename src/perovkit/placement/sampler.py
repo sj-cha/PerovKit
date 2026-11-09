@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Dict, Iterator, List, NamedTuple, Optional, Se
 
 import numpy as np
 
+from ..config import PlacementConfig
 from ..conformers import ConformerLibrary, embed_at, uff_energy, uff_polish
 from ..core import BindingSite
 from ..torsion import TorsionModel
@@ -14,7 +15,7 @@ from ..utils.box import Box
 from ..utils.rotation import rotation_about_axis
 from .fitting import Candidate, Fit, fit_conformers, mean_normal, site_normals
 from .kernels import _min_distance, _over_sites, make_cells
-from .refine import CONTACT_MARGINS, refine, stretch
+from .refine import refine, stretch
 from .sites import assign_faces
 
 if TYPE_CHECKING:
@@ -65,22 +66,10 @@ class ConstellationSampler:
         rng (random.Random): Random generator of the placement.
         sites (Sequence[BindingSite]): Every surface site; a ligand takes the free ones under
             it out of use (accept), and a fit may not lie over one already taken.
-        overlap_cutoff (float): Minimum distance (Å) a fitted ligand must keep from the core.
-        max_rmsd (float): Largest anchor RMSD (Å) at which a conformer still fits.
-        n_fits (int): Fits kept per constellation, and offered later as alternatives.
-        n_constellations (int): Feasible constellations compared per seed.
-        max_enumerated (int): Constellations enumerated per seed.
-        n_spin (int): Spin angles scanned when the fit leaves one free.
-        w_align, w_foot, foot_scale (float): Orientation terms of the cost, see fit_conformers.
-        w_crowd (float): Weight of the squared shortfall (Å^2) below overlap_cutoff to
-            already placed ligands.
-        n_refine (int): Distinct conformers refined in torsion space before a seed whose fits
-            all clash with the core is given up (0 disables); they may start up to
-            2 * max_rmsd off, since refinement also pulls the anchors in.
-        max_templates (int): Rescued poses kept per ligand type as templates (_learn).
-        embed_constellations, embed_conformers, max_embeddings (int): Where no conformer comes
-            near the sites (_embed): the most compact constellations tried per seed, the
-            conformers embedded at each, and the embeddings per placement.
+        config (PlacementConfig): The cutoff, max_anchor_rmsd and the settings of multi-motif
+            ligands. Conformers refined (n_refine) may start near_rmsd_factor x
+            max_anchor_rmsd off, since refinement also pulls the anchors in; embedding
+            (_embed) is for where no conformer comes near the sites.
     """
 
     def __init__(
@@ -89,46 +78,18 @@ class ConstellationSampler:
         box: Box,
         rng: random.Random,
         sites: Sequence[BindingSite],
-        overlap_cutoff: float,
-        max_rmsd: float,
-        n_fits: int = 4,
-        n_constellations: int = 4,
-        max_enumerated: int = 64,
-        n_spin: int = 36,
-        w_align: float = 2.0,
-        w_foot: float = 1.0,
-        foot_scale: float = 2.0,
-        w_crowd: float = 1.0,
-        n_refine: int = 8,
-        max_templates: int = 16,
-        embed_constellations: int = 2,
-        embed_conformers: int = 8,
-        max_embeddings: int = 12,
+        config: PlacementConfig,
     ):
         self.core_points, self.core_image_of = box.images(core_positions)
         self._n_core = len(core_positions)
         self.box = box
         self.rng = rng
         self.displaced: set = set()   # core atoms that accepted ligands displace
-        self.overlap_cutoff = overlap_cutoff
-        self.max_rmsd = max_rmsd
-        self.n_fits = n_fits
-        self.n_constellations = n_constellations
-        self.max_enumerated = max_enumerated
-        self.n_spin = n_spin
-        self.w_align = w_align
-        self.w_foot = w_foot
-        self.foot_scale = foot_scale
-        self.w_crowd = w_crowd
-        self.n_refine = n_refine
-        self.max_templates = max_templates
-        self.embed_constellations = embed_constellations
-        self.embed_conformers = embed_conformers
-        self.max_embeddings = max_embeddings
+        self.config = config
         self.placed: List[np.ndarray] = []
         self._lig_tree = None
-        # contacts up to overlap_cutoff + 0.5 Å are searched: see _core_min_distance
-        self._core_cells = make_cells(self.core_points, overlap_cutoff + 0.5)
+        # contacts up to contact_reach beyond the cutoff are searched: see _core_min_distance
+        self._core_cells = make_cells(self.core_points, config.overlap_cutoff + config.contact_reach)
         self.sites = list(sites)
         self._site_positions = np.array([s.position for s in self.sites], dtype=float).reshape(-1, 3)
         planes = np.array([s.plane for s in self.sites], dtype=float).reshape(-1, 3)
@@ -141,7 +102,7 @@ class ConstellationSampler:
 
 
     def _setup(self, lig: Ligand, refine_torsions: bool) -> _TypeSetup:
-        lib = lig.conformers()
+        lib = lig.conformers(n_conformers=self.config.n_conformers, rmsd_cutoff=self.config.rmsd_cutoff)
         tm = lig.torsion_model()
         motifs = lig.binding_motifs
         # only frame atoms shadow sites: torsion-turned atoms can move out of the way
@@ -335,7 +296,8 @@ class ConstellationSampler:
     ) -> Iterator[Tuple[List[BindingSite], np.ndarray]]:
         """
         Constellations starting at `seed` whose site distances all fall within the
-        library's anchor-anchor range widened by 2 * max_rmsd, nearest to typical first:
+        library's anchor-anchor range widened by near_rmsd_factor x max_anchor_rmsd, nearest to
+        typical first:
         the median distances of the templates when there are any, else of the library.
         """
         n = len(pools)
@@ -343,7 +305,7 @@ class ConstellationSampler:
         bounds = np.stack([d.min(axis=0), d.max(axis=0)], axis=-1)
         # constellations shaped like the templates (poses proven at real sites) come first
         typical = np.median(d[lib.first_template:] if lib.n_templates else d, axis=0)
-        tol = 2.0 * self.max_rmsd
+        tol = self.config.near_rmsd_factor * self.config.max_anchor_rmsd
         rel_pools = [self.box.mic(np.array([s.position for s in p], dtype=float) - seed.position)
                      if p else np.zeros((0, 3)) for p in pools]
 
@@ -367,7 +329,7 @@ class ConstellationSampler:
         for item in extend([seed], [np.zeros(3)]):
             yield item
             count += 1
-            if count >= self.max_enumerated:
+            if count >= self.config.max_enumerated:
                 return
 
 
@@ -390,7 +352,7 @@ class ConstellationSampler:
                     tried.append((sites, seed.position + rel))
                 continue
             found.append((cand.fits[0].cost, cand))
-            if len(found) >= self.n_constellations:
+            if len(found) >= self.config.n_constellations:
                 break
         if not found and stuck and setup.model is not None:
             cand = self._rescue(setup, stuck)
@@ -422,23 +384,22 @@ class ConstellationSampler:
         lib = setup.lib
         normals = site_normals(sites)
         targets = positions + setup.offsets[:, None] * normals
-        res = fit_conformers(lib, targets, normals, w_align=self.w_align,
-                             w_foot=self.w_foot, foot_scale=self.foot_scale)
+        res = fit_conformers(lib, targets, normals, self.config)
 
-        near = np.flatnonzero(res.rmsd <= 2.0 * self.max_rmsd)
+        near = np.flatnonzero(res.rmsd <= self.config.near_rmsd_factor * self.config.max_anchor_rmsd)
         if len(near) == 0:
             return None, "no conformer fits the site distances", []
         near = near[np.argsort(res.cost[near], kind="stable")]
-        ok = near[res.rmsd[near] <= self.max_rmsd][: self.n_fits]
+        ok = near[res.rmsd[near] <= self.config.max_anchor_rmsd][: self.config.n_fits]
         if lib.n_templates:
             # always try fitting templates, or clashing rigid fits get rescued again
-            learned = near[(near >= lib.first_template) & (res.rmsd[near] <= self.max_rmsd)]
+            learned = near[(near >= lib.first_template) & (res.rmsd[near] <= self.config.max_anchor_rmsd)]
             ok = np.concatenate([ok, learned[~np.isin(learned, ok)]])
 
         excluded = self._excluded(sites, setup.displaces)
 
         axis = res.axis
-        thetas = (np.linspace(0.0, 2.0 * np.pi, self.n_spin, endpoint=False)
+        thetas = (np.linspace(0.0, 2.0 * np.pi, self.config.n_spin, endpoint=False)
                   if axis is not None else np.zeros(1))
         spins = rotation_about_axis(axis, thetas) if axis is not None else np.eye(3)[None]
         has_dir = np.linalg.norm(lib.directions, axis=-1) > 0
@@ -466,7 +427,7 @@ class ConstellationSampler:
         n_covering = 0
         for c in ok:
             base, coords, d_core = spun(c)
-            feasible = d_core >= self.overlap_cutoff
+            feasible = d_core >= self.config.overlap_cutoff
             if feasible.any():
                 free = ~self._covers_taken(coords, base.pivot, setup.radii)
                 if not (feasible & free).any():
@@ -485,9 +446,9 @@ class ConstellationSampler:
             lat2 = np.mean(np.sum((perp - perp.mean(axis=1, keepdims=True)) ** 2, axis=-1), axis=1)
             d_lig = np.full(len(coords), np.inf)   # spins that clash with the core score inf anyway
             d_lig[feasible] = self._ligand_min_distance(coords[feasible])
-            short = np.maximum(0.0, self.overlap_cutoff - np.minimum(d_core, d_lig))
-            score = (self.w_align * (1.0 - align) + self.w_foot * lat2 / self.foot_scale ** 2
-                     + self.w_crowd * short ** 2)
+            short = np.maximum(0.0, self.config.overlap_cutoff - np.minimum(d_core, d_lig))
+            cfg = self.config
+            score = cfg.w_align * (1.0 - align) + cfg.w_foot * lat2 + cfg.w_crowd * short ** 2
             score[~feasible] = np.inf
 
             s = int(np.argmin(score))
@@ -503,8 +464,8 @@ class ConstellationSampler:
             fits.sort(key=lambda f: f.cost)
             return Candidate(sites=list(sites), targets=targets, fits=fits), "", []
 
-        if self.n_refine > 0:
-            for c in near[res.rmsd[near] > self.max_rmsd][: self.n_refine]:
+        if self.config.n_refine > 0:
+            for c in near[res.rmsd[near] > self.config.max_anchor_rmsd][: self.config.n_refine]:
                 starts.append(start(*spun(c)))
         reason = ("no conformer fits the site distances" if not len(ok) else
                   "every fit clashes with the core" if not n_covering else
@@ -522,13 +483,13 @@ class ConstellationSampler:
         """
         tried = set()
         for s in sorted(starts, key=lambda s: s.cost):
-            if len(tried) >= self.n_refine:
+            if len(tried) >= self.config.n_refine:
                 break
             if s.key in tried:
                 continue
             tried.add(s.key)
             fit = None
-            if s.base.rmsd <= self.max_rmsd and setup.model.tails.any():
+            if s.base.rmsd <= self.config.max_anchor_rmsd and setup.model.tails.any():
                 fit = self._stretch_fit(setup, s)
             if fit is None:
                 fit = self._refine_fit(setup, s)
@@ -553,14 +514,13 @@ class ConstellationSampler:
                        for i, j in itertools.combinations(range(len(P)), 2))
 
         lib, mol = setup.lib, setup.mol
-        for sites, positions in sorted(constellations, key=diameter)[:self.embed_constellations]:
-            if self._n_embedded >= self.max_embeddings:
+        for sites, positions in sorted(constellations, key=diameter)[:self.config.embed_constellations]:
+            if self._n_embedded >= self.config.max_embeddings:
                 return None
             self._n_embedded += 1
             normals = site_normals(sites)
             targets = positions + setup.offsets[:, None] * normals
-            res = fit_conformers(lib, targets, normals, w_align=self.w_align,
-                                 w_foot=self.w_foot, foot_scale=self.foot_scale)
+            res = fit_conformers(lib, targets, normals, self.config)
             c = int(np.argmin(res.cost))
             x = (lib.coords[c] - res.conformer_center[c]) @ res.rotation[c].T + res.pivot
             pins = {}
@@ -569,7 +529,8 @@ class ConstellationSampler:
                 for a in set(g) | {n.GetIdx() for i in g for n in mol.GetAtomWithIdx(int(i)).GetNeighbors()
                                    if n.GetAtomicNum() > 1}:
                     pins[a] = x[a] + shift
-            ys = embed_at(mol, pins, n_conformers=self.embed_conformers, random_seed=1000 + self._n_embedded)
+            ys = embed_at(mol, pins, n_conformers=self.config.embed_conformers,
+                          random_seed=1000 + self._n_embedded)
             excluded = self._excluded(sites, setup.displaces)
             starts = []
             for k, y in enumerate(ys):
@@ -597,22 +558,23 @@ class ConstellationSampler:
         core, the rescued pose itself is the template. Returns the candidate.
         """
         lib, mol, groups = setup.lib, setup.mol, setup.groups
-        if lib.n_templates >= self.max_templates or not setup.model.tails.any():
+        if lib.n_templates >= self.config.max_templates or not setup.model.tails.any():
             return cand
         fit = cand.fits[0]
         x = fit.coords(lib)
         excluded = self._excluded(cand.sites, setup.displaces)
-        res = stretch(setup.model, x, groups, cand.targets, mean_normal(cand.sites),
-                      [self._core_points(excluded)], self.overlap_cutoff + CONTACT_MARGINS[0])
+        cfg = self.config
+        res = stretch(setup.model, x, groups, cand.targets, mean_normal(cand.sites), [self._core_points(excluded)],
+                      cfg.overlap_cutoff + cfg.contact_margins[0], cfg, cfg.fit_stretch_iters)
         poses = []
         if res is not None:
             held = [i for g in groups for i in g]
             held += np.flatnonzero(self._core_min_distance(res.coords[:, None], excluded)
-                                   < self.overlap_cutoff + 0.5).tolist()
+                                   < self.config.overlap_cutoff + self.config.contact_reach).tolist()
             y, e = uff_polish(mol, res.coords, held)
             poses = [(y, e), (res.coords, None)]
         for y, e in poses:
-            if self._core_min_distance(y[None], excluded)[0] >= self.overlap_cutoff:
+            if self._core_min_distance(y[None], excluded)[0] >= self.config.overlap_cutoff:
                 energy = (uff_energy(mol, y) if e is None else e) - lib.reference_energy
                 setup.lib = self._libraries[setup.key] = lib.with_template(mol, groups, y, energy)
                 return Candidate(sites=cand.sites, targets=cand.targets,
@@ -652,10 +614,11 @@ class ConstellationSampler:
         clear it; returns it as a fit with explicit coordinates ("unstuck": the stretch
         before packing still stands it up fully) if that works, else None.
         """
+        cfg = self.config
         res = stretch(setup.model, s.start, setup.groups, s.targets, mean_normal(s.sites),
-                      self._surroundings(s.excluded), self.overlap_cutoff + CONTACT_MARGINS[0],
-                      stop_at=self.overlap_cutoff + CONTACT_MARGINS[0] / 2)
-        if res is None or self._core_min_distance(res.coords[None], s.excluded)[0] < self.overlap_cutoff:
+                      self._surroundings(s.excluded), cfg.overlap_cutoff + cfg.contact_margins[0], cfg,
+                      cfg.fit_stretch_iters, stop_at=cfg.overlap_cutoff + cfg.contact_margins[0] / 2)
+        if res is None or self._core_min_distance(res.coords[None], s.excluded)[0] < cfg.overlap_cutoff:
             return None
         return dataclasses.replace(s.base, theta=0.0, xyz=res.coords, source="unstuck")
 
@@ -666,11 +629,12 @@ class ConstellationSampler:
         around it; returns it as a fit with explicit coordinates, or None if it stays stuck.
         """
         res = refine(setup.model, s.start, setup.groups, s.targets, self._surroundings(s.excluded),
-                     contact_distance=self.overlap_cutoff + CONTACT_MARGINS[0],
-                     stop_at=self.overlap_cutoff + CONTACT_MARGINS[0] / 2, stop_rmsd=self.max_rmsd)
-        if res.anchor_rmsd > self.max_rmsd:
+                     self.config.overlap_cutoff + self.config.contact_margins[0], self.config,
+                     stop_at=self.config.overlap_cutoff + self.config.contact_margins[0] / 2,
+                     stop_rmsd=self.config.max_anchor_rmsd)
+        if res.anchor_rmsd > self.config.max_anchor_rmsd:
             return None
-        if self._core_min_distance(res.coords[None], s.excluded)[0] < self.overlap_cutoff:
+        if self._core_min_distance(res.coords[None], s.excluded)[0] < self.config.overlap_cutoff:
             return None
         return dataclasses.replace(s.base, theta=0.0, rmsd=res.anchor_rmsd, xyz=res.coords,
                                    source="refined")
@@ -680,14 +644,15 @@ class ConstellationSampler:
         """
         Per-pose distance to the nearest core atom not in `excluded`: (S,) for (S, m, 3).
 
-        Only contacts up to overlap_cutoff + 0.5 Å are searched, inf beyond: every use of
+        Only contacts up to contact_reach beyond the cutoff are searched, inf beyond: every use of
         the result looks at contacts below the cutoff, and bounding the search is what
         makes the scan over spins and fits affordable.
         """
         blocked = np.zeros(self._n_core, dtype=bool)
         blocked[np.asarray(excluded, dtype=int)] = True
         return _min_distance(np.ascontiguousarray(coords, dtype=float).reshape(-1, 3), coords.shape[0],
-                             self._core_cells, self.core_image_of, blocked, self.overlap_cutoff + 0.5)
+                             self._core_cells, self.core_image_of, blocked,
+                             self.config.overlap_cutoff + self.config.contact_reach)
 
 
     def _ligand_min_distance(self, coords: np.ndarray) -> np.ndarray:
@@ -698,5 +663,5 @@ class ConstellationSampler:
         if self._lig_tree is None:
             return np.full(len(coords), np.inf)
         tree, _ = self._lig_tree
-        dist, _ = tree.query(coords.reshape(-1, 3), k=1, distance_upper_bound=self.overlap_cutoff)
+        dist, _ = tree.query(coords.reshape(-1, 3), k=1, distance_upper_bound=self.config.overlap_cutoff)
         return dist.reshape(coords.shape[0], -1).min(axis=1)

@@ -4,16 +4,10 @@ import numpy as np
 from rdkit import Chem
 from rdkit.Chem.rdForceFieldHelpers import GetUFFBondStretchParams
 
+from ..config import PlacementConfig
 from .kernels import _closest
 from .pack import Contacts
-from .refine import CONTACT_MARGINS, refine_joint
-
-K_LINK = 160.0         # per Å^2, pull of a cap's bond point onto the partner carbon
-LINK_TOLERANCE = 0.1   # Å, a bond whose points end farther from their partners is not made
-LINK_STOP = 0.02       # Å, the refinement making bonds stops once every point is this close
-NEAR = 8.0             # Å, bonds this short are made first, longer ones only between the ends left
-WHOLE = 20             # bonded units refined whole when no more; a larger network only around new bonds,
-HOPS = 2               # those within this many bonds of them moving, the next ones held
+from .refine import refine_joint
 
 
 class _Sets:
@@ -106,20 +100,20 @@ def bond_units(
     poses: Sequence,
     coords_list: List[np.ndarray],
     contacts: Contacts,
-    max_rmsd: float,
-    reach: float,
+    config: PlacementConfig,
     log: Callable = print,
 ) -> List[Tuple[int, int, int, int]]:
     """
     Bond the reactive groups of neighboring ligands into chains, the tail carbon of a unit to
-    the head carbon of another, each pair in place of their caps: bonds up to NEAR Å first,
-    then up to `reach` between the ends left, the free ends paired nearest first again and
-    again. The units new bonds join are refined with all units bonded to them, or within a
-    network larger than WHOLE only those up to HOPS bonds away, the next ones held, each
-    cap's point a bond length out pulled onto the partner carbon; the new bonds stay when
-    every point ends within LINK_TOLERANCE, no contact but a bond is under the cutoff and
-    every anchor is within `max_rmsd` (RMS, Å) of its sites, else the worst-fitting one is
-    given up and the rest tried again. A bond once made stays. Updates `coords_list`.
+    the head carbon of another, each pair in place of their caps: bonds up to near_reach
+    first, then up to bond_reach between the ends left, the free ends paired nearest first
+    again and again. The units new bonds join are refined with all units bonded to them, or
+    within a network larger than whole_units only those up to hops bonds away, the next ones
+    held, each cap's point a bond length out pulled onto the partner carbon; the new bonds
+    stay when every point ends within link_tolerance, no contact but a bond is under the
+    cutoff and every anchor is within max_anchor_rmsd of its sites, else the worst-fitting
+    one is given up and the rest tried again. A bond once made stays. The settings are those
+    of `config`. Updates `coords_list`.
 
     Returns:
         The bonds, as (pose, carbon, pose, carbon).
@@ -151,7 +145,7 @@ def bond_units(
 
     def link_arrays(links, start, coords, loose_caps):
         """
-        The rows of System.links, one per direction of each bond, their scales and K_LINK; and a
+        The rows of System.links, one per direction of each bond, their scales and k_link; and a
         row that pulls nothing for each of `loose_caps`, (pose, cap) of bonds to units left
         out, so that those caps touch nothing either.
         """
@@ -174,7 +168,7 @@ def bond_units(
                 partner.append(start[b] + q)
                 image.append(k)
                 scale.append(length / float(np.linalg.norm(coords[a][c] - coords[a][o])))
-        return np.stack([cap, own, partner, image], axis=1).astype(np.int64), np.array(scale), K_LINK
+        return np.stack([cap, own, partner, image], axis=1).astype(np.int64), np.array(scale), config.k_link
 
     def attempt(new_bonds) -> Tuple[bool, np.ndarray, Dict[int, np.ndarray]]:
         """
@@ -186,11 +180,11 @@ def bond_units(
         while edge:
             edge = {n for l in edge for n in bonded_to[l]} - component
             component |= edge
-        if len(component) <= WHOLE:
+        if len(component) <= config.whole_units:
             moving = component
         else:
             moving = set(joined)
-            for _ in range(HOPS):
+            for _ in range(config.hops):
                 moving |= {n for l in moving for n in bonded_to[l]}
         held = {n for l in moving for n in bonded_to[l]} - moving
         members = sorted(moving | held)
@@ -207,8 +201,9 @@ def bond_units(
         results = refine_joint(
             [poses[l].ligand.torsion_model() for l in members], [coords_list[l] for l in members],
             [poses[l].ligand.binding_groups for l in members], [poses[l].targets for l in members],
-            [contacts.core_cells[0], others[0]], cutoff + CONTACT_MARGINS[0], box.shifts,
-            stop_at=cutoff + CONTACT_MARGINS[0] / 2, stop_rmsd=max_rmsd, stop_link=LINK_STOP,
+            [contacts.core_cells[0], others[0]], cutoff + config.contact_margins[0], box.shifts, config,
+            stop_at=cutoff + config.contact_margins[0] / 2, stop_rmsd=config.max_anchor_rmsd,
+            stop_link=config.link_stop,
             spin_axes=[poses[l].spin_axis for l in members], interior=contacts.interior, links=arrays,
             held_poses=[l in held for l in members])
         new = {l: r.coords for l, r in zip(members, results) if l in moving}
@@ -220,7 +215,7 @@ def bond_units(
         points = X[own] + scale[:, None] * (X[cap] - X[own])
         miss = np.linalg.norm(points - X[partner] - box.shifts[image], axis=1).reshape(-1, 2).max(axis=1)
         worst_anchor = max(r.anchor_rmsd for l, r in zip(members, results) if l in moving)
-        if miss.max() > LINK_TOLERANCE or worst_anchor > max_rmsd:
+        if miss.max() > config.link_tolerance or worst_anchor > config.max_anchor_rmsd:
             return False, miss[:len(new_bonds)], new
 
         # contacts of the units that moved, without the caps bonds replace, bonded carbons excepted
@@ -248,7 +243,7 @@ def bond_units(
         return True, miss[:len(new_bonds)], new
 
     tried: Set[tuple] = set()
-    for bound in sorted({min(NEAR, reach), reach}):
+    for bound in sorted({min(config.near_reach, config.bond_reach), config.bond_reach}):
         while True:
             fresh = _candidates(poses, coords_list, box, bound, made, tried)
             if not fresh:
@@ -273,6 +268,6 @@ def bond_units(
                 made += new_bonds
 
     if tried:
-        log(f"[Log] Bonded {len(made)} pairs of reactive groups within {reach:g} Å ({len(tried)} tried) "
-            f"into {len(_components(made))} chains.")
+        log(f"[Log] Bonded {len(made)} pairs of reactive groups within {config.bond_reach:g} Å "
+            f"({len(tried)} tried) into {len(_components(made))} chains.")
     return [(l, tail, m, head) for l, tail, _, m, head, _ in map(ends, made)]
