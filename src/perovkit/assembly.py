@@ -8,6 +8,9 @@ import numpy as np
 from ase import Atoms
 from ase.io import read
 
+from scipy.sparse import coo_matrix
+from scipy.sparse.csgraph import connected_components
+
 from .config import PlacementConfig
 from .core import Core
 from .io.metadata import read_assemblies, write_metadata
@@ -34,15 +37,18 @@ class Assembly:
         atoms (Atoms): Every atom of the assembly.
         octahedra (Dict[int, dict]): As in Core, with the ids of the bound ligands.
         B_ijk (Dict[int, Tuple[int, int, int]]): As in Core.
-        ligand_bonds (List[Tuple[int, int, int, int]]): Bonds between ligands, made by
-            polymerizing their reactive groups: (ligand id, atom, ligand id, atom), atoms
-            numbered within each ligand. Moving a ligand stretches its bonds.
+        ligand_bonds (List[Tuple[int, int]]): Pairs of ligands bonded by polymerizing their
+            reactive groups, (ligand id, ligand id): the tail carbon of the first to the head
+            carbon of the second. Moving a ligand stretches its bonds.
+        ligand_clusters (List[List[int]]): Ids of the ligands each chain or network joins,
+            largest first; a reactive ligand that bonded to nothing is one alone.
         config (PlacementConfig, optional): The settings it was placed with.
     """
     core: Core
     ligands: List[Ligand] = field(default_factory=list)
     ligand_coverage: Dict[str, float] = field(default_factory=dict)
-    ligand_bonds: List[Tuple[int, int, int, int]] = field(default_factory=list)
+    # bonds between ligands: (ligand id, atom, ligand id, atom), atoms numbered within each ligand
+    _bonds: List[Tuple[int, int, int, int]] = field(default_factory=list, repr=False)
     config: Optional[PlacementConfig] = None
 
     @property
@@ -59,11 +65,26 @@ class Assembly:
         self._build_atoms()
 
     @property
+    def ligand_bonds(self) -> List[Tuple[int, int]]:
+        self._follow_deleted_atoms()
+        return [(l, m) for l, _, m, _ in self._bonds]
+
+    @property
+    def ligand_clusters(self) -> List[List[int]]:
+        self._follow_deleted_atoms()
+        reactive = np.array([lig.id for lig in self.ligands if lig.reactive_groups], dtype=int)
+        row = {l: i for i, l in enumerate(reactive.tolist())}
+        pairs = np.array([(row[l], row[m]) for l, _, m, _ in self._bonds], dtype=int).reshape(-1, 2)
+        graph = coo_matrix((np.ones(len(pairs)), pairs.T), shape=(len(reactive), len(reactive)))
+        n, labels = connected_components(graph, directed=False)
+        return sorted((reactive[labels == c].tolist() for c in range(n)), key=len, reverse=True)
+
+    @property
     def bond_atoms(self) -> np.ndarray:
         """The atoms of each bond between ligands, as indices into `atoms`: (n_bonds, 2)."""
         self._follow_deleted_atoms()
         index = {lig.id: lig.indices for lig in self.ligands}
-        return np.array([(index[l][a], index[m][b]) for l, a, m, b in self.ligand_bonds],
+        return np.array([(index[l][a], index[m][b]) for l, a, m, b in self._bonds],
                         dtype=int).reshape(-1, 2)
 
 
@@ -188,7 +209,7 @@ class Assembly:
         radii = np.array([np.linalg.norm(e - c, axis=1).max() for e, c in zip(entities, centers)])
         # entity pair (i < j) -> {atom of j: the atom of i it is bonded to}
         bonded: Dict[Tuple[int, int], Dict[int, int]] = {}
-        for l, a, m, b in self.ligand_bonds:
+        for l, a, m, b in self._bonds:
             (i, x), (j, y) = sorted([(l + 1, a), (m + 1, b)])
             bonded.setdefault((i, j), {})[y] = x
 
@@ -363,6 +384,6 @@ class Assembly:
         core.octahedra = {new[b]: {"X": [new[x] for x in octa["X"] if x in new],
                                    "Ligand": [new_id[l] for l in octa["Ligand"] if l in new_id]}
                           for b, octa in core.octahedra.items() if b in new}
-        self.ligand_bonds = [(new_id[l], a, new_id[m], b) for l, a, m, b in self.ligand_bonds
-                             if l in new_id and m in new_id]
+        self._bonds = [(new_id[l], a, new_id[m], b) for l, a, m, b in self._bonds
+                       if l in new_id and m in new_id]
         core.B_ijk = {new[b]: ijk for b, ijk in core.B_ijk.items() if b in new}

@@ -173,7 +173,7 @@ def _assemble(
     # as plain Python numbers, which JSON takes; None for a ligand given its sites
     coverage = {lig.name: np.asarray(cov).item() if isinstance(cov, Real) else None
                 for lig, cov in requests}
-    return Assembly(core=stripped, ligands=list(ligands), ligand_coverage=coverage, ligand_bonds=list(bonds),
+    return Assembly(core=stripped, ligands=list(ligands), ligand_coverage=coverage, _bonds=list(bonds),
                     config=config)
 
 

@@ -183,8 +183,8 @@ def write_metadata(assembly, filename: str, sort: bool = False) -> None:
         "core_indices": {"octahedra": assembly.octahedra, "B_ijk": assembly.B_ijk},
         "ligands": ligands_meta,
     }
-    if assembly.ligand_bonds:
-        topo["ligand_bonds"] = [list(map(int, b)) for b in assembly.ligand_bonds]
+    if assembly._bonds:
+        topo["ligand_bonds"] = [list(map(int, b)) for b in assembly._bonds]
     if assembly.config is not None:
         topo["placement_config"] = asdict(assembly.config)
 
@@ -312,7 +312,7 @@ def read_assemblies(cls, atoms: Atoms | List[Atoms], json_filename: str):
         core.B_ijk = B_ijk
         assemblies.append(cls(core=core, ligands=ligands,
                               ligand_coverage={t["name"]: t["coverage"] for t in ligand_types_meta},
-                              ligand_bonds=[tuple(b) for b in topo.get("ligand_bonds", [])],
+                              _bonds=[tuple(b) for b in topo.get("ligand_bonds", [])],
                               config=config))
 
     return assemblies[0] if single_input else assemblies
