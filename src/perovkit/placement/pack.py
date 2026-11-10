@@ -211,9 +211,7 @@ class Contacts:
         self.box = box
         self.cutoff = cutoff
         x = self.core_points = np.array(core_points, dtype=float)
-        lo, hi = x.min(axis=0) + depth, x.max(axis=0) - depth
-        lo[box.axes], hi[box.axes] = -np.inf, np.inf
-        self.interior = (lo, hi)
+        self.interior = box.interior(x, depth)
         self.reach = cutoff + reach
         self.core_cells = make_cells(x, self.reach)
 
@@ -311,7 +309,7 @@ def pack(
     # stand up tails first: coiled conformers tangle with their neighbors
     n_stretched = 0
     if config.stretch_tails:
-        n_stretched = stretch_poses(poses, contacts.core_points, config, n_workers)
+        n_stretched = stretch_poses(poses, contacts.core_points, contacts.interior, config, n_workers)
         if n_stretched:
             log(f"[Log] Stretched the tails of {n_stretched} of {len(poses)} ligands.")
 

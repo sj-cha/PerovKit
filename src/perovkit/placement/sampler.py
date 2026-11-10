@@ -15,7 +15,7 @@ from ..utils.box import Box
 from ..utils.rotation import rotation_about_axis
 from .fitting import Candidate, Fit, fit_conformers, mean_normal, site_normals
 from .kernels import _min_distance, _over_sites, make_cells
-from .refine import refine, stretch
+from .refine import inside_depth, refine, stretch
 from .sites import assign_faces
 
 if TYPE_CHECKING:
@@ -70,6 +70,8 @@ class ConstellationSampler:
             ligands. Conformers refined (n_refine) may start near_rmsd_factor x
             max_anchor_rmsd off, since refinement also pulls the anchors in; embedding
             (_embed) is for where no conformer comes near the sites.
+        interior (tuple): Corners (lo, hi) of the core's interior (Box.interior): a pose
+            with an atom there touches the core, and rescues are pushed out of it.
     """
 
     def __init__(
@@ -79,8 +81,10 @@ class ConstellationSampler:
         rng: random.Random,
         sites: Sequence[BindingSite],
         config: PlacementConfig,
+        interior: tuple,
     ):
         self.core_points, self.core_image_of = box.images(core_positions)
+        self.interior = interior
         self._n_core = len(core_positions)
         self.box = box
         self.rng = rng
@@ -565,7 +569,8 @@ class ConstellationSampler:
         excluded = self._excluded(cand.sites, setup.displaces)
         cfg = self.config
         res = stretch(setup.model, x, groups, cand.targets, mean_normal(cand.sites), [self._core_points(excluded)],
-                      cfg.overlap_cutoff + cfg.contact_margins[0], cfg, cfg.fit_stretch_iters)
+                      cfg.overlap_cutoff + cfg.contact_margins[0], cfg, cfg.fit_stretch_iters,
+                      interior=self.interior)
         poses = []
         if res is not None:
             held = [i for g in groups for i in g]
@@ -617,7 +622,8 @@ class ConstellationSampler:
         cfg = self.config
         res = stretch(setup.model, s.start, setup.groups, s.targets, mean_normal(s.sites),
                       self._surroundings(s.excluded), cfg.overlap_cutoff + cfg.contact_margins[0], cfg,
-                      cfg.fit_stretch_iters, stop_at=cfg.overlap_cutoff + cfg.contact_margins[0] / 2)
+                      cfg.fit_stretch_iters, stop_at=cfg.overlap_cutoff + cfg.contact_margins[0] / 2,
+                      interior=self.interior)
         if res is None or self._core_min_distance(res.coords[None], s.excluded)[0] < cfg.overlap_cutoff:
             return None
         return dataclasses.replace(s.base, theta=0.0, xyz=res.coords, source="unstuck")
@@ -631,7 +637,7 @@ class ConstellationSampler:
         res = refine(setup.model, s.start, setup.groups, s.targets, self._surroundings(s.excluded),
                      self.config.overlap_cutoff + self.config.contact_margins[0], self.config,
                      stop_at=self.config.overlap_cutoff + self.config.contact_margins[0] / 2,
-                     stop_rmsd=self.config.max_anchor_rmsd)
+                     stop_rmsd=self.config.max_anchor_rmsd, interior=self.interior)
         if res.anchor_rmsd > self.config.max_anchor_rmsd:
             return None
         if self._core_min_distance(res.coords[None], s.excluded)[0] < self.config.overlap_cutoff:
@@ -642,7 +648,9 @@ class ConstellationSampler:
 
     def _core_min_distance(self, coords: np.ndarray, excluded: np.ndarray) -> np.ndarray:
         """
-        Per-pose distance to the nearest core atom not in `excluded`: (S,) for (S, m, 3).
+        Per-pose distance to the nearest core atom not in `excluded`: (S,) for (S, m, 3); 0 for
+        a pose with an atom in the core's interior, which the free volume between core atoms
+        would otherwise let through.
 
         Only contacts up to contact_reach beyond the cutoff are searched, inf beyond: every use of
         the result looks at contacts below the cutoff, and bounding the search is what
@@ -650,9 +658,11 @@ class ConstellationSampler:
         """
         blocked = np.zeros(self._n_core, dtype=bool)
         blocked[np.asarray(excluded, dtype=int)] = True
-        return _min_distance(np.ascontiguousarray(coords, dtype=float).reshape(-1, 3), coords.shape[0],
-                             self._core_cells, self.core_image_of, blocked,
-                             self.config.overlap_cutoff + self.config.contact_reach)
+        d = _min_distance(np.ascontiguousarray(coords, dtype=float).reshape(-1, 3), coords.shape[0],
+                          self._core_cells, self.core_image_of, blocked,
+                          self.config.overlap_cutoff + self.config.contact_reach)
+        d[inside_depth(coords, self.interior).any(axis=-1)] = 0.0
+        return d
 
 
     def _ligand_min_distance(self, coords: np.ndarray) -> np.ndarray:

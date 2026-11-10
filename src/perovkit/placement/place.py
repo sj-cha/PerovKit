@@ -60,7 +60,8 @@ def place_ligands(
     displaced: List[int] = []
     poses: List[SingleMotifPose | MultiMotifPose] = []
     # single-motif ligands too ask it which sites the multi-motif ones cover
-    sampler = ConstellationSampler(core_positions, box, rng, sites, config)
+    depth = config.interior_depth * core.a
+    sampler = ConstellationSampler(core_positions, box, rng, sites, config, box.interior(core_positions, depth))
 
     for lig, cov in requests:
         if lig.n_motifs > 1:
@@ -84,8 +85,7 @@ def place_ligands(
 
     displaced.extend(sampler.displaced)   # the site atoms multi-motif ligands replace
     core_points, _ = box.images(np.delete(core_positions, displaced, axis=0))
-    contacts = Contacts(core_points, box, config.overlap_cutoff, config.interior_depth * core.a,
-                        config.contact_reach)
+    contacts = Contacts(core_points, box, config.overlap_cutoff, depth, config.contact_reach)
     coords_list = pack(poses, contacts, rng, config, config.active_radius_factor * core.a + 1e-2, n_workers,
                        log=log, verbose=verbose)
     reactive = [l for l, p in enumerate(poses) if p.ligand.reactive_groups]

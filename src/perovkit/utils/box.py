@@ -30,6 +30,16 @@ class Box:
         pts = np.asarray(points, dtype=float)
         return (pts + self.shifts[:, None]).reshape(-1, 3), np.tile(np.arange(len(pts)), len(self.shifts))
 
+    def interior(self, points: np.ndarray, depth: float) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Corners (lo, hi) of the extent of `points` without its outer `depth` Å, along the
+        axes where it has a surface: unbounded along the periodic ones.
+        """
+        x = np.asarray(points, dtype=float)
+        lo, hi = x.min(axis=0) + depth, x.max(axis=0) - depth
+        lo[self.axes], hi[self.axes] = -np.inf, np.inf
+        return lo, hi
+
     def tree(self, points: np.ndarray) -> Tuple[cKDTree, np.ndarray]:
         """KD-tree of the images of `points`, with the point each comes from."""
         x, image_of = self.images(points)

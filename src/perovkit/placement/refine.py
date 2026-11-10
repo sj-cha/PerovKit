@@ -17,6 +17,12 @@ def _starts(lengths) -> np.ndarray:
     return np.concatenate([[0], np.cumsum(lengths)]).astype(np.int64)
 
 
+def inside_depth(x: np.ndarray, interior: tuple) -> np.ndarray:
+    """How far (Å) each atom of `x` (..., 3) lies inside the box `interior`, 0 outside."""
+    lo, hi = interior
+    return np.maximum(np.minimum(x - lo, hi - x).min(axis=-1), 0.0)
+
+
 def build_system(
     models: Sequence[TorsionModel],
     coords: Sequence[np.ndarray],
@@ -221,17 +227,18 @@ def stretch(
     config: PlacementConfig,
     max_iters: int,
     stop_at: Optional[float] = None,
+    interior: Optional[tuple] = None,
 ) -> Optional[Refinement]:
     """
     Straighten the dangling chains of a ligand and raise them along `normal`.
 
     Every tail torsion is set anti (180°), from the anchors outward, or gauche (±60°) where
-    anti would run the chain into the rest of the ligand or the fixed atoms; then only the
-    tail torsions are optimized, so no anchor moves, to lift the tail's heavy atoms along
-    `normal` while keeping clear of the `fixed` atoms (arrays) and of the ligand itself.
-    With `stop_at` it stops as soon as every contact with the fixed atoms is that far, when
-    the point is only to unstick a chain from the surface. Returns None for a ligand without
-    tails.
+    anti would run the chain into the rest of the ligand, the fixed atoms or the `interior`
+    box of the core (as in `refine`); then only the tail torsions are optimized, so no
+    anchor moves, to lift the tail's heavy atoms along `normal` while keeping clear of all
+    three. With `stop_at` it stops as soon as every contact with the fixed atoms is that
+    far, when the point is only to unstick a chain from the surface. Returns None for a
+    ligand without tails.
     """
     if not model.tails.any():
         return None
@@ -259,6 +266,8 @@ def stretch(
             for grid in grids:
                 d = _nearest(y, grid, contact_distance)
                 overlap += float(np.sum((contact_distance - d[np.isfinite(d)]) ** 2))
+            if interior is not None:
+                overlap += config.interior_weight * float(np.sum(inside_depth(y, interior) ** 2))
             if overlap == 0.0:
                 best = y
                 break
@@ -269,7 +278,7 @@ def stretch(
     frozen = np.concatenate([np.ones(6, dtype=bool), ~model.tails])
     return refine(model, x, groups, targets, fixed, contact_distance, config,
                   max_iters=max_iters, pull=(normal, lifted, config.k_pull), frozen=frozen,
-                  stop_at=stop_at)
+                  stop_at=stop_at, interior=interior)
 
 
 def refine_joint(
