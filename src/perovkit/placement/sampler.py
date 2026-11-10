@@ -130,8 +130,8 @@ class ConstellationSampler:
         Seeds are the first motif's sites, grouped by face (assign_faces; a slab surface is
         one face). The next seed comes from the face of lowest occupancy, ligands accepted
         over its free sites of the first motif's type per ligand, and within it is the one
-        farthest from every occupied site. A face whose seeds fail stays behind, and the
-        other faces take up the shortfall.
+        farthest from every occupied site, or a random one (site_selection). A face whose
+        seeds fail stays behind, and the other faces take up the shortfall.
 
         Args:
             lig (Ligand): The multi-motif ligand.
@@ -173,7 +173,7 @@ class ConstellationSampler:
                 break
             face = min(open_faces, key=lambda f: (placed[f] / capacity[f], -capacity[f], f))
             free = [i for i in faces[face] if not tried[i] and seeds[i].available]
-            if np.isinf(gap[free]).all():
+            if self.config.site_selection == "random" or np.isinf(gap[free]).all():
                 i = free[self.rng.randint(0, len(free) - 1)]
             else:
                 i = free[int(np.argmax(gap[free]))]

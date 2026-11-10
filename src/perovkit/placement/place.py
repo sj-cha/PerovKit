@@ -76,7 +76,7 @@ def place_ligands(
         if n_blocked:
             log(f"[Log] Left out {n_blocked} free sites covered by multi-motif ligands.")
 
-        for lig_cloned, site in take_sites(core, lig, cov, sites, rng, displaced, log):
+        for lig_cloned, site in take_sites(core, lig, cov, sites, rng, displaced, log, config.site_selection):
             poses.append(SingleMotifPose(lig_cloned, np.array(site.plane, dtype=float),
                                   np.array(site.position, dtype=float)))
 

@@ -54,10 +54,12 @@ def take_sites(
     rng: random.Random,
     displaced: List[int],
     log: Callable,
+    selection: str = "farthest",
 ) -> List[Tuple[Ligand, BindingSite]]:
     """
     Take free sites for a single-motif ligand on the sublattice of its motif: those
-    `coverage` lists, or else as many as it asks for, spread by farthest-point sampling.
+    `coverage` lists, or else as many as it asks for, spread by farthest-point sampling
+    (`selection` "farthest") or drawn at random ("random").
     Returns a copy of the ligand for each site; the surface atoms the ligands replace are
     added to `displaced`.
     """
@@ -83,7 +85,9 @@ def take_sites(
 
         coords = np.array([s.position for s in available])
         sc = core.supercell
-        if core.is_nanocrystal and sc is not None and len(set(sc)) > 1:
+        if selection == "random":
+            chosen_indices = rng.sample(range(len(available)), n_target)
+        elif core.is_nanocrystal and sc is not None and len(set(sc)) > 1:
             planes = [s.plane for s in available]
             chosen_indices = per_face_farthest_point_sampling(coords, planes, n_target, rng)
         else:

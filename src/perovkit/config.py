@@ -16,6 +16,9 @@ class PlacementConfig:
     contact_reach: float = 0.5                        # distances below (overlap_cutoff + contact_reach) (Å) are measured exactly
     interior_depth: float = 0.5                       # allowed ligand penetration into the core (Å)
 
+    # site selection
+    site_selection: str = "farthest"                  # order in which sites are taken: "farthest" from the occupied ones, or "random"
+
     # objective of the refinements (torsion space, L-BFGS)
     refine_torsions: bool = True                      # refine torsions for ligands that cannot be resolved by rigid-body rotation (fitting and packing)
     k_contact: float = 40.0                           # penalty for pairs under the cutoff (per Å^2)
@@ -80,6 +83,10 @@ class PlacementConfig:
     link_stop: float = 0.02                           # bond point-partner distance required to stop the refinement early (Å)
     whole_units: int = 20                             # max number of units in a network refined as a whole
     hops: int = 2                                     # number of bonds from newly bonded units within which units are refined in larger networks
+
+    def __post_init__(self):
+        if self.site_selection not in ("farthest", "random"):
+            raise ValueError(f"site_selection must be 'farthest' or 'random'; got {self.site_selection!r}")
 
     def to_json(self, filename: str) -> None:
         with open(filename, "w") as f:
