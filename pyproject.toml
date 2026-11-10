@@ -1,6 +1,6 @@
 [project]
 name = "perovkit"
-version = "0.3.0"
+version = "0.4.0"
 description = "PerovKit: A Python library for robust, automatic construction of ligand-passivated perovskite models"
 authors = [
     { name="Seungjun Cha", email="scha@gatech.edu" }
